@@ -40,10 +40,10 @@ class RenderResult:
 class InfoRenderer:
     _FONT_FILENAME = "LXGWWenKaiLite-Regular.ttf"
     _FONT_URLS = [
+        "https://ghproxy.net/https://raw.githubusercontent.com/lxgw/LxgwWenKai-Lite/main/fonts/TTF/LXGWWenKaiLite-Regular.ttf",
+        "https://jsd.cdn.zzko.cn/gh/lxgw/LxgwWenKai-Lite@main/fonts/TTF/LXGWWenKaiLite-Regular.ttf",
         "https://raw.githubusercontent.com/lxgw/LxgwWenKai-Lite/main/fonts/TTF/LXGWWenKaiLite-Regular.ttf",
         "https://cdn.jsdelivr.net/gh/lxgw/LxgwWenKai-Lite@main/fonts/TTF/LXGWWenKaiLite-Regular.ttf",
-        "https://fastly.jsdelivr.net/gh/lxgw/LxgwWenKai-Lite@main/fonts/TTF/LXGWWenKaiLite-Regular.ttf",
-        "https://gcore.jsdelivr.net/gh/lxgw/LxgwWenKai-Lite@main/fonts/TTF/LXGWWenKaiLite-Regular.ttf",
     ]
 
     _CARD_W = 1120
@@ -84,7 +84,7 @@ class InfoRenderer:
     async def _ensure_font_cached(self):
         if self._font_path.exists() and self._font_path.stat().st_size > 0:
             return
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=60)
         for url in self._FONT_URLS:
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -104,15 +104,45 @@ class InfoRenderer:
         logger.warning("[Renderer] 字体下载失败，将回退到系统字体")
 
     def _font(self, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        # 1. 优先使用已缓存的插件专用中文字体
         try:
             if self._font_path.exists():
                 return ImageFont.truetype(str(self._font_path), size=size)
         except Exception as exc:
-            logger.debug(f"[Renderer] 加载缓存字体失败: {exc}")
+            logger.debug(f"[Renderer] 加载已缓存字体失败: {exc}")
+
+        # 2. 尝试 AstrBot 数据根目录下的 font.ttf (用户自定义)
         try:
-            return ImageFont.truetype("msyh.ttc", size=size)
+            from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+            custom_font = Path(get_astrbot_data_path()) / "font.ttf"
+            if custom_font.exists():
+                return ImageFont.truetype(str(custom_font), size=size)
         except Exception:
-            return ImageFont.load_default()
+            pass
+
+        # 3. 跨平台常见中文字体 fallback
+        # Linux 下如果没有安装字体包，下载通常是最好的选择，但这里也列出常见的避免完全失败
+        fallback_fonts = [
+            "msyh.ttc",  # Windows - 微软雅黑
+            "simsun.ttc",  # Windows - 宋体
+            "NotoSansCJK-Regular.ttc",  # Linux (Ubuntu/Debian)
+            "wqy-microhei.ttc",  # Linux (CentOS/Alpine)
+            "PingFang.ttc",  # macOS
+            "DroidSansFallback.ttf",  # 备用
+        ]
+        for font_name in fallback_fonts:
+            try:
+                return ImageFont.truetype(font_name, size=size)
+            except Exception:
+                continue
+
+        # 4. 最后兜底
+        if not self._font_path.exists():
+            logger.warning(
+                f"[Renderer] 无法加载中文字体，渲染结果可能乱码。请确保网络畅通以自动下载字体，或手动放置字体文件到: {self._font_path}"
+            )
+        return ImageFont.load_default()
 
     @staticmethod
     def _safe_percent(value: float | int, lo: int = 0, hi: int = 100) -> int:
