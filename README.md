@@ -188,17 +188,31 @@ mine_sentinel:
 - MC Java 插件 Actions：https://github.com/EllanServer/AstrBotAdapter/actions
 - AstrBot 插件仓库：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter
 - AstrBot 插件 Actions：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter/actions
+- NapCatQQ 仓库：https://github.com/NapNeko/NapCatQQ
+- NapCatQQ Releases：https://github.com/NapNeko/NapCatQQ/releases
+- NapCat Shell 安装文档：https://napneko.github.io/guide/boot/Shell
 
 开始前先向我索取这些信息，不要自行猜路径：
 1. 部署模式：单服 / Velocity 群组服。
 2. Minecraft 服务器根目录。单服给一个根目录；Velocity 群组服请给 Velocity 根目录和每个后端服根目录。
 3. AstrBot 根目录。
 4. 要接收 AI 总结的 QQ 群或 UMO，例如 group:123456789 或 aiocqhttp:GroupMessage:123456789。
-5. 是否现在重启 MC 服务端和 AstrBot。
+5. NapCat 安装目录如果已知可一并提供；不知道就留空，由你先自动检测。
+6. 是否现在重启 MC 服务端、AstrBot 和 NapCat。
 
 拿到路径后执行：
 1. 检查所有目录是否存在，识别 plugins 目录、AstrBot 插件目录和现有配置文件。
-2. 从 GitHub Actions 下载两个仓库最新 successful workflow 的构建产物和源码。优先使用 gh：
+2. 先检测 NapCat/OneBot 是否已经安装和运行，不要一上来重装：
+   - Windows：检查进程 NapCat/NapCatQQ/QQ/NapCatWinBootMain，检查服务、计划任务、常见目录、AstrBot 同级目录和用户给出的 NapCat 目录。
+   - Linux：检查 ps、systemctl、pm2、docker ps、which napcat、sudo napcat、常见安装目录和 AstrBot 同级目录。
+   - 同时检查 AstrBot 现有 aiocqhttp/OneBot v11/QQ 适配器配置，确认是否已经能连接到 NapCat。
+   - 如果 NapCat 已安装且可用，只记录安装位置和连接方式，不覆盖现有配置。
+3. 如果检测不到 NapCat，先询问并确认 NapCat 安装目录、运行方式（Windows Shell 一键包 / Linux Shell / Docker）和机器人 QQ 号，然后按官方 NapCatQQ Releases 与 Shell 安装文档安装：
+   - Windows AMD64 优先下载 NapCat.Shell.Windows.OneKey.zip，解压到无中文和空格的目录，运行安装器或 napcat.bat。
+   - Linux 优先按官方 Shell 文档/installer 安装；如果用户要求 Docker，再使用 Docker 方式。
+   - 不要让 AI 输入 QQ 密码；启动 NapCat 后让用户扫码/手动登录。
+   - 配置 OneBot v11 WebSocket 或 HTTP，使 AstrBot 能连接 NapCat；若已有可用连接，保持原配置。
+4. 从 GitHub Actions 下载两个仓库最新 successful workflow 的构建产物和源码。优先使用 gh：
    - gh run list -R EllanServer/AstrBotAdapter --branch main --status success --limit 1
    - gh run download -R EllanServer/AstrBotAdapter <run-id> --dir ./downloads/AstrBotAdapter
    - gh run list -R EllanServer/astrbot_plugin_minecraft_adapter --branch master --status success --limit 1
@@ -206,25 +220,26 @@ mine_sentinel:
    如果没有 gh，就打开上面的 Actions 链接下载最新成功运行的 artifacts。若 Actions 没有源码 artifact，则同时下载源码 ZIP：
    - https://github.com/EllanServer/AstrBotAdapter/archive/refs/heads/main.zip
    - https://github.com/EllanServer/astrbot_plugin_minecraft_adapter/archive/refs/heads/master.zip
-3. 安装 Java 插件：
+5. 安装 Java 插件：
    - 单服：把最新 Backend jar 放进该服务器根目录的 plugins/。
    - Velocity 群组服：把 Velocity jar 放进 Velocity 的 plugins/，把 Backend jar 放进每个后端服的 plugins/；如果产物包含 libs/，按 README 保持 libs/ 与 Velocity jar 同级。
-4. 安装 AstrBot 插件：把 astrbot_plugin_minecraft_adapter 最新源码放进 AstrBot 的插件目录，目录名保持 astrbot_plugin_minecraft_adapter；如已有旧目录，先备份再覆盖。
-5. 配置 Java 插件：
+6. 安装 AstrBot 插件：把 astrbot_plugin_minecraft_adapter 最新源码放进 AstrBot 的插件目录，目录名保持 astrbot_plugin_minecraft_adapter；如已有旧目录，先备份再覆盖。
+7. 配置 Java 插件：
    - 单服保持 proxyMode.enabled=false。
    - Velocity 群组服先启动/读取 Velocity 端 secret，再给每个后端服写入 proxyMode.enabled=true 和 proxyMode.secret。
    - 确认 mine_sentinel.enabled、observation.enabled、chat.enabled、metrics.enabled 为 true。
-6. 配置 AstrBot 插件：
+8. 配置 AstrBot 插件：
    - 单服在 mc_servers 中添加后端服 host/port/token。
    - 群组服只添加 Velocity 端 host/port/token。
    - 把 QQ 群写入 message.target_sessions，必要时写入 mine_sentinel.report.delivery_targets。
    - 开启 mine_sentinel.enabled、storage.enabled、report.enabled、send_as_image、send_full_log_file。
-7. 做备份：覆盖任何 jar、插件目录或配置文件前，先复制到带时间戳的 backup 目录。
-8. 验证：
-   - 启动或重启服务后检查 Java 插件和 AstrBot 日志。
+   - 确认 AstrBot 已连接 NapCat/OneBot，且目标 QQ 群可以收发消息。
+9. 做备份：覆盖任何 jar、插件目录或配置文件前，先复制到带时间戳的 backup 目录。
+10. 验证：
+   - 启动或重启服务后检查 Java 插件、AstrBot 和 NapCat 日志。
    - 在 QQ/AstrBot 会话执行 mc monitor status，确认收到 observation。
    - 执行 mc report now <服务器ID> 30m 测试图片报告和 JSONL 附件发送。
-9. 最后给我汇总：安装了哪些文件、备份位置、配置了哪些服务器 ID、测试命令结果、还需要我手动确认的事项。
+11. 最后给我汇总：安装了哪些文件、备份位置、NapCat 是否复用或新装、配置了哪些服务器 ID、测试命令结果、还需要我手动确认的事项。
 ```
   
 ## 更新日志
