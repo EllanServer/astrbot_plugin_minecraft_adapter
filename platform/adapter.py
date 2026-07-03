@@ -100,11 +100,15 @@ class MCPlatformAdapter(Platform):
         self._stop_event = asyncio.Event()
         await self._stop_event.wait()
 
-    async def stop(self):
-        """停止平台适配器"""
+    async def terminate(self):
+        """停止平台适配器（对齐 Platform 基类生命周期方法）"""
         self._running = False
         if hasattr(self, "_stop_event"):
             self._stop_event.set()
+        await super().terminate()
+
+    # 向后兼容：外部代码仍调用 stop()
+    stop = terminate
 
     async def handle_chat_request(self, msg: MCMessage):
         """处理来自 Minecraft 的聊天请求"""

@@ -1,0 +1,372 @@
+"""MineSentinel service entry point."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Any
+
+from astrbot.api import logger
+
+from .alerts import MineSentinelAlertEngine
+from .delivery import MineSentinelDelivery
+from .dispatch import MineSentinelReportDispatcher
+from .formatter import format_report
+from .jobs import PeriodicReportJob
+from .models import MineSentinelConfig, ObservationRecord
+from .report_artifacts import MineSentinelReportArtifacts
+from .reporting import MineSentinelReporter
+from .reporting.image_renderer import MineSentinelReportImageRenderer
+from .reporting.report_result import MineSentinelRenderedReport
+from .routing import MineSentinelTargetRouter
+from .storage import DiskObservationStore, RecentObservationWindow
+
+
+class MineSentinelService:
+    def __init__(
+        self,
+        context: Any,
+        config_data: dict | None,
+        get_server_config: Callable[[str], Any | None],
+        storage_dir: str | Path | None = None,
+        io_runner: Callable[..., Awaitable[Any]] | None = None,
+        report_thread_runner: Callable[..., Awaitable[Any]] | None = None,
+    ):
+        self.context = context
+        self.config = MineSentinelConfig.from_dict(config_data)
+        self.get_server_config = get_server_config
+        self.io_runner = io_runner or asyncio.to_thread
+        self.last_report_time = 0.0
+        self.last_error = ""
+        storage_path = Path(storage_dir) if storage_dir else Path(__file__).parent / ".cache"
+        self.disk_store = (
+            DiskObservationStore(self.config, storage_path)
+            if storage_dir and self.config.storage.enabled
+            else None
+        )
+        self.reporter = MineSentinelReporter(self.config, context)
+        self.report_artifacts = MineSentinelReportArtifacts(
+            self.config,
+            self.reporter,
+            self.disk_store,
+            thread_runner=report_thread_runner or self.io_runner,
+        )
+        self.report_image_renderer = MineSentinelReportImageRenderer(
+            storage_path / "render_cache"
+        )
+        self.delivery = MineSentinelDelivery(context)
+        self.target_router = MineSentinelTargetRouter(
+            get_server_config,
+            lambda: self.config.report.delivery_targets,
+        )
+        self.dispatcher = MineSentinelReportDispatcher(
+            self.delivery,
+            self.target_router,
+            self._set_last_error,
+        )
+        self.alerts = MineSentinelAlertEngine(self.config)
+        self._periodic_report_job = PeriodicReportJob(
+            self.config,
+            self._run_periodic_report_once,
+            lambda: self.last_report_time,
+        )
+
+    def start(self):
+        if not self.config.enabled:
+            logger.info("[MineSentinel] 已禁用")
+            return
+        if self.config.report.enabled:
+            self._periodic_report_job.start()
+            logger.info(
+                "[MineSentinel] 定时 AI 报告已启用，"
+                f"间隔 {self.config.report.interval_minutes} 分钟"
+            )
+        logger.info("[MineSentinel] 服务已启动")
+
+    async def stop(self):
+        await self._periodic_report_job.stop()
+
+    async def handle_batch(self, server_id: str, payload: dict):
+        if not self.config.enabled:
+            return
+        try:
+            written = 0
+            if self.disk_store:
+                try:
+                    written = await self.io_runner(
+                        self.disk_store.add_batch,
+                        server_id,
+                        payload or {},
+                    )
+                except Exception as exc:
+                    self.last_error = f"写入硬盘 observation 失败: {exc}"
+                    logger.error(f"[MineSentinel] {self.last_error}")
+            else:
+                self.last_error = "硬盘 observation 存储未启用，batch 已忽略"
+                logger.error(f"[MineSentinel] {self.last_error}")
+                return
+            logger.debug(
+                f"[MineSentinel] batch {server_id}: written_to_disk={written}"
+            )
+            if self.config.alert.enabled and written:
+                await self._maybe_alert(server_id)
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.error(f"[MineSentinel] 处理 observation batch 失败: {exc}")
+
+    def monitor_status(self) -> str:
+        lines = [
+            "MineSentinel 监控状态",
+            f"启用状态：{'启用' if self.config.enabled else '禁用'}",
+            "存储模式：硬盘 JSONL（无 observation 内存缓存）",
+            f"硬盘存储：{'启用' if self.disk_store else '禁用'}",
+        ]
+        if self.disk_store:
+            lines.extend(
+                [
+                    f"observation 目录：{self.disk_store.observation_dir}",
+                    f"export 目录：{self.disk_store.export_dir}",
+                    "报告内存上限："
+                    f"{self.config.report.max_records_in_memory} 条 observation",
+                ]
+            )
+        lines.extend(
+            [
+                f"last_report_time：{self._format_ts(self.last_report_time) if self.last_report_time else '无'}",
+                f"last_error：{self.last_error or '无'}",
+            ]
+        )
+        return "\n".join(lines)
+
+    async def report_now(
+        self,
+        current_session: str,
+        server_id: str | None = None,
+        window_minutes: int | None = None,
+    ) -> str:
+        result = await self.report_now_result(
+            current_session,
+            server_id,
+            window_minutes,
+            render_image=False,
+        )
+        return result.text
+
+    async def report_now_result(
+        self,
+        current_session: str,
+        server_id: str | None = None,
+        window_minutes: int | None = None,
+        render_image: bool | None = None,
+    ) -> MineSentinelRenderedReport:
+        if not self.config.enabled:
+            return MineSentinelRenderedReport("MineSentinel 未启用")
+        window = self._report_window_minutes(window_minutes)
+        window_data = await self._recent_window(window, server_id)
+        records = window_data.records
+        if not records:
+            return MineSentinelRenderedReport("最近窗口内没有足够数据")
+
+        report = await self._build_report(
+            records,
+            window,
+            server_id,
+            current_session,
+            window_data,
+        )
+        self.last_report_time = time.time()
+        text = format_report(report, window_data.total_count, 0, window_data.unique_players)
+        report_file = self._report_file_path(report)
+        image = await self._render_report_image(
+            report,
+            window_data.total_count,
+            0,
+            window_data.unique_players,
+            render_image,
+        )
+        if report_file and current_session:
+            await self.dispatcher.send_file(current_session, report_file)
+
+        if self._has_report_delivery_targets():
+            await self.dispatcher.send_to_target_sessions(
+                text,
+                records,
+                current_session,
+                include_server_targets=self.config.report.send_to_target_sessions,
+                image=image,
+            )
+        return MineSentinelRenderedReport(text, image=image, report_file=report_file)
+
+    async def _run_periodic_report_once(self) -> bool:
+        window = self._report_window_minutes()
+        window_data = await self._recent_window(window)
+        records = window_data.records
+        if not records:
+            return False
+        if not self._has_report_delivery_targets():
+            return False
+
+        sent_any = False
+        for umo, scoped_records in sorted(
+            self.dispatcher.records_by_session(
+                records,
+                include_server_targets=self.config.report.send_to_target_sessions,
+            ).items()
+        ):
+            report = await self._build_report(
+                scoped_records,
+                window,
+                None,
+                umo,
+                window_data,
+            )
+            unique_players = len(
+                {record.identity for record in scoped_records if record.identity}
+            )
+            text = format_report(
+                report,
+                len(scoped_records),
+                0,
+                unique_players,
+            )
+            image = await self._render_report_image(
+                report,
+                len(scoped_records),
+                0,
+                unique_players,
+                None,
+            )
+            sent_any = await self.dispatcher.send_report(
+                umo,
+                text,
+                image=image,
+                file_path=self._report_file_path(report),
+            ) or sent_any
+        if sent_any:
+            self.last_report_time = time.time()
+        return sent_any
+
+    async def _maybe_alert(self, server_id: str):
+        if not self.alerts.should_analyze(server_id):
+            return
+
+        window = self.config.alert.window_minutes
+        records = await self._recent_records(window, server_id)
+        if not records:
+            return
+        report = self.reporter.build_heuristic_report(
+            records,
+            window,
+            server_id,
+        )
+        for text in self.alerts.build_messages(server_id, report):
+            await self.dispatcher.send_to_target_sessions(
+                text,
+                records,
+                include_server_targets=self.config.report.send_to_target_sessions,
+            )
+
+    def _report_window_minutes(self, window_minutes: int | None = None) -> int:
+        return max(1, window_minutes or self.config.report.default_window_minutes)
+
+    async def _render_report_image(
+        self,
+        report: dict,
+        total_count: int,
+        dedupe_count: int,
+        unique_players: int,
+        render_image: bool | None,
+    ):
+        should_render = self.config.report.send_as_image if render_image is None else render_image
+        if not should_render:
+            return None
+        try:
+            return await self.report_image_renderer.render(
+                report,
+                total_count,
+                dedupe_count,
+                unique_players,
+            )
+        except Exception as exc:
+            logger.warning(f"[MineSentinel] 渲染图片报告失败，回退文本: {exc}")
+            return None
+
+    def _has_report_delivery_targets(self) -> bool:
+        return bool(
+            self.config.report.send_to_target_sessions
+            or self.config.report.delivery_targets
+        )
+
+    async def _build_report(
+        self,
+        records: list[ObservationRecord],
+        window: int,
+        server_id: str | None,
+        umo: str | None,
+        window_data: RecentObservationWindow | None = None,
+    ) -> dict:
+        report = await self.report_artifacts.build(
+            records,
+            window,
+            server_id,
+            umo,
+            window_data,
+        )
+        if self.report_artifacts.last_error:
+            self.last_error = self.report_artifacts.last_error
+        return report
+
+    async def _recent_window(
+        self,
+        window_minutes: int,
+        server_id: str | None = None,
+    ) -> RecentObservationWindow:
+        if self.disk_store:
+            try:
+                return await self.io_runner(
+                    self.disk_store.recent_window,
+                    window_minutes,
+                    server_id,
+                )
+            except Exception as exc:
+                self.last_error = f"读取硬盘 observation 失败: {exc}"
+                logger.error(f"[MineSentinel] {self.last_error}")
+        return RecentObservationWindow([], 0, 0, False, 0)
+
+    async def _recent_records(
+        self,
+        window_minutes: int,
+        server_id: str | None = None,
+    ) -> list[ObservationRecord]:
+        return (await self._recent_window(window_minutes, server_id)).records
+
+    async def _export_report_records(
+        self,
+        records: list[ObservationRecord],
+        window_minutes: int,
+        server_id: str | None,
+        umo: str | None,
+        export_full_window: bool = False,
+    ):
+        path = await self.report_artifacts.export_report_records(
+            records,
+            window_minutes,
+            server_id,
+            umo,
+            export_full_window,
+        )
+        if self.report_artifacts.last_error:
+            self.last_error = self.report_artifacts.last_error
+        return path
+
+    def _report_file_path(self, report: dict) -> Path | None:
+        return self.report_artifacts.report_file_path(report)
+
+    def _set_last_error(self, message: str):
+        self.last_error = message
+
+    @staticmethod
+    def _format_ts(value: float) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))

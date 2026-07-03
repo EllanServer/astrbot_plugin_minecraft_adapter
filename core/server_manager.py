@@ -59,6 +59,12 @@ class ServerConnection:
     def server_info(self) -> ServerInfo | None:
         return self.ws_client.server_info
 
+    def update_server_id(self, server_id: str):
+        """Update the runtime identifier after discovery."""
+        self.config.server_id = server_id
+        self.ws_client.server_id = server_id
+        self.rest_client.server_id = server_id
+
     async def _handle_ws_message(self, msg: MCMessage):
         if self._on_message:
             await self._on_message(self.server_id, msg)
@@ -148,6 +154,24 @@ class ServerManager:
 
         del self._servers[server_id]
         logger.info(f"[ServerManager] 已移除服务器: {server_id}")
+        return True
+
+    def rename_server(self, old_id: str, new_id: str) -> bool:
+        """Rename a server connection without dropping the active socket."""
+        if old_id == new_id:
+            return True
+
+        connection = self._servers.get(old_id)
+        if not connection:
+            return False
+        if new_id in self._servers:
+            logger.warning(f"[ServerManager] 服务器 {new_id} 已存在")
+            return False
+
+        del self._servers[old_id]
+        connection.update_server_id(new_id)
+        self._servers[new_id] = connection
+        logger.info(f"[ServerManager] 已重命名服务器: {old_id} -> {new_id}")
         return True
 
     def get_server(self, server_id: str) -> ServerConnection | None:

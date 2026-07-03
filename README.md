@@ -2,6 +2,9 @@
 
 连接 Minecraft 服务器和 AstrBot，实现消息互通和服务器管理功能。
 
+> [!important]
+> 本仓库是 [railgun19457/astrbot_plugin_minecraft_adapter](https://github.com/railgun19457/astrbot_plugin_minecraft_adapter) 的 EllanServer 下游维护版，用于保留本服适配、MineSentinel 图片巡检报告和 QQ 目标发送等改动。同步上游时请优先对比上游 `master` 分支。
+
 ![:name](https://count.getloli.com/@astrbot_plugin_minecraft_adapter?name=astrbot_plugin_minecraft_adapter&theme=minecraft&padding=6&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
 
 > [!note]
@@ -12,6 +15,7 @@
 - 群服互通，支持将mc服务器与其他连接到AstrBot的平台互通消息
 - 服务器管理，支持服务器状态查询，远程指令执行等
 - AI聊天，支持游戏内和AstrBot聊天
+- MineSentinel 观察分析，接收 MC 端只读观察批次，使用 AstrBot 模型生成报告和告警
 
 ## 命令
 - `mc help` - 显示帮助信息和自定义指令列表
@@ -21,6 +25,8 @@
 - `mc cmd <指令>` - 远程执行服务器指令
 - `mc bind <游戏ID>` - 绑定你的游戏ID
 - `mc unbind` - 解除绑定
+- `mc monitor status` - 查看 MineSentinel 观察缓存、去重和最近报告状态
+- `mc report now [服务器ID] [时间窗口]` - 立即生成观察报告，例如 `mc report now survival 8h`
 
 当前会话关联多个服务器时，需要区分服务器的指令会显示服务器列表，发送编号选择目标服务器
 
@@ -49,6 +55,39 @@
       - `{sender}`会在执行时替换为发送者的游戏ID
       - 假设用户A绑定了游戏ID `Misaka`，并在群聊中发送`tp 114 514 1919`,实际执行的指令为`tp Misaka 114 514 1919`
       - 自定义参数将用户输入的坐标参数传递到了实际指令中，{sender}参数则提供了tp的游戏ID
+
+### MineSentinel 观察配置
+  - `mine_sentinel.enabled` 控制是否接收和分析 MC 端 `OBSERVATION_BATCH`
+  - `mine_sentinel.report.enabled` 默认开启，定时生成 AI 总结并发送到服务器配置中的 `target_sessions`
+  - `mine_sentinel.report.interval_hours` 默认 `8`，可调整为其他小时数；旧配置中的 `interval_minutes` 仍兼容
+  - `mine_sentinel.report.default_window_minutes` 默认 `480`，控制每次总结覆盖的观察窗口
+  - `mine_sentinel.retention_minutes` 默认 `480`，建议不小于 `default_window_minutes`
+  - `mine_sentinel.storage.enabled` 默认开启，完整 observation 会以 JSONL 落盘到插件数据目录下的 `mine_sentinel/observations`
+  - `mine_sentinel.storage.cleanup_interval_seconds` 默认 `300`，写入仍实时落盘，但过期 JSONL 文件清理会节流，避免高频 batch 下反复扫描目录
+  - MC 端 `schemaVersion=2` 的 `context` 字段会保留到 JSONL，用于按来源、消息类型、后端服、世界/维度重建同一问题的前因后果
+  - `mine_sentinel.storage.dedupe_memory_limit` 默认 `100000`，报告读取/导出时去重 key 超过该数量会溢写临时 SQLite 文件，避免极端窗口下去重集合撑爆内存
+  - 8 小时报告从硬盘读取窗口记录；插件不再保留 observation 内存缓存，避免聊天量大时撑爆内存
+  - `mine_sentinel.dialogue.enabled` 默认开启，会专门从玩家聊天中识别卡顿、掉线、回档、丢物品、经济异常、外挂举报、跨服异常和体验建议等问题信号
+  - `mine_sentinel.dialogue.min_issue_score`、`min_evidence_count`、`max_findings` 可调节对话问题发现的敏感度和报告展示数量
+  - `mine_sentinel.dialogue.incident_gap_seconds` 默认 `1800`，同类玩家问题超过该间隔没有新反馈时会拆成新的 incident，避免 8 小时内不同时间段的问题被揉成一条
+  - `mine_sentinel.dialogue.continuation_window_seconds` 默认 `90`，用于在同服/同后端短窗口内把“我也是”“一样”“+1”等跟进反馈归入最近明确问题
+  - `mine_sentinel.dialogue.context_window_seconds` 默认 `120`、`context_messages_per_side` 默认 `2`，报告证据会带同服/同后端前后文聊天片段，避免 AI 和管理员只看孤立单句
+  - `mine_sentinel.dialogue.custom_rules` 可追加服务器专属问题识别规则，例如 RPG 任务 NPC、领地、商店、抽奖、礼包、拍卖行等玩法黑话；规则会被清洗为安全的 category/severity/tag 后再参与报告，自定义 tag 会自动加 `custom_` 前缀并去重，避免和内置规则混组
+  - 每次报告会在 `mine_sentinel/exports` 导出本次完整窗口 JSONL 文件，并在报告备注中给出文件路径
+  - `mine_sentinel.report.send_as_image` 默认开启，报告正文会优先渲染为 PNG 图片发送，排版中会把事件卡片、风险提醒、建议处理和底部“引用上下文”分区展示；图片渲染失败时会自动回退为纯文本
+  - 图片报告默认使用 [LXGW WenKai GB](https://github.com/lxgw/LxgwWenkaiGB) 的 `LXGWWenKaiGB-Regular.ttf`，首次渲染时会自动下载并缓存到插件数据目录的 `mine_sentinel/render_cache/fonts`
+  - 若运行环境无法访问 GitHub/CDN，可手动放置中文字体到 AstrBot 数据目录的 `font.ttf`，或预先把 `LXGWWenKaiGB-Regular.ttf` 放到上述字体缓存目录
+  - `mine_sentinel.report.send_full_log_file` 默认开启，会尝试把本次完整窗口 JSONL 作为群文件/附件发送；若平台不支持文件组件，文字报告仍会正常发送
+  - `mine_sentinel.storage.include_raw` 默认关闭，报告不依赖 raw 字段；开启会增加磁盘占用和隐私风险
+  - 8 小时报告的本地规则统计会尽量使用完整窗口记录，并在报告中列出具体玩家名
+  - `mine_sentinel.report.max_records_in_memory` 默认 `50000`，用于限制单次报告放进内存分析的 observation 数；极端聊天量触发上限时会优先保留可疑玩家对话并在运维备注中说明，完整 JSONL 仍然落盘并可导出/上传
+  - `mine_sentinel.report.max_ai_records` 默认 `120`，`max_ai_prompt_chars` 默认 `30000`，仅限制提交给 AI 的润色输入，不影响本地完整记录落盘
+  - `mine_sentinel.report.provider_id` 为空时使用当前/目标会话正在使用的 AstrBot provider；填写 provider ID 时使用指定模型
+  - `mine_sentinel.report.send_to_target_sessions` 开启后，手动报告、定时报告和告警会发送到服务器配置中的目标会话
+  - `mine_sentinel.report.delivery_targets` 可独立指定 NapCat/AstrBot 发送目标，支持完整 UMO（如 `aiocqhttp:GroupMessage:123456789`）或简写 `group:QQ群号`、`qq:QQ号`、`private:QQ号`；纯数字默认按 QQ 群处理
+  - `mine_sentinel.alert.enabled` / `min_severity` / `cooldown_seconds` 控制告警发送；即时告警默认只看最近 `30` 分钟，并且同服务器最短 `60` 秒分析一次
+
+MineSentinel 不会向 MC 端下发处罚、RCON、远程指令或配置修改；它只在 AstrBot 侧聚合、去重、总结和通知。
   
 ## 更新日志
 ### v2.0.2 (2026-2-23)
@@ -85,4 +124,8 @@
 
 ## 许可证
 
-MIT License
+本子项目使用 GNU Affero General Public License v3.0，详见 [LICENSE](LICENSE)。
+
+当前仓库是多许可证工作区：根目录文件使用 Apache License 2.0，`AstrBotAdapter/` 使用 MIT License，`astrbot_plugin_minecraft_adapter/` 使用 GNU AGPL v3.0。完整说明见根目录 [README.md](../README.md) 和 [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md)。
+
+MineSentinel 图片报告运行时可自动缓存的 LXGW WenKai GB 字体由 [lxgw/LxgwWenkaiGB](https://github.com/lxgw/LxgwWenkaiGB) 提供，字体项目采用 SIL Open Font License 1.1。

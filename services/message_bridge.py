@@ -62,6 +62,31 @@ class MessageBridge:
                         if sid != server_id
                     ]
 
+    def rename_server(self, old_id: str, new_id: str, config: ServerConfig):
+        """Keep forwarding maps in sync when discovery changes the runtime id."""
+        if old_id == new_id:
+            self._server_configs[new_id] = config
+            return
+
+        self._server_configs.pop(old_id, None)
+        self._server_configs[new_id] = config
+
+        for session, servers in list(self._session_to_servers.items()):
+            updated: list[tuple[str, ServerConfig]] = []
+            for sid, cfg in servers:
+                if sid == old_id:
+                    updated.append((new_id, config))
+                else:
+                    updated.append((sid, cfg))
+            self._session_to_servers[session] = updated
+
+        for key in list(self._recently_forwarded):
+            sid, content = key
+            if sid == old_id:
+                self._recently_forwarded[(new_id, content)] = (
+                    self._recently_forwarded.pop(key)
+                )
+
     async def handle_mc_message(self, server_id: str, msg: MCMessage) -> bool:
         """处理来自 MC 服务器的消息并转发到目标会话
 

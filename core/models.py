@@ -30,6 +30,7 @@ class MessageType(str, Enum):
     COMMAND_REQUEST = "COMMAND_REQUEST"
     COMMAND_RESPONSE = "COMMAND_RESPONSE"
     STATUS_UPDATE = "STATUS_UPDATE"
+    OBSERVATION_BATCH = "OBSERVATION_BATCH"
     ERROR = "ERROR"
     DISCONNECT = "DISCONNECT"
 
@@ -78,6 +79,67 @@ class ErrorCode(int, Enum):
 
 
 @dataclass
+class DiscoveredServerInfo:
+    """Server entry reported by the Java adapter REST v2 server scan."""
+
+    server_id: str = ""
+    name: str = ""
+    display_name: str = ""
+    platform: str = ""
+    version: str = ""
+    motd: str = ""
+    online_players: int = 0
+    max_players: int = 0
+    port: int | None = None
+    scope: str = ""
+    online: bool = True
+    uptime: int = 0
+    uptime_formatted: str = ""
+    tps: dict = field(default_factory=dict)
+    mspt: float = 0.0
+    memory: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DiscoveredServerInfo":
+        return cls(
+            server_id=str(
+                data.get("id") or data.get("serverId") or data.get("name") or ""
+            ),
+            name=str(data.get("name") or data.get("id") or ""),
+            display_name=str(
+                data.get("displayName") or data.get("name") or data.get("id") or ""
+            ),
+            platform=str(data.get("platform") or ""),
+            version=str(
+                data.get("minecraftVersion")
+                or data.get("version")
+                or data.get("platformVersion")
+                or ""
+            ),
+            motd=str(data.get("motd") or ""),
+            online_players=data.get("onlinePlayers", data.get("onlineCount", 0)),
+            max_players=data.get("maxPlayers", 0),
+            port=data.get("port"),
+            scope=str(data.get("scope") or ""),
+            online=data.get("online", True),
+            uptime=data.get("uptime", 0),
+            uptime_formatted=str(data.get("uptimeFormatted") or ""),
+            tps=data.get("tps", {}) or {},
+            mspt=data.get("mspt", 0.0) or 0.0,
+            memory=data.get("memory", {}) or {},
+        )
+
+
+def _primary_discovered_server(
+    servers: list[DiscoveredServerInfo],
+) -> DiscoveredServerInfo | None:
+    for server in servers:
+        if (server.scope or "").lower() != "backend":
+            return server
+    return servers[0] if servers else None
+
+
+@dataclass
 class BackendServerInfo:
     """Backend server info reported via Velocity proxy"""
 
@@ -107,11 +169,27 @@ class BackendServerInfo:
             online=data.get("online", True),
         )
 
+    @classmethod
+    def from_discovered(cls, data: DiscoveredServerInfo) -> "BackendServerInfo":
+        return cls(
+            name=data.display_name or data.name or data.server_id,
+            platform=data.platform,
+            version=data.version,
+            online_count=data.online_players,
+            max_players=data.max_players,
+            uptime=data.uptime,
+            uptime_formatted=data.uptime_formatted,
+            tps=data.tps,
+            memory=data.memory,
+            online=data.online,
+        )
+
 
 @dataclass
 class ServerInfo:
     """来自连接或 API 的服务器信息"""
 
+    server_id: str = ""
     name: str = ""
     platform: str = ""
     platform_version: str = ""
@@ -126,18 +204,57 @@ class ServerInfo:
     backend_count: int = 0
     aggregate_online: int = 0
     aggregate_max: int = 0
+    scope: str = ""
+    discovered_servers: list[DiscoveredServerInfo] = field(default_factory=list)
 
     @property
     def is_proxy(self) -> bool:
         """Whether this server is a Velocity proxy with backends"""
-        return len(self.backends) > 0
+        return (self.scope or "").lower() == "proxy" or len(self.backends) > 0
 
     @classmethod
     def from_dict(cls, data: dict) -> "ServerInfo":
+        discovered = [
+            DiscoveredServerInfo.from_dict(item)
+            for item in data.get("servers", [])
+            if isinstance(item, dict)
+        ]
+        if discovered:
+            primary = _primary_discovered_server(discovered) or DiscoveredServerInfo()
+            aggregate = data.get("aggregate", {}) or {}
+            backends = [
+                BackendServerInfo.from_discovered(item)
+                for item in discovered
+                if (item.scope or "").lower() == "backend"
+            ]
+            return cls(
+                server_id=primary.server_id,
+                name=primary.display_name or primary.name or primary.server_id,
+                platform=primary.platform,
+                platform_version=primary.version,
+                minecraft_version=primary.version,
+                motd=primary.motd,
+                max_players=primary.max_players,
+                online_count=primary.online_players,
+                uptime=primary.uptime,
+                uptime_formatted=primary.uptime_formatted,
+                backends=backends,
+                backend_count=aggregate.get("backendCount", len(backends)),
+                aggregate_online=aggregate.get(
+                    "totalOnlinePlayers", primary.online_players
+                ),
+                aggregate_max=aggregate.get("totalMaxPlayers", primary.max_players),
+                scope=primary.scope,
+                discovered_servers=discovered,
+            )
+
         version = data.get("minecraftVersion", data.get("version", ""))
         backends = [BackendServerInfo.from_dict(b) for b in data.get("backends", [])]
         aggregate = data.get("aggregate", {})
         return cls(
+            server_id=str(
+                data.get("id") or data.get("serverId") or data.get("name") or ""
+            ),
             name=data.get("name", ""),
             platform=data.get("platform", ""),
             platform_version=data.get("platformVersion", version),
@@ -151,6 +268,7 @@ class ServerInfo:
             backend_count=data.get("backendCount", len(backends)),
             aggregate_online=aggregate.get("totalOnlinePlayers", 0),
             aggregate_max=aggregate.get("totalMaxPlayers", 0),
+            scope=str(data.get("scope") or ""),
         )
 
 
@@ -330,6 +448,7 @@ class ServerConfig:
     host: str = "localhost"
     port: int = 8765
     token: str = ""
+    auto_server_id: bool = True
     enable_ai_chat: bool = True
     text2image: bool = True
     # 消息转发配置
@@ -358,6 +477,7 @@ class ServerConfig:
             host=server.get("host", "localhost"),
             port=server.get("port", 8765),
             token=server.get("token", ""),
+            auto_server_id=data.get("auto_server_id", True),
             enable_ai_chat=data.get("enable_ai_chat", True),
             text2image=data.get("text2image", True),
             forward_chat_to_astrbot=message.get("forward_chat_to_astrbot", True),
@@ -449,14 +569,75 @@ class ServerStatus:
     plugins_enabled: int = 0
     # Velocity proxy mode: backend server statuses
     backends: list[BackendServerStatus] = field(default_factory=list)
+    scope: str = ""
+    discovered_servers: list[DiscoveredServerInfo] = field(default_factory=list)
 
     @property
     def is_proxy(self) -> bool:
         """Whether this status contains backend server data"""
-        return len(self.backends) > 0
+        return (self.scope or "").lower() == "proxy" or len(self.backends) > 0
 
     @classmethod
     def from_dict(cls, data: dict) -> "ServerStatus":
+        discovered = [
+            DiscoveredServerInfo.from_dict(item)
+            for item in data.get("servers", [])
+            if isinstance(item, dict)
+        ]
+        if discovered:
+            primary = _primary_discovered_server(discovered) or DiscoveredServerInfo()
+            backends = [
+                BackendServerStatus.from_dict(
+                    {
+                        "name": item.display_name or item.name or item.server_id,
+                        "platform": item.platform,
+                        "version": item.version,
+                        "online": item.online,
+                        "onlinePlayers": item.online_players,
+                        "maxPlayers": item.max_players,
+                        "uptime": item.uptime,
+                        "uptimeFormatted": item.uptime_formatted,
+                        "tps": item.tps,
+                        "memory": item.memory,
+                    }
+                )
+                for item in discovered
+                if (item.scope or "").lower() == "backend"
+            ]
+            tps = primary.tps
+            memory = primary.memory
+            tps_1m = tps.get("tps1m", tps.get("1m", 0.0))
+            tps_5m = tps.get("tps5m", tps.get("5m", 0.0))
+            tps_15m = tps.get("tps15m", tps.get("15m", 0.0))
+            memory_used = memory.get("used", 0)
+            memory_max = memory.get("max", memory.get("total", 0))
+            memory_free = memory.get("free", max(memory_max - memory_used, 0))
+            memory_usage_percent = (
+                memory.get("usagePercent", (memory_used / memory_max) * 100)
+                if memory_max
+                else memory.get("usagePercent", 0.0)
+            )
+            return cls(
+                online=primary.online,
+                tps_1m=tps_1m,
+                tps_5m=tps_5m,
+                tps_15m=tps_15m,
+                memory_used=memory_used,
+                memory_max=memory_max,
+                memory_free=memory_free,
+                memory_usage_percent=memory_usage_percent,
+                online_players=primary.online_players,
+                max_players=primary.max_players,
+                uptime=primary.uptime,
+                uptime_formatted=primary.uptime_formatted,
+                worlds=[],
+                plugins_total=0,
+                plugins_enabled=0,
+                backends=backends,
+                scope=primary.scope,
+                discovered_servers=discovered,
+            )
+
         tps = data.get("tps", {})
         memory = data.get("memory", {})
         plugins = data.get("plugins", {})
@@ -494,6 +675,7 @@ class ServerStatus:
             plugins_total=plugins.get("total", 0),
             plugins_enabled=plugins.get("enabled", 0),
             backends=backends,
+            scope=str(data.get("scope") or ""),
         )
 
 
