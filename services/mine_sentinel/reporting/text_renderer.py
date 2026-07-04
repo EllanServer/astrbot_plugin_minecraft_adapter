@@ -9,6 +9,19 @@ from typing import Any
 
 from ..issue_formatting import format_millis
 from .incidents import IncidentGroup, IncidentGrouper, IssuePolicy, issue_sort_key
+from .incident_format import (
+    as_millis as _as_millis,
+    clean_sentence as _clean_sentence,
+    dedupe_key as _dedupe_key,
+    evidence_line as _evidence_line,
+    format_duration as _format_duration,
+    format_time_window as _format_time_window,
+    incident_time_text as _incident_time_text,
+    incident_title as _incident_title,
+    is_attachment_note as _is_attachment_note,
+    quiet_window_text as _quiet_window_line,
+    resolve_attachment_name,
+)
 from .labels import DEFAULT_LABELS
 from .presentation import ReportPresentationBuilder
 
@@ -181,26 +194,6 @@ def _incident_event_summary(index: int, group: IncidentGroup) -> str:
     return lead
 
 
-def _incident_title(group: IncidentGroup, labels: list[str]) -> str:
-    if group.family == "moderation":
-        return "疑似作弊/破坏或利用漏洞反馈"
-    if group.family == "suggestion":
-        return labels[0] if labels else "玩家建议/体验请求"
-    if len(labels) > 1:
-        return "服务器集中出现多类异常反馈"
-    return labels[0] if labels else "玩家异常反馈"
-
-
-def _incident_time_text(group: IncidentGroup) -> str:
-    start = _as_millis(group.start_ts)
-    end = _as_millis(group.end_ts)
-    if start and end and start != end:
-        return f"{format_millis(start)} ~ {format_millis(end)} 左右"
-    if start or end:
-        return f"{format_millis(start or end)} 左右"
-    return "本窗口内"
-
-
 def _incident_labels(issues: list[dict[str, Any]]) -> list[str]:
     labels: list[str] = []
     seen: set[str] = set()
@@ -327,21 +320,6 @@ def _incident_action(issues: list[dict[str, Any]]) -> str:
     return "；".join(actions) + suffix
 
 
-def _quiet_window_line(report: dict, groups: list[IncidentGroup]) -> str:
-    if not groups:
-        return ""
-    chat_count = int(report.get("chat_count") or 0)
-    if chat_count <= 0:
-        return ""
-    if len(groups) == 1:
-        time_text = _incident_time_text(groups[0]).replace(" 左右", "")
-        return (
-            f"除 {time_text} 的集中反馈外，当前摘要中没有体现其他时间段的"
-            "大规模聊天冲突、刷屏、广告或持续性争吵。"
-        )
-    return "除上述事件外，当前摘要中没有体现其他时间段的大规模聊天冲突、刷屏、广告或持续性争吵。"
-
-
 def _category_event_summary(item: str) -> str:
     raw = item.strip()
     if raw.startswith("[") or raw.startswith("dialogue:"):
@@ -457,42 +435,6 @@ def _append_unique(items: list[str], seen: set[str], item: str):
     items.append(item)
 
 
-def _format_time_window(report: dict) -> str:
-    start = _as_millis(report.get("window_start_ts"))
-    end = _as_millis(report.get("window_end_ts"))
-    if start and end:
-        start_day = time.strftime("%Y-%m-%d", time.localtime(start / 1000))
-        end_day = time.strftime("%Y-%m-%d", time.localtime(end / 1000))
-        start_hm = time.strftime("%H:%M", time.localtime(start / 1000))
-        end_hm = time.strftime("%H:%M", time.localtime(end / 1000))
-        if start_day == end_day:
-            return f"{start_day} {start_hm} - {end_hm}"
-        return f"{start_day} {start_hm} - {end_day} {end_hm}"
-    return str(report.get("time_window") or "未知")
-
-
-def _format_duration(report: dict) -> str:
-    start = _as_millis(report.get("window_start_ts"))
-    end = _as_millis(report.get("window_end_ts"))
-    minutes = 0
-    if start and end and end > start:
-        minutes = max(1, round((end - start) / 60000))
-    else:
-        try:
-            minutes = int(report.get("_window_minutes") or 0)
-        except (TypeError, ValueError):
-            minutes = 0
-    if not minutes:
-        match = re.search(r"最近\s*(\d+)\s*分钟", str(report.get("time_window") or ""))
-        if match:
-            minutes = int(match.group(1))
-    if minutes and minutes % 60 == 0:
-        return f"{minutes // 60} 小时"
-    if minutes:
-        return f"{minutes} 分钟"
-    return "本窗口"
-
-
 def _format_servers(report: dict) -> str:
     values: list[str] = []
     server_names = report.get("server_names") or []
@@ -509,9 +451,7 @@ def _format_servers(report: dict) -> str:
 
 
 def _format_attachment(report: dict) -> str:
-    name = str(report.get("_export_file_name") or "").strip()
-    if not name and report.get("_export_file_path"):
-        name = Path(str(report["_export_file_path"])).name
+    name = resolve_attachment_name(report)
     if name:
         return f"已保存为附件 {name}"
     return "未生成附件"
@@ -538,39 +478,7 @@ def _issue_title(issue: dict[str, Any]) -> str:
     return _LABELS.issue_title(issue)
 
 
-def _evidence_line(total_count: int, dedupe_count: int, unique_players: int) -> str:
-    if dedupe_count:
-        return f"证据：共 {total_count} 条观察，去重 {dedupe_count} 条，涉及玩家 {unique_players} 人。"
-    return f"证据：共 {total_count} 条观察，涉及玩家 {unique_players} 人。"
-
-
-def _clean_sentence(value: str) -> str:
-    text = value.strip()
-    text = re.sub(r"^-+\s*", "", text)
-    if not text:
-        return ""
-    if text[-1] not in "。！？.!?":
-        text += "。"
-    return text
-
-
-def _dedupe_key(value: str) -> str:
-    return re.sub(r"\s+", "", value).lower()[:120]
-
-
-def _is_attachment_note(note: str) -> bool:
-    return "完整 observation 文件" in note or "完整聊天记录附件" in note
-
-
 def _truncate(value: str, max_length: int) -> str:
     if len(value) <= max_length:
         return value
     return value[: max(0, max_length - 3)].rstrip() + "..."
-
-
-def _as_millis(value: Any) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return number if number > 0 else 0

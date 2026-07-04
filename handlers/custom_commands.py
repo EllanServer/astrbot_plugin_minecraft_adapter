@@ -33,10 +33,15 @@ class CustomCommandParser:
             trigger_regex = trigger_regex.replace(f"<&{param}&>", f"(?P<{param}>\\S+)")
 
         trigger_name = trigger_part.split()[0] if trigger_part else ""
+        # Pre-compile the trigger regex so per-message matching doesn't pay the
+        # compilation cost on every call. match() is invoked for every incoming
+        # non-command message × every mapping.
+        compiled = re.compile(f"^{trigger_regex}$", re.IGNORECASE)
         return {
             "trigger_part": trigger_part,
             "trigger_name": trigger_name,
             "trigger_regex": trigger_regex,
+            "compiled_regex": compiled,
             "param_names": param_names,
             "command_template": command_part,
         }
@@ -45,9 +50,8 @@ class CustomCommandParser:
         self, text: str, sender_mc_name: str | None = None
     ) -> tuple[str, dict] | None:
         for mapping in self.mappings:
-            trigger_regex = mapping["trigger_regex"]
             command_template = mapping["command_template"]
-            match = re.match(f"^{trigger_regex}$", text, re.IGNORECASE)
+            match = mapping["compiled_regex"].match(text)
             if not match:
                 continue
 

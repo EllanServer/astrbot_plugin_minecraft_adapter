@@ -1,5 +1,6 @@
 """用户绑定服务，用于将外部平台用户与 MC 玩家关联"""
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -114,7 +115,7 @@ class BindingService:
         """创建用户的唯一键"""
         return f"{platform}:{user_id}"
 
-    def bind(
+    async def bind(
         self,
         platform: str,
         user_id: str,
@@ -158,11 +159,11 @@ class BindingService:
             self._storage.mc_name_index[mc_name_lower] = []
         self._storage.mc_name_index[mc_name_lower].append(key)
 
-        self._save()
+        await asyncio.to_thread(self._save)
         logger.info(f"[BindingService] 已绑定 {platform}:{user_id} -> {mc_player_name}")
         return True, f"成功绑定玩家 {mc_player_name}"
 
-    def unbind(self, platform: str, user_id: str) -> tuple[bool, str]:
+    async def unbind(self, platform: str, user_id: str) -> tuple[bool, str]:
         """解绑外部用户
 
         返回:
@@ -187,7 +188,7 @@ class BindingService:
         # 移除绑定
         del self._storage.bindings[key]
 
-        self._save()
+        await asyncio.to_thread(self._save)
         logger.info(
             f"[BindingService] 已解绑 {platform}:{user_id} (原绑定玩家: {binding.mc_player_name})"
         )

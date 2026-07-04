@@ -96,17 +96,39 @@ class IncidentGrouper:
 
     def group(self, issues: list[dict[str, Any]]) -> list[IncidentGroup]:
         groups: list[IncidentGroup] = []
+        # Inverted index: (family, scope) -> list of groups that share that
+        # scope. Lets each new issue probe only candidate groups sharing at
+        # least one scope, instead of scanning every existing group (O(N×M) ->
+        # roughly O(N×candidates_per_scope)).
+        index: dict[tuple[str, str], list[IncidentGroup]] = {}
         for issue in sorted(issues, key=issue_sort_key):
             if is_metric_issue(issue):
                 continue
+            family = issue_family(issue)
+            scopes = set(issue_scopes(issue))
+            # Gather candidate groups that share at least one scope.
+            seen_ids: set[int] = set()
+            candidates: list[IncidentGroup] = []
+            for scope in scopes:
+                for group in index.get((family, scope), ()):
+                    if id(group) not in seen_ids:
+                        seen_ids.add(id(group))
+                        candidates.append(group)
             placed = False
-            for group in groups:
+            for group in candidates:
                 if self.can_merge(group, issue):
                     group.add(issue)
+                    # New scopes from the issue may expand the group's index
+                    # footprint so future issues with those scopes find it.
+                    for new_scope in group.scopes - scopes:
+                        index.setdefault((family, new_scope), []).append(group)
                     placed = True
                     break
             if not placed:
-                groups.append(IncidentGroup.from_issue(issue))
+                new_group = IncidentGroup.from_issue(issue)
+                groups.append(new_group)
+                for scope in new_group.scopes:
+                    index.setdefault((family, scope), []).append(new_group)
         groups.sort(key=incident_sort_key)
         return groups
 

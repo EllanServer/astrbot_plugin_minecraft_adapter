@@ -11,12 +11,17 @@ from pathlib import Path
 class DedupeTracker:
     """Exact seen-key tracker that spills to a temp SQLite file when needed."""
 
+    # Number of inserts to buffer before committing to SQLite. Each implicit
+    # commit forces a disk sync; batching amortizes that across many keys.
+    _BATCH_SIZE = 2000
+
     def __init__(self, max_memory_keys: int = 100000, temp_dir: Path | None = None):
         self.max_memory_keys = max(1, int(max_memory_keys))
         self.temp_dir = temp_dir
         self._keys: set[str] = set()
         self._conn: sqlite3.Connection | None = None
         self._path: Path | None = None
+        self._pending = 0
 
     def __enter__(self) -> "DedupeTracker":
         return self
@@ -42,14 +47,22 @@ class DedupeTracker:
             self._spill_to_sqlite()
 
         assert self._conn is not None
-        try:
-            self._conn.execute("INSERT INTO seen(key) VALUES (?)", (key,))
-            return False
-        except sqlite3.IntegrityError:
-            return True
+        # INSERT OR IGNORE is faster than try/except IntegrityError and lets us
+        # use rowcount to detect duplicates without exception overhead.
+        cursor = self._conn.execute("INSERT OR IGNORE INTO seen(key) VALUES (?)", (key,))
+        if cursor.rowcount == 0:
+            return True  # key already existed
+        self._pending += 1
+        if self._pending >= self._BATCH_SIZE:
+            self._conn.commit()
+            self._pending = 0
+        return False
 
     def close(self):
         if self._conn is not None:
+            if self._pending:
+                self._conn.commit()
+                self._pending = 0
             self._conn.close()
             self._conn = None
         if self._path is not None:

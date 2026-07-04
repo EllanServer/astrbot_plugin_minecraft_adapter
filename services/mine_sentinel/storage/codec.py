@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -77,12 +78,49 @@ class ObservationRecordCodec:
         except FileNotFoundError:
             return
 
+    def read_jsonl_window(
+        self,
+        path: Path,
+        cutoff_ms: int,
+        end_ms: int | None = None,
+    ):
+        """Yield JSONL rows whose timestamp falls in [cutoff_ms, end_ms).
+
+        JSONL files are append-only and written in timestamp order, so once a
+        record's timestamp exceeds ``end_ms`` we can stop scanning the rest of
+        the file. Records older than ``cutoff_ms`` are skipped but scanning
+        continues because earlier files may still contain in-window rows.
+        """
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    ts = data.get("timestamp")
+                    if not isinstance(ts, (int, float)):
+                        yield data
+                        continue
+                    if ts < cutoff_ms:
+                        continue
+                    if end_ms is not None and ts > end_ms:
+                        break
+                    yield data
+        except FileNotFoundError:
+            return
+
     def dedupe_key(self, record: ObservationRecord) -> str:
         if record.event_id:
             return record.event_id
         bucket = record.timestamp // max(1, self.config.dedupe_window_seconds * 1000)
         content = " ".join(record.content.lower().split())
-        return "|".join(
+        raw = "|".join(
             [
                 record.kind,
                 record.server_id,
@@ -91,6 +129,11 @@ class ObservationRecordCodec:
                 str(bucket),
             ]
         )
+        # blake2b digest keeps keys fixed-length (32 hex chars) regardless of
+        # content length. With 100k+ keys in DedupeTracker's set or SQLite,
+        # shorter keys mean less memory and faster comparisons. 128-bit digest
+        # makes collisions practically impossible for this scale.
+        return "h:" + hashlib.blake2b(raw.encode("utf-8"), digest_size=16).hexdigest()
 
     def compact_dict(self, data: dict[str, Any], max_fields: int) -> dict[str, Any]:
         compact: dict[str, Any] = {}

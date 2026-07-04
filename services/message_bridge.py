@@ -1,5 +1,6 @@
 """MC 与其他平台之间转发消息的消息桥接服务"""
 
+import asyncio
 import re
 import time
 from typing import TYPE_CHECKING
@@ -56,11 +57,16 @@ class MessageBridge:
             # 从反向映射中移除
             for session in config.target_sessions:
                 if session in self._session_to_servers:
-                    self._session_to_servers[session] = [
+                    remaining = [
                         (sid, cfg)
                         for sid, cfg in self._session_to_servers[session]
                         if sid != server_id
                     ]
+                    if remaining:
+                        self._session_to_servers[session] = remaining
+                    else:
+                        # 清理空列表，避免内存泄漏与 get_servers_for_session 返回空列表
+                        del self._session_to_servers[session]
 
     def rename_server(self, old_id: str, new_id: str, config: ServerConfig):
         """Keep forwarding maps in sync when discovery changes the runtime id."""
@@ -129,8 +135,9 @@ class MessageBridge:
             return False
 
         # 发送到每个目标会话
-        for target_umo in targets:
-            await self._send_to_session(target_umo, content)
+        await asyncio.gather(
+            *(self._send_to_session(target_umo, content) for target_umo in targets)
+        )
 
         return True
 
@@ -209,13 +216,19 @@ class MessageBridge:
         message_str = event.message_str
         umo = event.unified_msg_origin
 
-        # 检查每个服务器配置
-        any_forwarded = False
-        for server_id, config in self._server_configs.items():
-            # 检查此会话是否在目标会话列表中
-            if not config.target_sessions or umo not in config.target_sessions:
-                continue
+        # 通过反向索引直接拿到绑定了该会话的服务器，避免 O(N×M) 线性扫描。
+        matched_servers = self._session_to_servers.get(umo)
+        if not matched_servers:
+            return False
 
+        # 这些值不随服务器变化，提前取一次即可。
+        sender_name = event.get_sender_name()
+        sender_id = event.get_sender_id()
+        platform_name = event.get_platform_name()
+
+        # 检查每个匹配的服务器配置
+        any_forwarded = False
+        for server_id, config in matched_servers:
             # 前缀为空时转发全部消息，否则检查前缀
             if config.auto_forward_prefix:
                 if not message_str.startswith(config.auto_forward_prefix):
@@ -227,11 +240,6 @@ class MessageBridge:
 
             if not content:
                 continue
-
-            # 获取发送者信息
-            sender_name = event.get_sender_name()
-            sender_id = event.get_sender_id()
-            platform_name = event.get_platform_name()
 
             # 发送到 MC 服务器
             server = self.server_manager.get_server(server_id)
@@ -345,11 +353,10 @@ class MessageBridge:
 
     def get_servers_for_session(self, umo: str) -> list[str]:
         """获取目标会话包含该 UMO 的服务器 ID 列表"""
-        result = []
-        for server_id, config in self._server_configs.items():
-            if config.target_sessions and umo in config.target_sessions:
-                result.append(server_id)
-        return result
+        matched = self._session_to_servers.get(umo)
+        if not matched:
+            return []
+        return [server_id for server_id, _ in matched]
 
     def strip_color_codes(self, text: str) -> str:
         """从文本中移除 Minecraft 颜色代码"""

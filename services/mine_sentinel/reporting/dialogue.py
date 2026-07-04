@@ -14,7 +14,7 @@ from .dialogue_signals import (
     replaceable_sample_index,
     signal_fingerprint,
 )
-from .dialogue_terms import matched_terms, normalize_text
+from .dialogue_terms import RuleTermMatcher, normalize_text
 
 
 MODERATION_CATEGORY = "moderation"
@@ -26,6 +26,11 @@ class PlayerDialogueAnalyzer:
     def __init__(self, config: MineSentinelConfig):
         self.config = config
         self.rules = dialogue_rules_from_config(config.dialogue.custom_rules)
+        # Pre-compile all rule keywords into one alternation regex so each chat
+        # record is scanned once instead of rules × keywords str.find passes.
+        self._matcher = RuleTermMatcher(
+            (rule, rule.keywords, rule.urgent_terms) for rule in self.rules
+        )
         self.output = DialogueIssueBuilder(config)
 
     def analyze(self, records: list[ObservationRecord]) -> dict[str, Any]:
@@ -49,12 +54,11 @@ class PlayerDialogueAnalyzer:
         )
         for record in chat_records:
             text = normalize_text(record.content)
-            direct_matches = []
-            for rule in self.rules:
-                terms = matched_terms(text, rule.keywords)
-                if not terms:
-                    continue
-                direct_matches.append((rule, terms))
+            # Single-pass scan: one regex finds every keyword/urgent hit per rule.
+            direct_matches: list[tuple[DialogueRule, list[str]]] = []
+            for rule, (keywords, _urgent) in self._matcher.scan(text).items():
+                if keywords:
+                    direct_matches.append((rule, keywords))
             if direct_matches:
                 for rule, terms in self._prioritized_direct_matches(direct_matches):
                     collector.add(record, rule, terms, text)
@@ -81,8 +85,8 @@ class PlayerDialogueAnalyzer:
         text = normalize_text(record.content)
         best_rule = None
         best_count = 0
-        for rule in self.rules:
-            count = len(matched_terms(text, rule.keywords))
+        for rule, terms in self._matcher.matched_keywords(text).items():
+            count = len(terms)
             if count > best_count or (
                 count
                 and count == best_count

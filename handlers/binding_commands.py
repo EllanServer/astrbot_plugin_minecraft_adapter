@@ -46,7 +46,7 @@ class BindingCommandHandler:
             yield event.plain_result("❌ 绑定功能未启用")
             return
 
-        success, message = self.binding_service.bind(
+        success, message = await self.binding_service.bind(
             platform=event.get_platform_name(),
             user_id=event.get_sender_id(),
             mc_player_name=player_id,
@@ -58,7 +58,7 @@ class BindingCommandHandler:
 
     async def handle_unbind(self, event: "AstrMessageEvent"):
         """Remove the current chat account's Minecraft binding."""
-        success, message = self.binding_service.unbind(
+        success, message = await self.binding_service.unbind(
             platform=event.get_platform_name(),
             user_id=event.get_sender_id(),
         )

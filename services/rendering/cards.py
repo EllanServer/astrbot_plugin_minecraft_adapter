@@ -40,7 +40,6 @@ class ImageCardRenderer:
 
     _CARD_W = DEFAULT_THEME.card_w
     _CARD_BG = DEFAULT_THEME.card_bg
-    _PROXY_NAMES = {"vc", "velocity", "proxy", "bungeecord", "waterfall"}
 
     _COLOR_PRIMARY = DEFAULT_THEME.color_primary
     _COLOR_TEXT_MAIN = DEFAULT_THEME.color_text_main
@@ -60,9 +59,17 @@ class ImageCardRenderer:
         cards: list[tuple[str, "ServerInfo", "ServerStatus"]],
     ) -> BytesIO:
         await self._ensure_assets()
+        # PIL drawing is CPU-bound; run it off the event loop so WebSocket
+        # heartbeats and message dispatch are not blocked while rendering.
+        return await asyncio.to_thread(self._render_multi_server_status_sync, cards)
+
+    def _render_multi_server_status_sync(
+        self,
+        cards: list[tuple[str, "ServerInfo", "ServerStatus"]],
+    ) -> BytesIO:
         images: list[Image.Image] = []
         for tag, info, status in cards:
-            single = await self._render_server_status_card(
+            single = self._render_server_status_card(
                 info,
                 status,
                 server_tag=tag,
@@ -139,14 +146,14 @@ class ImageCardRenderer:
         return norm(value)
 
     def _is_proxy_like_name(self, name: str) -> bool:
-        return is_proxy_like_name(name, self._PROXY_NAMES)
+        return is_proxy_like_name(name)
 
     def _get_effective_server_name(
         self,
         player: "PlayerInfo | PlayerDetail",
         fallback: str,
     ) -> str:
-        return get_effective_server_name(player, fallback, self._PROXY_NAMES)
+        return get_effective_server_name(player, fallback)
 
     async def _get_avatar(
         self,
@@ -166,7 +173,7 @@ class ImageCardRenderer:
     def _new_card(estimate_h: int) -> tuple[Image.Image, ImageDraw.ImageDraw]:
         return new_card(estimate_h)
 
-    async def _render_server_status_card(
+    def _render_server_status_card(
         self,
         server_info: "ServerInfo",
         server_status: "ServerStatus",
@@ -325,13 +332,13 @@ class ImageCardRenderer:
         player: "PlayerInfo",
         fallback: str,
     ) -> str:
-        return effective_player_info_server_id(player, fallback, self._PROXY_NAMES)
+        return effective_player_info_server_id(player, fallback)
 
     def _flatten_player_cards(
         self,
         cards: list[tuple[str, list["PlayerInfo"], int, str]],
     ) -> list[tuple[str, list["PlayerInfo"], int, str]]:
-        return flatten_player_cards(cards, self._PROXY_NAMES)
+        return flatten_player_cards(cards)
 
     async def _render_multi_player_list_card(
         self,

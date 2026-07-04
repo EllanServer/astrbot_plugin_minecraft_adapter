@@ -34,6 +34,13 @@ class DiskObservationStore:
         self.observation_dir.mkdir(parents=True, exist_ok=True)
         self.export_dir.mkdir(parents=True, exist_ok=True)
         self._last_cleanup_at: float | None = None
+        # Short-lived cache for the most recent window read, so that an alert
+        # triggered right after a periodic report (or vice versa) does not scan
+        # disk twice for the same window. Key: (window_minutes, server_id).
+        self._window_cache_key: tuple[int, str | None] | None = None
+        self._window_cache_value: RecentObservationWindow | None = None
+        self._window_cache_at: float = 0.0
+        self._window_cache_ttl: float = 30.0
 
     def add_batch(self, server_id: str, payload: dict[str, Any]) -> int:
         if not self.config.enabled or not self.config.storage.enabled:
@@ -75,6 +82,9 @@ class DiskObservationStore:
                 written += 1
 
         self.cleanup_if_due(now)
+        # New observations invalidate the cached window read.
+        self._window_cache_key = None
+        self._window_cache_value = None
         return written
 
     def recent(
@@ -93,7 +103,20 @@ class DiskObservationStore:
         if not self.config.enabled or not self.config.storage.enabled:
             return RecentObservationWindow([], 0, 0, False, 0)
 
-        cutoff_ms = int((time.time() - window_minutes * 60) * 1000)
+        cache_key = (window_minutes, server_id)
+        now = time.time()
+        if (
+            self._window_cache_key == cache_key
+            and self._window_cache_value is not None
+            and now - self._window_cache_at < self._window_cache_ttl
+            and max_records is None
+        ):
+            return self._window_cache_value
+
+        cutoff_ms = int((now - window_minutes * 60) * 1000)
+        # window end bound = now; lets read_jsonl_window stop scanning a file
+        # once it encounters records beyond the window upper bound.
+        end_ms = int(now * 1000)
         limit = max(1, max_records or self.config.report.max_records_in_memory)
         builder = RecentWindowBuilder(
             limit,
@@ -101,15 +124,23 @@ class DiskObservationStore:
         )
         with self._dedupe_tracker() as seen:
             for path in self._candidate_files(server_id, cutoff_ms):
-                for row in self.codec.read_jsonl(path):
+                for row in self.codec.read_jsonl_window(path, cutoff_ms, end_ms):
                     record = ObservationRecord.from_dict(row)
                     if record.timestamp < cutoff_ms:
+                        continue
+                    if record.timestamp > end_ms:
                         continue
                     key = self.codec.dedupe_key(record)
                     if seen.seen_or_add(key):
                         continue
                     builder.add(record)
-        return builder.build()
+        result = builder.build()
+
+        if max_records is None:
+            self._window_cache_key = cache_key
+            self._window_cache_value = result
+            self._window_cache_at = now
+        return result
 
     def export_records(
         self,
@@ -137,17 +168,20 @@ class DiskObservationStore:
         if not self.config.enabled or not self.config.storage.enabled:
             return None
 
-        now = int(time.time())
-        cutoff_ms = int((now - window_minutes * 60) * 1000)
-        path = export_path(self.export_dir, window_minutes, server_id, label, now)
+        now_ts = int(time.time())
+        cutoff_ms = int((now_ts - window_minutes * 60) * 1000)
+        end_ms = int(now_ts * 1000)
+        path = export_path(self.export_dir, window_minutes, server_id, label, now_ts)
 
         written = 0
         with self._dedupe_tracker() as seen:
             with path.open("w", encoding="utf-8") as handle:
                 for source_path in self._candidate_files(server_id, cutoff_ms):
-                    for row in self.codec.read_jsonl(source_path):
+                    for row in self.codec.read_jsonl_window(source_path, cutoff_ms, end_ms):
                         record = ObservationRecord.from_dict(row)
                         if record.timestamp < cutoff_ms:
+                            continue
+                        if record.timestamp > end_ms:
                             continue
                         key = self.codec.dedupe_key(record)
                         if seen.seen_or_add(key):

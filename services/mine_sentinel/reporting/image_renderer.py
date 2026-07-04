@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from io import BytesIO
@@ -13,6 +14,19 @@ from PIL import Image, ImageDraw
 from ...rendering.fonts import FontProvider
 from ...rendering.image import save_png
 from ..issue_formatting import format_millis
+from .incident_format import (
+    as_millis as _as_millis,
+    clean_sentence as _clean_sentence,
+    dedupe_key as _dedupe_key,
+    evidence_line as _evidence_line,
+    format_duration as _format_duration,
+    format_time_window as _format_time_window,
+    incident_time_text as _incident_time_text,
+    incident_title as _incident_title,
+    is_attachment_note as _is_attachment_note,
+    quiet_window_text as _quiet_window_text,
+    resolve_attachment_name,
+)
 from .incidents import IncidentGroup, IncidentGrouper, IssuePolicy, issue_sort_key
 from .labels import DEFAULT_LABELS
 from .presentation import ReportPresentationBuilder
@@ -55,6 +69,24 @@ class MineSentinelReportImageRenderer:
         unique_players: int,
     ) -> BytesIO:
         await self._ensure_assets()
+        # The actual drawing is pure CPU-bound PIL work on a large canvas;
+        # run it off the event loop so heartbeats/message dispatch are not
+        # blocked while a report image (often 20000+px tall) is rendered.
+        return await asyncio.to_thread(
+            self._draw_report,
+            report,
+            total_count,
+            dedupe_count,
+            unique_players,
+        )
+
+    def _draw_report(
+        self,
+        report: dict,
+        total_count: int,
+        dedupe_count: int,
+        unique_players: int,
+    ) -> BytesIO:
         presentation = self._presentation_builder.build(
             report,
             total_count,
@@ -434,38 +466,6 @@ def _wrap_tokens(text: str) -> list[str]:
 _CLOSING_PUNCTUATION = set("，。；：！？、）】》」』”’")
 
 
-def _format_time_window(report: dict) -> str:
-    start = _as_millis(report.get("window_start_ts"))
-    end = _as_millis(report.get("window_end_ts"))
-    if start and end:
-        start_day = time.strftime("%Y-%m-%d", time.localtime(start / 1000))
-        end_day = time.strftime("%Y-%m-%d", time.localtime(end / 1000))
-        start_hm = time.strftime("%H:%M", time.localtime(start / 1000))
-        end_hm = time.strftime("%H:%M", time.localtime(end / 1000))
-        if start_day == end_day:
-            return f"{start_day} {start_hm} - {end_hm}"
-        return f"{start_day} {start_hm} - {end_day} {end_hm}"
-    return str(report.get("time_window") or "未知")
-
-
-def _format_duration(report: dict) -> str:
-    start = _as_millis(report.get("window_start_ts"))
-    end = _as_millis(report.get("window_end_ts"))
-    minutes = 0
-    if start and end and end > start:
-        minutes = max(1, round((end - start) / 60000))
-    else:
-        try:
-            minutes = int(report.get("_window_minutes") or 0)
-        except (TypeError, ValueError):
-            minutes = 0
-    if minutes and minutes % 60 == 0:
-        return f"{minutes // 60} 小时"
-    if minutes:
-        return f"{minutes} 分钟"
-    return "本窗口"
-
-
 def _format_servers(report: dict) -> str:
     values: list[str] = []
     server_names = report.get("server_names") or []
@@ -482,10 +482,7 @@ def _format_servers(report: dict) -> str:
 
 
 def _format_attachment_name(report: dict) -> str:
-    name = str(report.get("_export_file_name") or "").strip()
-    if not name and report.get("_export_file_path"):
-        name = Path(str(report["_export_file_path"])).name
-    return name or "未生成"
+    return resolve_attachment_name(report) or "未生成"
 
 
 def _overall_line(
@@ -503,26 +500,6 @@ def _overall_line(
     if not players or players == "未知":
         players = "暂无明确发言玩家"
     return f"{status}共有 {unique_players} 名玩家出现记录，活跃玩家主要是：{players}。"
-
-
-def _incident_title(group: IncidentGroup, labels: list[str]) -> str:
-    if group.family == "moderation":
-        return "疑似作弊/破坏或利用漏洞反馈"
-    if group.family == "suggestion":
-        return labels[0] if labels else "玩家建议/体验请求"
-    if len(labels) > 1:
-        return "服务器集中出现多类异常反馈"
-    return labels[0] if labels else "玩家异常反馈"
-
-
-def _incident_time_text(group: IncidentGroup) -> str:
-    start = _as_millis(group.start_ts)
-    end = _as_millis(group.end_ts)
-    if start and end and start != end:
-        return f"{format_millis(start)} ~ {format_millis(end)} 左右"
-    if start or end:
-        return f"{format_millis(start or end)} 左右"
-    return "本窗口内"
 
 
 def _incident_labels(
@@ -729,21 +706,6 @@ def _action_lines(issues: list[dict[str, Any]]) -> list[str]:
     ]
 
 
-def _quiet_window_text(report: dict, groups: list[IncidentGroup]) -> str:
-    if not groups or int(report.get("chat_count") or 0) <= 0:
-        return ""
-    if len(groups) == 1:
-        time_text = _incident_time_text(groups[0]).replace(" 左右", "")
-        return f"除 {time_text} 的集中反馈外，当前摘要中没有体现其他时间段的大规模聊天冲突、刷屏、广告或持续性争吵。"
-    return "除上述事件外，当前摘要中没有体现其他时间段的大规模聊天冲突、刷屏、广告或持续性争吵。"
-
-
-def _evidence_line(total_count: int, dedupe_count: int, unique_players: int) -> str:
-    if dedupe_count:
-        return f"证据：共 {total_count} 条观察，去重 {dedupe_count} 条，涉及玩家 {unique_players} 人。"
-    return f"证据：共 {total_count} 条观察，涉及玩家 {unique_players} 人。"
-
-
 def _incident_colors(family: str) -> tuple[str, str]:
     if family == "moderation":
         return "#fef2f2", "#dc2626"
@@ -762,25 +724,3 @@ def _unique_text(values: list[str]) -> list[str]:
         seen.add(key)
         result.append(value)
     return result
-
-
-def _clean_sentence(value: str) -> str:
-    text = value.strip()
-    text = re.sub(r"^-+\s*", "", text)
-    if not text:
-        return ""
-    if text[-1] not in "。！？.!?":
-        text += "。"
-    return text
-
-
-def _dedupe_key(value: str) -> str:
-    return re.sub(r"\s+", "", value).lower()[:120]
-
-
-def _as_millis(value: Any) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return number if number > 0 else 0

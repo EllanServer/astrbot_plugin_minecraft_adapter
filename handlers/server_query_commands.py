@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -38,8 +39,12 @@ class ServerQueryCommandHandler:
 
         cards: list[tuple[str, object, object]] = []
         errors: list[str] = []
-        for server in online_servers:
-            server_cards, err = await self.collect_status_cards(server)
+        # Fetch each server's status concurrently; previously this was a serial
+        # await loop so N servers took sum(latency) instead of max(latency).
+        results = await asyncio.gather(
+            *(self.collect_status_cards(server) for server in online_servers)
+        )
+        for server_cards, err in results:
             if err:
                 errors.append(err)
                 continue
@@ -125,8 +130,10 @@ class ServerQueryCommandHandler:
 
         cards: list[tuple[str, list, int, str]] = []
         errors: list[str] = []
-        for server in online_servers:
-            server_cards, err = await self.collect_list_cards(server)
+        results = await asyncio.gather(
+            *(self.collect_list_cards(server) for server in online_servers)
+        )
+        for server_cards, err in results:
             if err:
                 errors.append(err)
                 continue
@@ -208,15 +215,26 @@ class ServerQueryCommandHandler:
             return
 
         cards: list[tuple[str, object]] = []
-        for server in online_servers:
+
+        async def _resolve_one(server):
             player, _ = await server.rest_client.get_player_by_name(player_id)
             if not player:
-                continue
+                return None
             player_server_name = await self.resolve_player_card_server_name(
                 server,
                 player,
             )
-            cards.append((player_server_name, player))
+            return (player_server_name, player)
+
+        # Query each server concurrently; per server the player lookup and the
+        # server-name resolution stay sequential (latter depends on former),
+        # but different servers no longer wait for each other.
+        resolved = await asyncio.gather(
+            *(_resolve_one(server) for server in online_servers)
+        )
+        for item in resolved:
+            if item is not None:
+                cards.append(item)
 
         if not cards:
             yield event.plain_result("❌ 玩家在所有在线服务器中均无数据")

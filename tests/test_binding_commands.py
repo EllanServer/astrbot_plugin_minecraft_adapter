@@ -90,11 +90,11 @@ class _BindingService:
         self.bound = None
         self.unbound = None
 
-    def bind(self, **kwargs):
+    async def bind(self, **kwargs):
         self.bound = kwargs
         return self.bind_result
 
-    def unbind(self, **kwargs):
+    async def unbind(self, **kwargs):
         self.unbound = kwargs
         return self.unbind_result
 
