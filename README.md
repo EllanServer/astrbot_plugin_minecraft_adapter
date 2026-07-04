@@ -188,42 +188,51 @@ mine_sentinel:
 - MC Java 插件 Actions：https://github.com/EllanServer/AstrBotAdapter/actions
 - AstrBot 插件仓库：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter
 - AstrBot 插件 Actions：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter/actions
-- NapCatQQ 仓库：https://github.com/NapNeko/NapCatQQ
-- NapCatQQ Releases：https://github.com/NapNeko/NapCatQQ/releases
-- NapCat Shell 安装文档：https://napneko.github.io/guide/boot/Shell
+- NapCatQQ 仓库（仅 OneBot/NapCat 路线需要）：https://github.com/NapNeko/NapCatQQ
+- NapCatQQ Releases（仅 OneBot/NapCat 路线需要）：https://github.com/NapNeko/NapCatQQ/releases
+- NapCat Shell 安装文档（仅 OneBot/NapCat 路线需要）：https://napneko.github.io/guide/boot/Shell
 
 开始前先向我索取这些信息，不要自行猜路径：
 1. 部署模式：单服 / Velocity 群组服。
 2. Minecraft 服务器根目录。单服给一个根目录；Velocity 群组服请给 Velocity 根目录和每个后端服根目录。
 3. AstrBot 根目录。
-4. 要接收 AI 总结的 QQ 群或 UMO。优先提供 `/sid` 输出，例如 napcat:GroupMessage:123456789 或 qq_official:GroupMessage:群 openid；也可以提供 group:123456789 或 qq:123456789 简写。
-5. NapCat 安装目录如果已知可一并提供；不知道就留空，由你先自动检测。
-6. 是否现在重启 MC 服务端、AstrBot 和 NapCat。
+4. 要接收 AI 总结的 QQ 群或 UMO。优先提供 `/sid` 输出，例如 napcat:GroupMessage:123456789 或 qq_official:GroupMessage:群 openid；也可以提供 group:123456789 或 qq:123456789 简写。官方 QQ Bot 下的 group 值通常是 group_openid 或频道 ID，不一定是传统 QQ 群号，所以优先用 `/sid`。
+5. 要使用的 QQ 连接方式：已有官方 QQ Bot / 已有 OneBot-NapCat / 需要新装 NapCat / 不确定。
+6. NapCat 安装目录如果已知可一并提供；如果使用官方 QQ Bot 或不知道就留空，由你先自动检测。
+7. AstrBot 实际使用的 Python 路径或安装方式（uv tool、venv、Docker、源码运行等）；不知道就留空，由你先检测。
+8. 是否现在重启 MC 服务端、AstrBot 和相关 QQ 连接进程。
 
 拿到路径后执行：
 1. 检查所有目录是否存在，识别 plugins 目录、AstrBot 插件目录和现有配置文件。
-2. 先检测 NapCat/OneBot 是否已经安装和运行，不要一上来重装：
+2. 先检测 AstrBot 现有 QQ 平台，不要一上来安装 NapCat：
+   - 检查 AstrBot 平台配置和运行状态，识别 `qq_official`、`qq_official_webhook`、`aiocqhttp`/OneBot v11；确认当前要使用的平台已经 connected/running。
+   - 如果官方 QQ Bot 已可用，记录平台 id、平台名和 `/sid` 输出，跳过 NapCat 安装。
+   - 如果用户选择 OneBot/NapCat，或当前只有 aiocqhttp/OneBot 配置，再检测 NapCat 是否已经安装和运行。
    - Windows：检查进程 NapCat/NapCatQQ/QQ/NapCatWinBootMain，检查服务、计划任务、常见目录、AstrBot 同级目录和用户给出的 NapCat 目录。
    - Linux：检查 ps、systemctl、pm2、docker ps、which napcat、sudo napcat、常见安装目录和 AstrBot 同级目录。
-   - 同时检查 AstrBot 现有 aiocqhttp/OneBot v11/官方 QQ Bot 适配器配置，确认当前要使用的平台已经 connected/running。
-   - 如果 NapCat 已安装且可用，只记录安装位置和连接方式，不覆盖现有配置。
-3. 如果检测不到 NapCat，先询问并确认 NapCat 安装目录、运行方式（Windows Shell 一键包 / Linux Shell / Docker）和机器人 QQ 号，然后按官方 NapCatQQ Releases 与 Shell 安装文档安装：
+   - 如果已有可用 QQ 平台或 NapCat 连接，只记录安装位置和连接方式，不覆盖现有配置。
+3. 只有在用户选择 OneBot/NapCat 且检测不到可用 NapCat 时，才先询问并确认 NapCat 安装目录、运行方式（Windows Shell 一键包 / Linux Shell / Docker）和机器人 QQ 号，然后按官方 NapCatQQ Releases 与 Shell 安装文档安装：
    - Windows AMD64 优先下载 NapCat.Shell.Windows.OneKey.zip，解压到无中文和空格的目录，运行安装器或 napcat.bat。
    - Linux 优先按官方 Shell 文档/installer 安装；如果用户要求 Docker，再使用 Docker 方式。
    - 不要让 AI 输入 QQ 密码；启动 NapCat 后让用户扫码/手动登录。
    - 配置 OneBot v11 WebSocket 或 HTTP，使 AstrBot 能连接 NapCat；若已有可用连接，保持原配置。
-4. 从 GitHub Actions 下载两个仓库最新 successful workflow 的构建产物和源码。优先使用 gh：
+4. 从 GitHub Actions 下载两个仓库最新 successful workflow 的构建产物和源码。Rust 版 AstrBot 插件已经移除 Python fallback，必须下载并安装 `mine_sentinel_rs` native wheel，不要在目标机本地编译 Rust wheel。优先使用 gh：
    - gh run list -R EllanServer/AstrBotAdapter --branch main --status success --limit 1
    - gh run download -R EllanServer/AstrBotAdapter <run-id> --dir ./downloads/AstrBotAdapter
-   - gh run list -R EllanServer/astrbot_plugin_minecraft_adapter --branch pyo3-mine-sentinel --status success --limit 1
+   - gh run list -R EllanServer/astrbot_plugin_minecraft_adapter --branch master --workflow "Build Rust wheels" --status success --limit 1
    - gh run download -R EllanServer/astrbot_plugin_minecraft_adapter <run-id> --dir ./downloads/astrbot_plugin_minecraft_adapter
-   如果没有 gh，就打开上面的 Actions 链接下载最新成功运行的 artifacts。若 Actions 没有源码 artifact，则同时下载源码 ZIP：
+   如果没有 gh，就打开上面的 Actions 链接下载最新成功运行的 artifacts。AstrBot 插件源码从主分支下载源码 ZIP：
    - https://github.com/EllanServer/AstrBotAdapter/archive/refs/heads/main.zip
-   - https://github.com/EllanServer/astrbot_plugin_minecraft_adapter/archive/refs/heads/pyo3-mine-sentinel.zip
+   - https://github.com/EllanServer/astrbot_plugin_minecraft_adapter/archive/refs/heads/master.zip
+   - 按 AstrBot 运行时选择 wheel artifact：Windows x86_64 选 `mine_sentinel_rs-wheel-windows-x86_64-cp3.xx`，Linux x86_64 选 `mine_sentinel_rs-wheel-linux-x86_64-cp3.xx`，Linux ARM64 选 `mine_sentinel_rs-wheel-linux-aarch64-cp3.xx`，macOS Apple Silicon 选 `mine_sentinel_rs-wheel-macos-arm64-cp3.xx`。`cp3.xx` 必须和 AstrBot Python 版本一致，例如 Python 3.12 选 `cp3.12`。
 5. 安装 Java 插件：
    - 单服：把最新 Backend jar 放进该服务器根目录的 plugins/。
    - Velocity 群组服：把 Velocity jar 放进 Velocity 的 plugins/，把 Backend jar 放进每个后端服的 plugins/；如果产物包含 libs/，按 README 保持 libs/ 与 Velocity jar 同级。
-6. 安装 AstrBot 插件：把 astrbot_plugin_minecraft_adapter 最新源码放进 AstrBot 的插件目录，目录名保持 astrbot_plugin_minecraft_adapter；如已有旧目录，先备份再覆盖。
+6. 安装 AstrBot 插件和 Rust native 扩展：
+   - 把 astrbot_plugin_minecraft_adapter 主分支最新源码放进 AstrBot 的插件目录，目录名保持 astrbot_plugin_minecraft_adapter；如已有旧目录，先备份再覆盖。
+   - 找到 AstrBot 实际运行的 Python，可通过 AstrBot 启动脚本、venv、uv tool 目录或容器内 `python --version` 确认；不要用系统 Python 代替。
+   - 解压 GitHub Actions 下载的 `mine_sentinel_rs-wheel-*` artifact，找到里面的 `.whl`，用 AstrBot 的 Python 安装：`<astrbot-python> -m pip install --force-reinstall --no-deps <mine_sentinel_rs-*.whl>`。如果该环境没有 pip，优先用 `uv pip install --python <astrbot-python> --force-reinstall --no-deps <wheel>`。
+   - 安装后执行 `<astrbot-python> -c "import mine_sentinel_rs; print('mine_sentinel_rs ok')"` 验证 native 扩展可导入；未通过不要重启上线。
 7. 配置 Java 插件：
    - 单服保持 proxyMode.enabled=false。
    - Velocity 群组服先启动/读取 Velocity 端 secret，再给每个后端服写入 proxyMode.enabled=true 和 proxyMode.secret。
@@ -233,13 +242,14 @@ mine_sentinel:
    - 群组服只添加 Velocity 端 host/port/token。
    - 把 QQ 群写入 message.target_sessions，必要时写入 mine_sentinel.report.delivery_targets；优先写 `/sid` 输出的 UMO，简写 group:/qq: 会自动解析到当前 AstrBot 平台，支持 OneBot/NapCat 和官方 QQ Bot。
    - 开启 mine_sentinel.enabled、storage.enabled、report.enabled、send_as_image、send_full_log_file。
-   - 确认 AstrBot 已连接 NapCat/OneBot，且目标 QQ 群可以收发消息。
+   - 确认 AstrBot 已连接所选 QQ 平台（官方 QQ Bot 或 OneBot/NapCat），且目标 QQ 群可以收发消息。
 9. 做备份：覆盖任何 jar、插件目录或配置文件前，先复制到带时间戳的 backup 目录。
 10. 验证：
-   - 启动或重启服务后检查 Java 插件、AstrBot 和 NapCat 日志。
+   - 启动或重启服务后检查 Java 插件、AstrBot 和所选 QQ 平台日志；使用官方 QQ Bot 时不需要 NapCat 日志。
+   - AstrBot 日志不能出现 `mine_sentinel_rs native extension is required`、`No module named mine_sentinel_rs` 或插件加载失败。
    - 在 QQ/AstrBot 会话执行 mc monitor status，确认收到 observation。
    - 执行 mc report now <服务器ID> 30m 测试图片报告和 JSONL 附件发送。
-11. 最后给我汇总：安装了哪些文件、备份位置、NapCat 是否复用或新装、配置了哪些服务器 ID、测试命令结果、还需要我手动确认的事项。
+11. 最后给我汇总：安装了哪些文件、备份位置、使用的 QQ 平台类型、NapCat 是否未使用/复用/新装、配置了哪些服务器 ID、AstrBot Python 版本、安装的 `mine_sentinel_rs` wheel artifact 名称、测试命令结果、还需要我手动确认的事项。
 ```
   
 ## 更新日志
