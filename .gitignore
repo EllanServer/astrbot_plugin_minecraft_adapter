@@ -1,3 +1,10 @@
 __pycache__/
 dev/
 .vscode/
+
+# Rust build artifacts (built via maturin, never commit)
+rust/target/
+dist/
+build/
+*.whl
+*.egg-info/

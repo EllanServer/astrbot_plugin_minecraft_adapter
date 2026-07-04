@@ -1,6 +1,20 @@
-"""Lightweight observation priority scoring used before full report analysis."""
+"""Lightweight observation priority scoring used before full report analysis.
+
+Delegates to the Rust implementation in ``mine_sentinel_rs`` when available
+(runs up to 50k times per report window). Falls back to pure-Python when the
+native extension is not installed.
+"""
 
 from __future__ import annotations
+
+try:
+    from mine_sentinel_rs import (  # type: ignore[import-not-found]
+        observation_priority_score as _rs_observation_priority_score,
+    )
+
+    _HAS_RUST = True
+except ImportError:  # pragma: no cover
+    _HAS_RUST = False
 
 from .models import ObservationRecord
 from .reporting.dialogue_rules import DialogueRule, dialogue_rules_from_config
@@ -29,14 +43,26 @@ def observation_priority_score(
     rules: tuple[DialogueRule, ...] | None = None,
 ) -> float:
     """Score records that should survive bounded-memory report sampling."""
+    if _HAS_RUST:
+        matcher = _default_matcher() if rules is None else RuleTermMatcher(
+            (rule, rule.keywords, rule.urgent_terms) for rule in rules
+        )
+        # Rust impl handles normalize + scan + scoring in one call, only
+        # needing the pre-built matcher (it caches the rule set internally).
+        return _rs_observation_priority_score(record, matcher)
+    return _observation_priority_score_py(record, rules)
 
+
+def _observation_priority_score_py(
+    record: ObservationRecord,
+    rules: tuple[DialogueRule, ...] | None = None,
+) -> float:
+    """Pure-Python fallback (mirrors the Rust implementation exactly)."""
     score = 0.0
     text = normalize_text(f"{record.content} {' '.join(record.tags)}")
 
     if record.kind == "CHAT":
         score += 1.0
-        # Build the matcher once for the (possibly custom) rule set. When rules
-        # is None we reuse a process-wide cached matcher for the default rules.
         matcher = _default_matcher() if rules is None else RuleTermMatcher(
             (rule, rule.keywords, rule.urgent_terms) for rule in rules
         )

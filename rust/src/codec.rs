@@ -8,7 +8,7 @@
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyLong};
+use pyo3::types::PyDict;
 
 /// Drop-in replacement for `ObservationRecordCodec`. Holds the small set of
 /// config-derived limits needed by `normalize_record` / `record_to_json` /
@@ -77,21 +77,21 @@ impl ObservationRecordCodec {
 
         // metrics
         let metrics_binding = record.getattr("metrics")?;
-        let metrics = metrics_binding.downcast::<PyDict>()?;
-        let compacted_metrics = self.compact_dict(py, metrics, self.max_metric_fields)?;
+        let metrics: Bound<PyDict> = metrics_binding.extract()?;
+        let compacted_metrics = self.compact_dict(py, &metrics, self.max_metric_fields)?;
         record.setattr("metrics", compacted_metrics)?;
 
         // context
         let context_binding = record.getattr("context")?;
-        let context = context_binding.downcast::<PyDict>()?;
-        let compacted_context = self.compact_dict(py, context, self.max_raw_fields)?;
+        let context: Bound<PyDict> = context_binding.extract()?;
+        let compacted_context = self.compact_dict(py, &context, self.max_raw_fields)?;
         record.setattr("context", compacted_context)?;
 
         // raw
         if self.include_raw {
             let raw_binding = record.getattr("raw")?;
-            let raw = raw_binding.downcast::<PyDict>()?;
-            let compacted_raw = self.compact_dict(py, raw, self.max_raw_fields)?;
+            let raw: Bound<PyDict> = raw_binding.extract()?;
+            let compacted_raw = self.compact_dict(py, &raw, self.max_raw_fields)?;
             record.setattr("raw", compacted_raw)?;
         } else {
             record.setattr("raw", PyDict::new(py))?;
@@ -119,8 +119,8 @@ impl ObservationRecordCodec {
         let tags: Vec<String> = record.getattr("tags")?.extract()?;
         let context = record.getattr("context")?;
         let metrics = record.getattr("metrics")?;
-        let raw = if self.include_raw {
-            record.getattr("raw")?.into_any()
+        let raw: Bound<PyAny> = if self.include_raw {
+            record.getattr("raw")?
         } else {
             PyDict::new(py).into_any()
         };
@@ -153,7 +153,7 @@ impl ObservationRecordCodec {
         let dumps = json_module.getattr("dumps")?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("ensure_ascii", false)?;
-        let separators = pyo3::types::PyTuple::new(py, [",", ":"]);
+        let separators = pyo3::types::PyTuple::new(py, [",", ":"])?;
         kwargs.set_item("separators", separators)?;
         let result: String = dumps.call((dict,), Some(&kwargs))?.extract()?;
         Ok(result)
@@ -184,7 +184,7 @@ impl ObservationRecordCodec {
         let mut hasher = Blake2bVar::new(16).expect("blake2b 16 bytes");
         hasher.update(raw.as_bytes());
         let mut out = [0u8; 16];
-        hasher.finalize_variable(|f| out.copy_from_slice(f));
+        hasher.finalize_variable(&mut out);
         Ok(format!("h:{}", hex_encode(&out)))
     }
 }
@@ -205,9 +205,9 @@ impl ObservationRecordCodec {
             if count >= max_fields {
                 break;
             }
-            let (key, value) = kv?;
+            let (key, value) = kv;
             let key_str: String = key.to_string();
-            let compacted = self.compact_value(py, value)?;
+            let compacted = self.compact_value(py, &value)?;
             compact.set_item(key_str, compacted)?;
             count += 1;
         }
@@ -219,32 +219,36 @@ impl ObservationRecordCodec {
         &self,
         py: Python<'py>,
         value: &Bound<'py, PyAny>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         if value.is_none() {
-            return Ok(value.clone().into_any().unbind());
+            return Ok(value.clone());
         }
-        // bool/int/float passthrough
-        if value.is_instance_of::<PyBool>()
-            || value.is_instance_of::<PyLong>()
-            || value.is_instance_of::<PyFloat>()
+        // bool/int/float passthrough: try numeric extractions.
+        if value.extract::<bool>().is_ok()
+            || value.extract::<i64>().is_ok()
+            || value.extract::<f64>().is_ok()
         {
-            return Ok(value.clone().into_any().unbind());
+            return Ok(value.clone());
         }
         // str → truncate
         if let Ok(s) = value.extract::<String>() {
-            return Ok(truncate(&s, self.max_content_length).into_py(py));
+            return Ok(truncate(&s, self.max_content_length)
+                .into_pyobject(py)?
+                .into_any());
         }
         // fallback: json.dumps(value, ensure_ascii=False, default=str) then truncate
         let json_module = py.import("json")?;
         let dumps = json_module.getattr("dumps")?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("ensure_ascii", false)?;
-        // default=str: stringify unknown objects via a Python closure.
+        // default=str: stringify unknown objects.
         let builtins = py.import("builtins")?;
         let str_fn = builtins.getattr("str")?;
         kwargs.set_item("default", str_fn)?;
         let text: String = dumps.call((value,), Some(&kwargs))?.extract()?;
-        Ok(truncate(&text, self.max_content_length).into_py(py))
+        Ok(truncate(&text, self.max_content_length)
+            .into_pyobject(py)?
+            .into_any())
     }
 }
 

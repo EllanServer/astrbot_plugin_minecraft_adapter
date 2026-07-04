@@ -1,4 +1,11 @@
-"""Observation JSONL serialization and normalization."""
+"""Observation JSONL serialization and normalization.
+
+Hot per-record methods (``normalize_record`` / ``record_to_json`` /
+``json_line`` / ``dedupe_key``) delegate to the Rust implementation in
+``mine_sentinel_rs`` when available; the streaming JSONL readers stay on
+Python because they are I/O-bound and already cheap relative to the parsing
+they avoid. Falls back to pure-Python if the native extension is missing.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +13,15 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any
+
+try:
+    from mine_sentinel_rs import (  # type: ignore[import-not-found]
+        ObservationRecordCodec as _RsObservationRecordCodec,
+    )
+
+    _HAS_RUST = True
+except ImportError:  # pragma: no cover
+    _HAS_RUST = False
 
 from ..models import MineSentinelConfig, ObservationRecord
 
@@ -15,8 +31,22 @@ class ObservationRecordCodec:
 
     def __init__(self, config: MineSentinelConfig):
         self.config = config
+        if _HAS_RUST:
+            self._rs = _RsObservationRecordCodec(
+                config.storage.max_content_length,
+                config.max_tags_per_record,
+                config.max_metric_fields,
+                config.max_raw_fields,
+                config.storage.include_raw,
+                config.dedupe_window_seconds,
+            )
+        else:
+            self._rs = None
 
     def normalize_record(self, record: ObservationRecord):
+        if self._rs is not None:
+            self._rs.normalize_record(record)
+            return
         record.content = self.truncate(
             record.content,
             self.config.storage.max_content_length,
@@ -36,6 +66,8 @@ class ObservationRecordCodec:
             record.raw = {}
 
     def record_to_json(self, record: ObservationRecord) -> dict[str, Any]:
+        if self._rs is not None:
+            return self._rs.record_to_json(record)
         return {
             "eventId": record.event_id,
             "kind": record.kind,
@@ -56,6 +88,8 @@ class ObservationRecordCodec:
         }
 
     def json_line(self, record: ObservationRecord) -> str:
+        if self._rs is not None:
+            return self._rs.json_line(record)
         return json.dumps(
             self.record_to_json(record),
             ensure_ascii=False,
@@ -116,6 +150,8 @@ class ObservationRecordCodec:
             return
 
     def dedupe_key(self, record: ObservationRecord) -> str:
+        if self._rs is not None:
+            return self._rs.dedupe_key(record)
         if record.event_id:
             return record.event_id
         bucket = record.timestamp // max(1, self.config.dedupe_window_seconds * 1000)

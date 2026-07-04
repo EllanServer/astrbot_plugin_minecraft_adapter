@@ -17,7 +17,5 @@ classifiers = [
 [tool.maturin]
 # The Rust crate lives in ./rust; the resulting native module
 # `mine_sentinel_rs` is importable from Python after `maturin develop` or
-# `maturin build --release`.
+# `maturin build --release`. Pure native extension (no Python package side).
 manifest-path = "rust/Cargo.toml"
-python-source = "."
-module-name = "mine_sentinel_rs"

@@ -9,8 +9,10 @@
 use ahash::AHashMap;
 use once_cell::sync::Lazy;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use regex::Regex;
+
+type PyObject = Py<PyAny>;
 
 /// Negation prefixes mirroring `dialogue_terms.NEGATION_PREFIXES`.
 /// A term hit whose 4-character prefix window ends with any of these is
@@ -129,8 +131,10 @@ pub fn term_is_negated(text: &str, term: &str) -> bool {
 struct CompiledTerms {
     /// lowered term → display (original-cased) form
     display: AHashMap<String, String>,
-    /// compiled alternation regex (empty → never matches)
-    pattern: Regex,
+    /// compiled alternation regex. `None` when there are no terms (mirrors
+    /// Python's `re.compile(r"(?!)")` always-fail pattern, but without the
+    /// lookahead unsupported by the `regex` crate).
+    pattern: Option<Regex>,
 }
 
 impl CompiledTerms {
@@ -138,7 +142,7 @@ impl CompiledTerms {
         if terms.is_empty() {
             return Self {
                 display: AHashMap::new(),
-                pattern: Regex::new(r"(?!)").expect("invalid never-match regex"),
+                pattern: None,
             };
         }
         let mut sorted: Vec<String> = terms.keys().cloned().collect();
@@ -148,7 +152,7 @@ impl CompiledTerms {
         let pattern = Regex::new(&pattern_str).expect("compiled term pattern invalid");
         Self {
             display: terms,
-            pattern,
+            pattern: Some(pattern),
         }
     }
 
@@ -156,9 +160,12 @@ impl CompiledTerms {
     /// Mirrors `_collect_non_negated_hits`. Deduplicates by lowered term
     /// (one entry per term, regardless of how many times it appears).
     fn collect_hits(&self, text: &str) -> Vec<String> {
-        let mut seen: AHashMap<String, ()> = AHashMap::new();
         let mut hits: Vec<String> = Vec::new();
-        for cap in self.pattern.find_iter(text) {
+        let Some(pattern) = &self.pattern else {
+            return hits;
+        };
+        let mut seen: AHashMap<String, ()> = AHashMap::new();
+        for cap in pattern.find_iter(text) {
             let term = cap.as_str();
             if term_is_negated(text, term) {
                 continue;
@@ -201,7 +208,7 @@ impl RuleTermMatcher {
 
         for entry in rules.try_iter()? {
             let entry = entry?;
-            let tup = entry.downcast::<PyTuple>()?;
+            let tup: Bound<PyTuple> = entry.extract()?;
             if tup.len() != 3 {
                 return Err(pyo3::exceptions::PyTypeError::new_err(
                     "RuleTermMatcher expects (rule, keywords, urgent_terms) tuples",
@@ -219,7 +226,7 @@ impl RuleTermMatcher {
                 let s: String = k.extract()?;
                 let lowered = s.to_lowercase();
                 keyword_terms.entry(lowered.clone()).or_insert(s.clone());
-                keyword_owners.entry(lowered).or_default().push(idx);
+                keyword_owners.entry(lowered.clone()).or_default().push(idx);
                 keyword_display.entry(lowered).or_insert(s);
             }
             for uo in urgent.try_iter()? {
@@ -227,7 +234,7 @@ impl RuleTermMatcher {
                 let s: String = u.extract()?;
                 let lowered = s.to_lowercase();
                 urgent_terms.entry(lowered.clone()).or_insert(s.clone());
-                urgent_owners.entry(lowered).or_default().push(idx);
+                urgent_owners.entry(lowered.clone()).or_default().push(idx);
                 urgent_display.entry(lowered).or_insert(s);
             }
         }
@@ -245,7 +252,7 @@ impl RuleTermMatcher {
 
     /// Return `{rule: (matched_keywords, matched_urgent_terms)}` for the text.
     /// Mirrors `RuleTermMatcher.scan`.
-    pub fn scan(&self, py: Python, text: &str) -> PyResult<Bound<PyDict>> {
+    pub fn scan<'py>(&self, py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyDict>> {
         let out = PyDict::new(py);
         if text.is_empty() {
             return Ok(out);
@@ -289,7 +296,11 @@ impl RuleTermMatcher {
 
     /// Return `{rule: matched_keywords}` ignoring urgent terms.
     /// Mirrors `RuleTermMatcher.matched_keywords`.
-    pub fn matched_keywords(&self, py: Python, text: &str) -> PyResult<Bound<PyDict>> {
+    pub fn matched_keywords<'py>(
+        &self,
+        py: Python<'py>,
+        text: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
         let out = PyDict::new(py);
         if text.is_empty() {
             return Ok(out);
@@ -304,8 +315,8 @@ impl RuleTermMatcher {
             if let Some(owners) = self.keyword_owners.get(&lowered) {
                 for &rule_idx in owners {
                     let rule_obj = self.rules[rule_idx].clone_ref(py);
-                    let list = match out.get_item(&rule_obj)? {
-                        Some(existing) => existing.downcast::<PyList>()?.clone(),
+                    let list: Bound<PyList> = match out.get_item(&rule_obj)? {
+                        Some(existing) => existing.extract()?,
                         None => {
                             let l = PyList::empty(py);
                             out.set_item(rule_obj.clone_ref(py), l.clone())?;
@@ -328,14 +339,14 @@ fn ensure_entry<'py>(
     py: Python<'py>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>)> {
     if let Some(existing) = out.get_item(&rule_obj)? {
-        let tup = existing.downcast::<PyTuple>()?;
-        let kw = tup.get_item(0)?.downcast::<PyList>()?.clone();
-        let ug = tup.get_item(1)?.downcast::<PyList>()?.clone();
+        let tup: Bound<PyTuple> = existing.extract()?;
+        let kw: Bound<PyList> = tup.get_item(0)?.extract()?;
+        let ug: Bound<PyList> = tup.get_item(1)?.extract()?;
         return Ok((kw, ug));
     }
     let kw = PyList::empty(py);
     let ug = PyList::empty(py);
-    let tup = PyTuple::new(py, [kw.clone(), ug.clone()]);
+    let tup = PyTuple::new(py, [kw.clone(), ug.clone()])?;
     out.set_item(rule_obj, tup)?;
     Ok((kw, ug))
 }
@@ -353,17 +364,17 @@ fn message_fingerprint_py(text: &str) -> String {
 }
 
 #[pyfunction]
-fn matched_terms(py: Python, text: &str, terms: &Bound<PyAny>) -> PyResult<Bound<PyList>> {
-    let list = PyList::empty(py);
+fn matched_terms(text: &str, terms: &Bound<PyAny>) -> PyResult<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
     for term_obj in terms.try_iter()? {
         let term = term_obj?;
         let s: String = term.extract()?;
         let lowered = s.to_lowercase();
         if !lowered.is_empty() && text.contains(&lowered) && !term_is_negated(text, &lowered) {
-            list.append(s)?;
+            out.push(s);
         }
     }
-    Ok(list)
+    Ok(out)
 }
 
 #[pyfunction]

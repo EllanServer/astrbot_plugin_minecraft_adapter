@@ -1,9 +1,31 @@
-"""Term normalization and matching helpers for dialogue analysis."""
+"""Term normalization and matching helpers for dialogue analysis.
+
+Performance-critical module: every CHAT observation runs through
+``RuleTermMatcher.scan`` twice (window sampling + report building). When
+the ``mine_sentinel_rs`` Rust extension is importable, all hot functions
+delegate to it; otherwise we fall back to the pure-Python implementation
+so the plugin still works without a Rust toolchain installed.
+"""
 
 from __future__ import annotations
 
 import re
 from typing import Iterable
+
+try:
+    # Native Rust core (PyO3). Built by `maturin build --release`; absent
+    # in dev environments without a Rust toolchain — graceful fallback below.
+    from mine_sentinel_rs import (  # type: ignore[import-not-found]
+        RuleTermMatcher as _RsRuleTermMatcher,
+        matched_terms as _rs_matched_terms,
+        message_fingerprint_py as _rs_message_fingerprint,
+        normalize_text_py as _rs_normalize_text,
+        term_is_negated_py as _rs_term_is_negated,
+    )
+
+    _HAS_RUST = True
+except ImportError:  # pragma: no cover - exercised when Rust extension absent
+    _HAS_RUST = False
 
 
 NEGATION_PREFIXES = (
@@ -19,16 +41,22 @@ REPEATED_CHAR_RE = re.compile(r"(.)\1{2,}")
 
 
 def normalize_text(text: str) -> str:
+    if _HAS_RUST:
+        return _rs_normalize_text(text)
     return " ".join((text or "").lower().split())
 
 
 def message_fingerprint(text: str) -> str:
+    if _HAS_RUST:
+        return _rs_message_fingerprint(text)
     normalized = normalize_text(text)
     compact = "".join(ch for ch in normalized if ch.isalnum())
     return REPEATED_CHAR_RE.sub(r"\1\1", compact)
 
 
 def matched_terms(text: str, terms: tuple[str, ...]) -> list[str]:
+    if _HAS_RUST:
+        return _rs_matched_terms(text, terms)
     matched = []
     for term in terms:
         normalized = term.lower()
@@ -38,6 +66,8 @@ def matched_terms(text: str, terms: tuple[str, ...]) -> list[str]:
 
 
 def term_is_negated(text: str, term: str) -> bool:
+    if _HAS_RUST:
+        return _rs_term_is_negated(text, term)
     start = 0
     saw_negated = False
     while True:
@@ -59,39 +89,49 @@ class RuleTermMatcher:
     single ``re.finditer`` scan reports every hit and its position, instead of
     looping over rules × keywords with repeated ``str.find`` calls. Negation
     is still applied per hit via :func:`term_is_negated`.
+
+    When the Rust extension ``mine_sentinel_rs`` is available, ``scan`` and
+    ``matched_keywords`` delegate to it for ~10-20x throughput on the per-CHAT
+    hot path. Otherwise falls back to the pure-Python regex implementation.
     """
 
     def __init__(self, rules: Iterable[tuple[object, tuple[str, ...], tuple[str, ...]]]):
         # rules: iterable of (rule_obj, keywords, urgent_terms)
-        self._rules: list[tuple[object, tuple[str, ...], tuple[str, ...]]] = []
-        # lowered term -> owning rule objects (a term may belong to several rules).
-        self._keyword_owners: dict[str, list[object]] = {}
-        self._urgent_owners: dict[str, list[object]] = {}
-        # lowered term -> original (display) term, so hits map back to the form
-        # the rule author wrote (matched_terms preserves original casing).
-        self._keyword_display: dict[str, str] = {}
-        self._urgent_display: dict[str, str] = {}
-        keyword_terms: set[str] = set()
-        urgent_terms: set[str] = set()
-        for rule, keywords, urgent in rules:
-            self._rules.append((rule, keywords, urgent))
-            for term in keywords:
-                lowered = term.lower()
-                keyword_terms.add(lowered)
-                self._keyword_owners.setdefault(lowered, []).append(rule)
-                self._keyword_display.setdefault(lowered, term)
-            for term in urgent:
-                lowered = term.lower()
-                urgent_terms.add(lowered)
-                self._urgent_owners.setdefault(lowered, []).append(rule)
-                self._urgent_display.setdefault(lowered, term)
-        self._keyword_re = _compile_term_pattern(keyword_terms)
-        self._urgent_re = _compile_term_pattern(urgent_terms)
+        rules_list: list[tuple[object, tuple[str, ...], tuple[str, ...]]] = list(rules)
+        self._rules = rules_list
+
+        if _HAS_RUST:
+            # Rust matcher keeps its own index; Python only holds the rule
+            # objects for identity comparisons (Rust returns them as dict keys).
+            self._rs = _RsRuleTermMatcher(rules_list)
+        else:
+            self._rs = None
+            self._keyword_owners: dict[str, list[object]] = {}
+            self._urgent_owners: dict[str, list[object]] = {}
+            self._keyword_display: dict[str, str] = {}
+            self._urgent_display: dict[str, str] = {}
+            keyword_terms: set[str] = set()
+            urgent_terms: set[str] = set()
+            for rule, keywords, urgent in rules_list:
+                for term in keywords:
+                    lowered = term.lower()
+                    keyword_terms.add(lowered)
+                    self._keyword_owners.setdefault(lowered, []).append(rule)
+                    self._keyword_display.setdefault(lowered, term)
+                for term in urgent:
+                    lowered = term.lower()
+                    urgent_terms.add(lowered)
+                    self._urgent_owners.setdefault(lowered, []).append(rule)
+                    self._urgent_display.setdefault(lowered, term)
+            self._keyword_re = _compile_term_pattern(keyword_terms)
+            self._urgent_re = _compile_term_pattern(urgent_terms)
 
     def scan(
         self, text: str
     ) -> dict[object, tuple[list[str], list[str]]]:
         """Return {rule: (matched_keywords, matched_urgent_terms)} for the text."""
+        if self._rs is not None:
+            return self._rs.scan(text)
         result: dict[object, tuple[list[str], list[str]]] = {}
         if not text:
             return result
@@ -113,6 +153,8 @@ class RuleTermMatcher:
 
     def matched_keywords(self, text: str) -> dict[object, list[str]]:
         """Return {rule: matched_keywords} ignoring urgent terms."""
+        if self._rs is not None:
+            return self._rs.matched_keywords(text)
         hits = _collect_non_negated_hits(text, self._keyword_re)
         out: dict[object, list[str]] = {}
         for lowered in hits:

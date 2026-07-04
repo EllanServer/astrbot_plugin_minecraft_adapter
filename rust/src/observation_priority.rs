@@ -47,13 +47,11 @@ pub fn observation_priority_score(
             if let Some(m) = matcher.as_ref() {
                 // scan returns dict[rule, (kw_list, ug_list)]
                 let hits = m.call_method1("scan", (text.as_str(),))?;
-                let hits_dict = hits.downcast::<PyDict>()?;
-                for item in hits_dict.items() {
-                    let pair: Bound<PyTuple> = item?.downcast::<PyTuple>()?;
-                    let rule_obj = pair.get_item(0)?;
-                    let lists = pair.get_item(1)?.downcast::<PyTuple>()?;
-                    let kw_list = lists.get_item(0)?.downcast::<PyList>()?;
-                    let ug_list = lists.get_item(1)?.downcast::<PyList>()?;
+                let hits_dict: Bound<PyDict> = hits.extract()?;
+                for (rule_obj, lists_bound) in hits_dict.iter() {
+                    let lists: Bound<PyTuple> = lists_bound.extract()?;
+                    let kw_list: Bound<PyList> = lists.get_item(0)?.extract()?;
+                    let ug_list: Bound<PyList> = lists.get_item(1)?.extract()?;
                     let kw_count = kw_list.len();
                     if kw_count == 0 {
                         continue;
@@ -89,13 +87,23 @@ pub fn observation_priority_score(
 /// Mirror `_metrics_priority`: tps/memory based scoring.
 fn metrics_priority(record: &Bound<PyAny>) -> PyResult<f64> {
     let metrics_binding = record.getattr("metrics")?;
-    let metrics = metrics_binding.downcast::<PyDict>()?;
-    let tps = metrics
-        .get_item("tps1m")
-        .or_else(|| metrics.get_item("tps"))?
-        .and_then(|v| v.extract::<f64>().ok())
-        .unwrap_or(20.0);
-    let memory = memory_usage_percent(metrics)?;
+    let metrics: Bound<PyDict> = metrics_binding.extract()?;
+    const TPS_KEYS: &[&str] = &["tps1m", "tps", "tps_1m", "oneMinuteTps", "one_minute_tps"];
+    let mut tps: f64 = 20.0;
+    let mut found = false;
+    for key in TPS_KEYS {
+        if let Some(v) = metrics.get_item(*key)? {
+            if let Ok(p) = v.extract::<f64>() {
+                tps = p;
+                found = true;
+                break;
+            }
+        }
+    }
+    if !found {
+        tps = 20.0;
+    }
+    let memory = memory_usage_percent(&metrics)?;
     let mut score = 0.0_f64;
     if tps < 18.0 {
         score += 3.0;
@@ -110,24 +118,59 @@ fn metrics_priority(record: &Bound<PyAny>) -> PyResult<f64> {
 }
 
 /// Mirror `metrics_context.memory_usage_percent(metrics)`:
-/// returns the percentage (0-100) or 0.0 if unknown. Looks up common keys.
+/// returns the percentage (0-100) or 0.0 if unknown. Mirrors the full
+/// MEMORY_PERCENT_KEYS + MEMORY_PAIR_KEYS tables from metrics_context.py so
+/// behavior stays in sync with the Python implementation.
 fn memory_usage_percent(metrics: &Bound<PyDict>) -> PyResult<f64> {
-    for key in ["usedMemoryPercent", "memoryUsagePercent", "memoryPercent"] {
+    // Percent keys (any one suffices). Python normalizes 0..1 to 0..100.
+    const PERCENT_KEYS: &[&str] = &[
+        "memoryUsagePercent",
+        "memory_usage_percent",
+        "memoryPercent",
+        "memory_percent",
+        "heapUsagePercent",
+        "heap_usage_percent",
+        "usedMemoryPercent",
+        "used_memory_percent",
+        "ramUsagePercent",
+        "ram_usage_percent",
+    ];
+    for key in PERCENT_KEYS {
         if let Some(v) = metrics.get_item(key)? {
             if let Ok(p) = v.extract::<f64>() {
-                return Ok(p);
+                let normalized = if (0.0..=1.0).contains(&p) { p * 100.0 } else { p };
+                return Ok(normalized);
             }
         }
     }
-    let used = metrics
-        .get_item("usedMemory")?
-        .and_then(|v| v.extract::<f64>().ok());
-    let max = metrics
-        .get_item("maxMemory")?
-        .and_then(|v| v.extract::<f64>().ok());
-    if let (Some(u), Some(m)) = (used, max) {
-        if m > 0.0 {
-            return Ok((u / m) * 100.0);
+    // Pair keys: (used, max). First matching pair wins.
+    const PAIR_KEYS: &[(&str, &str)] = &[
+        ("memoryUsed", "memoryMax"),
+        ("memoryUsedMb", "memoryMaxMb"),
+        ("memoryUsedMB", "memoryMaxMB"),
+        ("memory_used_mb", "memory_max_mb"),
+        ("memory_used", "memory_max"),
+        ("heapUsed", "heapMax"),
+        ("heapUsedMb", "heapMaxMb"),
+        ("heap_used_mb", "heap_max_mb"),
+        ("heap_used", "heap_max"),
+        ("usedMemory", "maxMemory"),
+        ("usedMemoryMb", "maxMemoryMb"),
+        ("used_memory_mb", "max_memory_mb"),
+        ("used_memory", "max_memory"),
+    ];
+    for (used_key, max_key) in PAIR_KEYS {
+        let used = metrics
+            .get_item(*used_key)?
+            .and_then(|v| v.extract::<f64>().ok());
+        let max = metrics
+            .get_item(*max_key)?
+            .and_then(|v| v.extract::<f64>().ok());
+        if let (Some(u), Some(m)) = (used, max) {
+            if m > 0.0 {
+                let pct = (u / m) * 100.0;
+                return Ok(pct.max(0.0).min(100.0));
+            }
         }
     }
     Ok(0.0)
