@@ -63,11 +63,25 @@ jobs:
         with:
           targets: ${{ matrix.platform.target }}
 
+      - name: Select maturin interpreter
+        id: maturin-interpreter
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            echo "value=python${{ matrix.python-version }}" >> "$GITHUB_OUTPUT"
+          else
+            python -c "import pathlib, sys; print(f'value={pathlib.Path(sys.executable).as_posix()}')" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build wheel (maturin)
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --manifest-path rust/Cargo.toml --out dist
+          # Avoid importing the plugin's top-level platform/ package when
+          # maturin probes Python metadata and expects stdlib platform.
+          working-directory: rust
+          target: ${{ matrix.platform.target }}
+          args: --release --out ../dist -i ${{ steps.maturin-interpreter.outputs.value }}
           # manylinux only applies to linux; maturin ignores it on
           # macos/windows. `auto` lets maturin pick the lowest manylinux
           # tag that the built wheel's symbols allow, maximizing
@@ -95,7 +109,8 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          args: --manifest-path rust/Cargo.toml --out dist
+          working-directory: rust
+          args: --out ../dist
 
       - name: Upload sdist artifact
         uses: actions/upload-artifact@v4
