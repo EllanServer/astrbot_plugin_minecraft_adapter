@@ -1,10 +1,21 @@
 """Observation JSONL serialization and normalization.
 
-Hot per-record methods (``normalize_record`` / ``record_to_json`` /
-``json_line`` / ``dedupe_key``) delegate to the Rust implementation in
-``mine_sentinel_rs`` when available; the streaming JSONL readers stay on
-Python because they are I/O-bound and already cheap relative to the parsing
-they avoid. Falls back to pure-Python if the native extension is missing.
+Performance policy: per-record methods are routed to whichever implementation
+is fastest on the hot path, measured by benchmark (Python 3.14, 512 records
+per round):
+
+- ``normalize_record`` / ``record_to_json`` / ``json_line``: pure Python.
+  These mutate the dataclass or build a Python dict from its attrs; the
+  CPython interpreter does both as C-level ops, and the PyO3 boundary cost
+  to pull fields into Rust (and rebuild PyDicts there) makes the Rust path
+  no faster — slightly slower on ``json_line``.
+- ``dedupe_key``: hybrid. Records with ``event_id`` (the common case) short-
+  circuit in Python (~5.8x faster than crossing into Rust just to read the
+  same attr). Records without ``event_id`` fall through to the Rust
+  ``blake2b`` path (~1.32x faster than ``hashlib``).
+- ``read_jsonl`` / ``read_jsonl_window``: pure Python, I/O-bound.
+
+Falls back to pure-Python if the native extension is missing.
 """
 
 from __future__ import annotations
@@ -71,8 +82,11 @@ class ObservationRecordCodec:
             record.raw = {}
 
     def record_to_json(self, record: ObservationRecord) -> dict[str, Any]:
-        if self._rs is not None:
-            return self._rs.record_to_json(record)
+        # Stays in Python: building a Python dict from record attrs is a
+        # sequence of C-level attribute reads; the Rust path pulls each attr
+        # across the PyO3 boundary and then rebuilds a PyDict, measured to be
+        # no faster (and on the json_line path, slightly slower than
+        # Python's own json.dumps). Kept in Python for raw throughput.
         return {
             "eventId": record.event_id,
             "kind": record.kind,
@@ -93,8 +107,10 @@ class ObservationRecordCodec:
         }
 
     def json_line(self, record: ObservationRecord) -> str:
-        if self._rs is not None:
-            return self._rs.json_line(record)
+        # Stays in Python: `json.dumps` is a single C call over a dict built
+        # from C-level attribute reads. The Rust path builds a serde_json
+        # tree by pulling every field across the PyO3 boundary, measured to
+        # be slightly slower (226 vs 229 ops/s on 512-record rounds).
         return json.dumps(
             self.record_to_json(record),
             ensure_ascii=False,
@@ -155,10 +171,18 @@ class ObservationRecordCodec:
             return
 
     def dedupe_key(self, record: ObservationRecord) -> str:
-        if self._rs is not None:
-            return self._rs.dedupe_key(record)
+        # Fast path: records with event_id short-circuit in Python — measured
+        # 5.8x faster than crossing into Rust just to read the same attr and
+        # return it (54k vs 9k ops/s). This is the common case in production
+        # (every server-sourced event carries an event_id).
         if record.event_id:
             return record.event_id
+        # Slow path: no event_id → blake2b hash. Rust's native blake2b is
+        # ~1.32x faster than Python's hashlib for the hash itself, but the
+        # boundary cost to pull kind/server_id/identity/content/timestamp
+        # partially offsets it. Net win is small but real.
+        if self._rs is not None:
+            return self._rs.dedupe_key(record)
         bucket = record.timestamp // max(1, self.config.dedupe_window_seconds * 1000)
         content = " ".join(record.content.lower().split())
         raw = "|".join(
