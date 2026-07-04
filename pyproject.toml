@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mine_sentinel_rs"
+version = "0.1.0"
+description = "Rust core for the AstrBot minecraft_adapter mine_sentinel module"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: MIT License",
+]
+
+[tool.maturin]
+# The Rust crate lives in ./rust; the resulting native module
+# `mine_sentinel_rs` is importable from Python after `maturin develop` or
+# `maturin build --release`.
+manifest-path = "rust/Cargo.toml"
+python-source = "."
+module-name = "mine_sentinel_rs"

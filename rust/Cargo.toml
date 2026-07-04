@@ -1,0 +1,27 @@
+[package]
+name = "mine_sentinel_rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust core for the AstrBot minecraft_adapter mine_sentinel module (PyO3 bindings)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "mine_sentinel_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3 + py38 floor: build a single wheel that works on CPython 3.8-3.14+.
+# This avoids needing PyO3 to be released for each new Python version and
+# makes the multi-platform CI matrix simpler.
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"] }
+blake2 = "0.10"
+regex = "1"
+once_cell = "1"
+ahash = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
