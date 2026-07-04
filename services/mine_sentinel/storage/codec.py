@@ -44,9 +44,14 @@ class ObservationRecordCodec:
             self._rs = None
 
     def normalize_record(self, record: ObservationRecord):
-        if self._rs is not None:
-            self._rs.normalize_record(record)
-            return
+        # Stays in Python: this method mutates the dataclass in place by
+        # reassigning its fields with rebuilt dicts. Every value's type check
+        # (`compact_value`) crosses the PyO3 boundary in Rust, while Python's
+        # `isinstance` is a single C-level opcode — measured ~1.4x slower in
+        # Rust. The Rust `normalize_record` is still exposed for callers that
+        # want a single boundary crossing, but the default path stays Python
+        # for raw throughput. The other codec methods return a value, so they
+        # benefit from Rust's serde_json path; this one doesn't.
         record.content = self.truncate(
             record.content,
             self.config.storage.max_content_length,
