@@ -66,6 +66,11 @@ class DiskObservationStore:
                     batch_server_id,
                     batch_server_name,
                 )
+                if (
+                    record.kind.upper() == "CHAT"
+                    and not self.config.chat.collect_for_ai_audit
+                ):
+                    continue
                 if not record.server_id:
                     record.server_id = batch_server_id
                 if record.timestamp and record.timestamp < cutoff_ms:

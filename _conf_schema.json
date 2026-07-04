@@ -71,9 +71,9 @@
             "items": {
               "forward_chat_to_astrbot": {
                 "type": "bool",
-                "description": "转发聊天消息到指定会话",
-                "hint": "将 Minecraft 玩家聊天消息转发到指定的外部会话",
-                "default": true
+                "description": "转发游戏内聊天到指定会话",
+                "hint": "开关 1：将 Minecraft 玩家聊天实时转发到 QQ/外部会话。默认关闭，关闭后不影响 MineSentinel AI 审计采集；审计采集由 mine_sentinel.chat.collect_for_ai_audit 控制。",
+                "default": false
               },
               "forward_chat_format": {
                 "type": "string",
@@ -200,6 +200,18 @@
             "type": "int",
             "description": "读取/导出窗口时去重 key 的内存上限，超过后溢写临时 SQLite 文件",
             "default": 100000
+          }
+        }
+      },
+      "chat": {
+        "type": "object",
+        "description": "聊天审计采集",
+        "items": {
+          "collect_for_ai_audit": {
+            "type": "bool",
+            "description": "只收集游戏内聊天用于 AI 审计",
+            "hint": "开关 2：控制 AstrBot 是否把 MC 端上报的 CHAT observation 写入 MineSentinel JSONL 并用于 AI 总结/告警。关闭后仍可继续实时转发游戏内聊天。",
+            "default": true
           }
         }
       },

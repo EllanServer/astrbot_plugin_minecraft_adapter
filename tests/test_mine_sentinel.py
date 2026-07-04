@@ -1333,6 +1333,49 @@ class MineSentinelDialogueTests(unittest.TestCase):
 
 
 class MineSentinelStorageTests(unittest.TestCase):
+    def test_chat_collection_switch_filters_chat_observations_only(self):
+        config = MineSentinelConfig.from_dict(
+            {"chat": {"collect_for_ai_audit": False}}
+        )
+        now = int(time.time() * 1000)
+        payload = {
+            "serverId": "survival",
+            "observations": [
+                {
+                    "eventId": "chat-1",
+                    "kind": "CHAT",
+                    "timestamp": now,
+                    "serverId": "survival",
+                    "player": {"name": "Alice", "uuidHash": "uuid-Alice"},
+                    "content": "hello",
+                },
+                {
+                    "eventId": "metric-1",
+                    "kind": "SERVER_METRICS",
+                    "timestamp": now,
+                    "serverId": "survival",
+                    "metrics": {"tps1m": 20.0},
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DiskObservationStore(config, Path(tmp_dir))
+            written = store.add_batch("survival", payload)
+            records = store.recent(60, "survival")
+
+        self.assertEqual(written, 1)
+        self.assertEqual([record.kind for record in records], ["SERVER_METRICS"])
+
+    def test_chat_collection_switch_uses_legacy_enabled_default(self):
+        disabled = MineSentinelConfig.from_dict({"chat": {"enabled": False}})
+        explicit = MineSentinelConfig.from_dict(
+            {"chat": {"enabled": False, "collect_for_ai_audit": True}}
+        )
+
+        self.assertFalse(disabled.chat.collect_for_ai_audit)
+        self.assertTrue(explicit.chat.collect_for_ai_audit)
+
     def test_record_codec_bounds_content_metrics_and_raw(self):
         config = MineSentinelConfig.from_dict(
             {

@@ -452,7 +452,7 @@ class ServerConfig:
     enable_ai_chat: bool = True
     text2image: bool = True
     # 消息转发配置
-    forward_chat_to_astrbot: bool = True
+    forward_chat_to_astrbot: bool = False
     forward_chat_format: str = "<{player}> {message}"
     forward_join_leave_to_astrbot: bool = False
     target_sessions: list[str] = field(default_factory=list)
@@ -480,7 +480,7 @@ class ServerConfig:
             auto_server_id=data.get("auto_server_id", True),
             enable_ai_chat=data.get("enable_ai_chat", True),
             text2image=data.get("text2image", True),
-            forward_chat_to_astrbot=message.get("forward_chat_to_astrbot", True),
+            forward_chat_to_astrbot=message.get("forward_chat_to_astrbot", False),
             forward_chat_format=message.get(
                 "forward_chat_format", "<{player}> {message}"
             ),

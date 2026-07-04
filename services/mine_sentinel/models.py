@@ -24,6 +24,22 @@ def _as_float(value: Any, default: float) -> float:
         return default
 
 
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
 def _positive_int(value: Any, default: int) -> int:
     return max(1, _as_int(value, default))
 
@@ -82,6 +98,11 @@ class MineSentinelStorageConfig:
 
 
 @dataclass
+class MineSentinelChatConfig:
+    collect_for_ai_audit: bool = True
+
+
+@dataclass
 class MineSentinelDialogueConfig:
     enabled: bool = True
     min_issue_score: float = 2.0
@@ -104,6 +125,7 @@ class MineSentinelConfig:
     max_raw_fields: int = 16
     dedupe_window_seconds: int = 120
     storage: MineSentinelStorageConfig = field(default_factory=MineSentinelStorageConfig)
+    chat: MineSentinelChatConfig = field(default_factory=MineSentinelChatConfig)
     dialogue: MineSentinelDialogueConfig = field(default_factory=MineSentinelDialogueConfig)
     report: MineSentinelReportConfig = field(default_factory=MineSentinelReportConfig)
     alert: MineSentinelAlertConfig = field(default_factory=MineSentinelAlertConfig)
@@ -112,9 +134,11 @@ class MineSentinelConfig:
     def from_dict(cls, data: dict | None) -> "MineSentinelConfig":
         data = data or {}
         storage_data = data.get("storage", {}) or {}
+        chat_data = data.get("chat", {}) or {}
         dialogue_data = data.get("dialogue", {}) or {}
         report_data = data.get("report", {}) or {}
         alert_data = data.get("alert", {}) or {}
+        legacy_chat_enabled = _as_bool(chat_data.get("enabled"), True)
         interval_minutes = _report_interval_minutes(report_data)
         default_window_minutes = _positive_int(
             report_data.get("default_window_minutes"),
@@ -149,6 +173,12 @@ class MineSentinelConfig:
                 dedupe_memory_limit=_positive_int(
                     storage_data.get("dedupe_memory_limit"),
                     100000,
+                ),
+            ),
+            chat=MineSentinelChatConfig(
+                collect_for_ai_audit=_as_bool(
+                    chat_data.get("collect_for_ai_audit"),
+                    legacy_chat_enabled,
                 ),
             ),
             dialogue=MineSentinelDialogueConfig(
