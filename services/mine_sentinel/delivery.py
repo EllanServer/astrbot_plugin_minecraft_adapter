@@ -10,6 +10,8 @@ from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Plain
 
+from ..session_targets import resolve_astrbot_session
+
 
 class MineSentinelDelivery:
     def __init__(self, context: Any):
@@ -22,6 +24,7 @@ class MineSentinelDelivery:
         text: str,
         file_path: Path | None = None,
     ) -> bool:
+        umo = self.resolve_session(umo)
         try:
             await self.context.send_message(umo, MessageChain([Plain(text=text)]))
             if file_path:
@@ -48,6 +51,7 @@ class MineSentinelDelivery:
         return await self.send_message(umo, text, file_path)
 
     async def send_image(self, umo: str, image: BytesIO) -> bool:
+        umo = self.resolve_session(umo)
         try:
             from astrbot.api.message_components import Image
         except Exception as exc:
@@ -64,6 +68,7 @@ class MineSentinelDelivery:
             return False
 
     async def send_file(self, umo: str, file_path: Path) -> bool:
+        umo = self.resolve_session(umo)
         if not file_path.exists():
             logger.warning(f"[MineSentinel] 完整 observation 文件不存在: {file_path}")
             return False
@@ -83,3 +88,6 @@ class MineSentinelDelivery:
             self.last_error = f"发送完整 observation 文件到 {umo} 失败: {exc}"
             logger.error(f"[MineSentinel] {self.last_error}")
             return False
+
+    def resolve_session(self, umo: str) -> str:
+        return resolve_astrbot_session(self.context, umo)

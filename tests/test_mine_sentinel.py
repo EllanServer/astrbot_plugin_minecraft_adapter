@@ -80,6 +80,10 @@ try:
         MineSentinelTargetRouter,
         normalize_delivery_target,
     )
+    from astrbot_plugin_minecraft_adapter.services.session_targets import (
+        resolve_astrbot_session,
+        session_matches,
+    )
     from astrbot_plugin_minecraft_adapter.services.mine_sentinel.storage import (
         DedupeTracker,
         DiskObservationStore,
@@ -130,6 +134,7 @@ except ModuleNotFoundError:
         MineSentinelTargetRouter,
         normalize_delivery_target,
     )
+    from services.session_targets import resolve_astrbot_session, session_matches
     from services.mine_sentinel.storage import (
         DedupeTracker,
         DiskObservationStore,
@@ -1923,22 +1928,41 @@ class MineSentinelRoutingTests(unittest.TestCase):
         self.assertEqual(routed["group:a"], [records[0]])
         self.assertEqual(routed["group:b"], [records[0]])
 
-    def test_delivery_target_shorthand_normalizes_to_napcat_umo(self):
+    def test_delivery_target_shorthand_normalizes_without_guessing_platform(self):
         self.assertEqual(
             normalize_delivery_target("group:123456"),
-            "aiocqhttp:GroupMessage:123456",
+            "group:123456",
         )
         self.assertEqual(
             normalize_delivery_target("qq:654321"),
-            "aiocqhttp:FriendMessage:654321",
+            "qq:654321",
         )
         self.assertEqual(
             normalize_delivery_target("123456"),
-            "aiocqhttp:GroupMessage:123456",
+            "group:123456",
         )
         self.assertEqual(
             normalize_delivery_target("aiocqhttp:GroupMessage:999"),
             "aiocqhttp:GroupMessage:999",
+        )
+
+    def test_delivery_target_resolves_to_active_astrbot_platform_id(self):
+        context = _context_with_platform("napcat", "aiocqhttp")
+
+        self.assertEqual(
+            resolve_astrbot_session(context, "group:123456"),
+            "napcat:GroupMessage:123456",
+        )
+        self.assertEqual(
+            resolve_astrbot_session(context, "qq:654321"),
+            "napcat:FriendMessage:654321",
+        )
+        self.assertEqual(
+            resolve_astrbot_session(context, "aiocqhttp:GroupMessage:999"),
+            "napcat:GroupMessage:999",
+        )
+        self.assertTrue(
+            session_matches(context, "group:123456", "napcat:GroupMessage:123456")
         )
 
     def test_target_router_adds_direct_report_targets(self):
@@ -1961,19 +1985,19 @@ class MineSentinelRoutingTests(unittest.TestCase):
         self.assertEqual(
             sorted(routed),
             [
-                "aiocqhttp:FriendMessage:10001",
-                "aiocqhttp:GroupMessage:ops",
                 "aiocqhttp:GroupMessage:source",
+                "group:ops",
                 "group:source",
+                "qq:10001",
             ],
         )
-        self.assertEqual(routed["aiocqhttp:GroupMessage:ops"], records)
+        self.assertEqual(routed["group:ops"], records)
         self.assertEqual(
             router.sessions_for_records(
                 records,
                 exclude_session="aiocqhttp:GroupMessage:source",
             ),
-            ["aiocqhttp:FriendMessage:10001", "aiocqhttp:GroupMessage:ops", "group:source"],
+            ["group:ops", "group:source", "qq:10001"],
         )
 
         self.assertEqual(
@@ -1984,9 +2008,9 @@ class MineSentinelRoutingTests(unittest.TestCase):
                 )
             ),
             [
-                "aiocqhttp:FriendMessage:10001",
-                "aiocqhttp:GroupMessage:ops",
                 "aiocqhttp:GroupMessage:source",
+                "group:ops",
+                "qq:10001",
             ],
         )
 
@@ -2198,6 +2222,15 @@ class _ArtifactStore:
 
 async def _run_artifact_sync(func, *args):
     return func(*args)
+
+
+def _context_with_platform(platform_id: str, platform_name: str):
+    meta = SimpleNamespace(id=platform_id, name=platform_name)
+    platform = SimpleNamespace(
+        meta=lambda: meta,
+        status=SimpleNamespace(value="running"),
+    )
+    return SimpleNamespace(platform_manager=SimpleNamespace(platform_insts=[platform]))
 
 
 class _DummyContext:

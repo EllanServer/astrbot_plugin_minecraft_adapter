@@ -31,11 +31,13 @@ class CommandSessionState:
         get_server_config: Callable[[str], Any | None],
         timeout_seconds: int = PENDING_ACTION_TIMEOUT,
         clock: Callable[[], float] = time.time,
+        session_matcher: Callable[[str, str], bool] | None = None,
     ):
         self.server_manager = server_manager
         self.get_server_config = get_server_config
         self.timeout_seconds = max(1, timeout_seconds)
         self.clock = clock
+        self.session_matcher = session_matcher or (lambda configured, actual: configured == actual)
         self._pending_actions: dict[str, PendingAction] = {}
 
     def has_pending_action(self, umo: str) -> bool:
@@ -131,7 +133,16 @@ class CommandSessionState:
 
     def _server_matches_session(self, server: Any, umo: str) -> bool:
         config = self.get_server_config(server.server_id)
-        return bool(config and config.target_sessions and umo in config.target_sessions)
+        return self.config_matches_session(config, umo)
+
+    def config_matches_session(self, config: Any | None, umo: str) -> bool:
+        if not config or not umo:
+            return False
+        return any(
+            self.session_matcher(str(session), umo)
+            for session in (getattr(config, "target_sessions", []) or [])
+            if session
+        )
 
     def _expired(self, pending: PendingAction) -> bool:
         return self.clock() - pending.timestamp > self.timeout_seconds

@@ -46,12 +46,20 @@ class MineSentinelReportDispatcher:
         image: BytesIO | None = None,
         file_path: Path | None = None,
     ):
+        current_resolved = self._resolve_session(current_session)
+        seen: set[str] = set()
         for umo in self.router.sessions_for_records(
             records,
             current_session,
             include_server_targets=include_server_targets,
             include_report_targets=include_report_targets,
         ):
+            resolved = self._resolve_session(umo)
+            if resolved and resolved == current_resolved:
+                continue
+            if resolved and resolved in seen:
+                continue
+            seen.add(resolved or umo)
             await self.send_report(umo, text, image=image, file_path=file_path)
 
     async def send_message(
@@ -89,3 +97,9 @@ class MineSentinelReportDispatcher:
     def _capture_delivery_error(self):
         if self.error_sink and self.delivery.last_error:
             self.error_sink(self.delivery.last_error)
+
+    def _resolve_session(self, umo: str) -> str:
+        resolver = getattr(self.delivery, "resolve_session", None)
+        if callable(resolver):
+            return resolver(umo)
+        return umo

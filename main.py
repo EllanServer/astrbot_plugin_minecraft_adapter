@@ -200,6 +200,7 @@ class MinecraftAdapterPlugin(Star):
             renderer=renderer,
             get_server_config=lambda sid: self._server_configs.get(sid),
             mine_sentinel_service=self.mine_sentinel_service,
+            session_matcher=self.message_bridge.session_matches,
         )
 
         # 为每个服务器注册自定义命令

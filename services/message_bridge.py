@@ -10,6 +10,11 @@ from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Plain
 
 from ..core.models import MCMessage, MessageType, ServerConfig
+from .session_targets import (
+    resolve_astrbot_session,
+    resolve_astrbot_sessions,
+    session_matches,
+)
 
 if TYPE_CHECKING:
     from astrbot.core.star.context import Context
@@ -45,7 +50,7 @@ class MessageBridge:
         self._server_configs[config.server_id] = config
 
         # 为目标会话构建反向映射
-        for session in config.target_sessions:
+        for session in resolve_astrbot_sessions(self.context, config.target_sessions):
             if session not in self._session_to_servers:
                 self._session_to_servers[session] = []
             self._session_to_servers[session].append((config.server_id, config))
@@ -55,7 +60,7 @@ class MessageBridge:
         config = self._server_configs.pop(server_id, None)
         if config:
             # 从反向映射中移除
-            for session in config.target_sessions:
+            for session in resolve_astrbot_sessions(self.context, config.target_sessions):
                 if session in self._session_to_servers:
                     remaining = [
                         (sid, cfg)
@@ -125,7 +130,7 @@ class MessageBridge:
             return False
 
         # 获取目标会话
-        targets = config.target_sessions
+        targets = resolve_astrbot_sessions(self.context, config.target_sessions)
         if not targets:
             return False
 
@@ -200,9 +205,10 @@ class MessageBridge:
             message_chain = MessageChain([Plain(text=content)])
 
             # 使用 Context 直接发送，内部会解析 UMO
-            sent = await self.context.send_message(umo, message_chain)
+            resolved_umo = self.resolve_session(umo)
+            sent = await self.context.send_message(resolved_umo, message_chain)
             if not sent:
-                logger.warning(f"[MessageBridge] 未找到平台: {umo}")
+                logger.warning(f"[MessageBridge] 未找到平台: {resolved_umo}")
 
         except Exception as e:
             logger.error(f"[MessageBridge] 发送消息失败: {e}")
@@ -219,7 +225,9 @@ class MessageBridge:
         # 通过反向索引直接拿到绑定了该会话的服务器，避免 O(N×M) 线性扫描。
         matched_servers = self._session_to_servers.get(umo)
         if not matched_servers:
-            return False
+            matched_servers = self._find_servers_for_session(umo)
+            if not matched_servers:
+                return False
 
         # 这些值不随服务器变化，提前取一次即可。
         sender_name = event.get_sender_name()
@@ -355,8 +363,27 @@ class MessageBridge:
         """获取目标会话包含该 UMO 的服务器 ID 列表"""
         matched = self._session_to_servers.get(umo)
         if not matched:
-            return []
+            matched = self._find_servers_for_session(umo)
+            if not matched:
+                return []
         return [server_id for server_id, _ in matched]
+
+    def resolve_session(self, session: str) -> str:
+        return resolve_astrbot_session(self.context, session)
+
+    def session_matches(self, configured_session: str, actual_umo: str) -> bool:
+        return session_matches(self.context, configured_session, actual_umo)
+
+    def _find_servers_for_session(self, umo: str) -> list[tuple[str, ServerConfig]]:
+        return [
+            (server_id, config)
+            for server_id, config in self._server_configs.items()
+            if any(
+                self.session_matches(str(session), umo)
+                for session in (config.target_sessions or [])
+                if session
+            )
+        ]
 
     def strip_color_codes(self, text: str) -> str:
         """从文本中移除 Minecraft 颜色代码"""

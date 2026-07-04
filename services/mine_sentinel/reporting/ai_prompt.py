@@ -93,6 +93,7 @@ class AIReportPromptBuilder:
             "原始样本只用于补措辞，不代表全部记录。"
             "这些 JSON 字段会被组装为 QQ 群五段式总结："
             "整体情况、聊天与事件总结、玩家问题/投诉识别、风险提醒、建议处理；"
+            "不要臆测、改写或输出 QQ/UMO/session target；目标会话解析由 AstrBot 插件处理；"
             "请让 summary、dialogue_findings、categories 和 suggested_action 面向玩家群可读，"
             "保留具体玩家名、时间线索、上下文结论和人工处理建议。"
             "生成聊天与事件相关内容时必须按事故聚合，而不是按问题类别拆分："

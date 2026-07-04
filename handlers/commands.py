@@ -33,6 +33,7 @@ class CommandHandler:
         renderer: "InfoRenderer",
         get_server_config,
         mine_sentinel_service: "MineSentinelService | None" = None,
+        session_matcher=None,
     ):
         self.server_manager = server_manager
         self.binding_service = binding_service
@@ -41,7 +42,11 @@ class CommandHandler:
         self.mine_sentinel_service = mine_sentinel_service
         self.mine_sentinel_commands = MineSentinelCommandHandler(mine_sentinel_service)
         self.remote_commands = RemoteCommandHandler(get_server_config)
-        self.session_state = CommandSessionState(server_manager, get_server_config)
+        self.session_state = CommandSessionState(
+            server_manager,
+            get_server_config,
+            session_matcher=session_matcher,
+        )
         self.binding_commands = BindingCommandHandler(
             binding_service,
             get_server_config,
@@ -94,7 +99,7 @@ class CommandHandler:
             config = self.get_server_config(server_id)
             if not config:
                 continue
-            if not config.target_sessions or umo not in config.target_sessions:
+            if not self.session_state.config_matches_session(config, umo):
                 continue
             if not config.cmd_enabled:
                 continue

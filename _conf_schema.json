@@ -90,7 +90,7 @@
               "target_sessions": {
                 "type": "list",
                 "description": "目标会话",
-                "hint": "MC服务器消息互通的目标会话UMO列表。格式如 aiocqhttp:GroupMessage:123456789。用于MC消息转发到外部、外部消息转发到MC以及区分指令所属服务器",
+                "hint": "MC message bridge target sessions. Prefer AstrBot /sid output, e.g. napcat:GroupMessage:123456789. Shorthand is also supported: group:QQ group id, qq:QQ user id. Old adapter-name UMO such as aiocqhttp:GroupMessage:123456789 is resolved to the active AstrBot platform id at runtime.",
                 "default": []
               },
               "auto_forward_prefix": {
@@ -292,7 +292,7 @@
           "delivery_targets": {
             "type": "list",
             "description": "报告额外发送目标",
-            "hint": "NapCat/AstrBot UMO 或简写：group:QQ群号、qq:QQ号、private:QQ号；完整 UMO 如 aiocqhttp:GroupMessage:123456。纯数字默认按 QQ 群处理。",
+            "hint": "AstrBot UMO or shorthand. Prefer /sid output, e.g. napcat:GroupMessage:123456. Shorthand: group:QQ group id, qq/private:QQ user id. Pure numbers default to QQ groups. Old aiocqhttp UMO is resolved to the active AstrBot platform id at runtime.",
             "default": []
           },
           "include_evidence_samples": {
