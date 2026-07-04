@@ -9,9 +9,8 @@
 use ahash::AHashMap;
 use once_cell::sync::Lazy;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyAny, PyDict, PyList, PyTuple};
 use regex::Regex;
-use std::sync::Arc;
 
 /// Negation prefixes mirroring `dialogue_terms.NEGATION_PREFIXES`.
 /// A term hit whose 4-character prefix window ends with any of these is
@@ -30,7 +29,6 @@ pub fn normalize_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_space = true;
     for c in text.chars() {
-        // lowercase only ASCII fast path; Unicode also lowercased.
         let lc = c.to_lowercase().next().unwrap_or(c);
         if lc.is_whitespace() {
             if !prev_space {
@@ -42,7 +40,6 @@ pub fn normalize_text(text: &str) -> String {
             prev_space = false;
         }
     }
-    // trim trailing space if any
     if out.ends_with(' ') {
         out.pop();
     }
@@ -59,7 +56,6 @@ pub fn message_fingerprint(text: &str) -> String {
             compact.push(ch);
         }
     }
-    // Collapse runs of >=3 same chars down to 2 (matches `r"\1\1"` substitution).
     let mut result = String::with_capacity(compact.len());
     let chars: Vec<char> = compact.chars().collect();
     let mut i = 0;
@@ -83,40 +79,9 @@ pub fn message_fingerprint(text: &str) -> String {
     result
 }
 
-/// Mirrors `term_is_negated`. A term is negated if every occurrence is
-/// preceded (within 4 chars) by a negation prefix. Returns true only when
-/// all occurrences are negated — a single non-negated occurrence returns
-/// false (matches the Python `saw_negated` accumulator logic).
-pub fn term_is_negated(text: &str, term: &str) -> bool {
-    if term.is_empty() {
-        return false;
-    }
-    let term_bytes = term.as_bytes();
-    let mut start = 0;
-    let mut saw_negated = false;
-    loop {
-        // find term starting from `start`
-        let hay = &text[start..];
-        let rel = match hay.find(term) {
-            Some(r) => r,
-            None => return saw_negated,
-        };
-        let abs = start + rel;
-        // 4-character prefix window (by char count, not bytes).
-        let prefix_start = char_window_start(text, abs, 4);
-        let prefix = &text[prefix_start..abs];
-        if NEGATION_PREFIXES.iter().any(|p| prefix.ends_with(p)) {
-            saw_negated = true;
-            start = abs + term_bytes.len();
-            continue;
-        }
-        return false;
-    }
-}
-
 /// Compute the byte offset of `count` chars before `pos` (clamped at 0).
-/// Walks backwards one UTF-8 char boundary at a time using the stable
-/// `str::is_char_boundary` API.
+/// Walks backwards one UTF-8 char boundary at a time using
+/// `str::is_char_boundary`.
 fn char_window_start(s: &str, pos: usize, count: usize) -> usize {
     let mut taken = 0;
     let mut idx = pos;
@@ -131,6 +96,34 @@ fn char_window_start(s: &str, pos: usize, count: usize) -> usize {
     idx
 }
 
+/// Mirrors `term_is_negated`. A term is negated if every occurrence is
+/// preceded (within 4 chars) by a negation prefix. Returns true only when
+/// all occurrences are negated — a single non-negated occurrence returns
+/// false (matches the Python `saw_negated` accumulator logic).
+pub fn term_is_negated(text: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    let mut saw_negated = false;
+    loop {
+        let hay = &text[start..];
+        let rel = match hay.find(term) {
+            Some(r) => r,
+            None => return saw_negated,
+        };
+        let abs = start + rel;
+        let prefix_start = char_window_start(text, abs, 4);
+        let prefix = &text[prefix_start..abs];
+        if NEGATION_PREFIXES.iter().any(|p| prefix.ends_with(p)) {
+            saw_negated = true;
+            start = abs + term.len();
+            continue;
+        }
+        return false;
+    }
+}
+
 /// Rust-side compiled term set. Sorts terms by length desc (longest-first
 /// alternation, mirroring `_compile_term_pattern`).
 struct CompiledTerms {
@@ -138,22 +131,17 @@ struct CompiledTerms {
     display: AHashMap<String, String>,
     /// compiled alternation regex (empty → never matches)
     pattern: Regex,
-    /// sorted lowered terms for fallback scanning if regex misbehaves
-    terms: Vec<String>,
 }
 
 impl CompiledTerms {
     fn new(terms: AHashMap<String, String>) -> Self {
         if terms.is_empty() {
-            // `(?!)` always-fail pattern, matching Python `_compile_term_pattern`.
             return Self {
                 display: AHashMap::new(),
                 pattern: Regex::new(r"(?!)").expect("invalid never-match regex"),
-                terms: Vec::new(),
             };
         }
         let mut sorted: Vec<String> = terms.keys().cloned().collect();
-        // Sort by length desc, then alphabetical for determinism.
         sorted.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
         let alternation: Vec<String> = sorted.iter().map(|t| regex::escape(t)).collect();
         let pattern_str = alternation.join("|");
@@ -161,12 +149,12 @@ impl CompiledTerms {
         Self {
             display: terms,
             pattern,
-            terms: sorted,
         }
     }
 
     /// Collect non-negated hits keyed by the lowered matched term.
-    /// Mirrors `_collect_non_negated_hits`.
+    /// Mirrors `_collect_non_negated_hits`. Deduplicates by lowered term
+    /// (one entry per term, regardless of how many times it appears).
     fn collect_hits(&self, text: &str) -> Vec<String> {
         let mut seen: AHashMap<String, ()> = AHashMap::new();
         let mut hits: Vec<String> = Vec::new();
@@ -194,8 +182,6 @@ pub struct RuleTermMatcher {
     urgent_compiled: CompiledTerms,
     /// The Python rule objects, kept alive so we can return them as dict keys.
     rules: Vec<PyObject>,
-    /// lowered term → display form, kept separate from CompiledTerms.display
-    /// so we can return display-cased strings to Python callers.
     keyword_display: AHashMap<String, String>,
     urgent_display: AHashMap<String, String>,
 }
@@ -204,7 +190,7 @@ pub struct RuleTermMatcher {
 impl RuleTermMatcher {
     /// `rules` is an iterable of `(rule_obj, keywords: tuple[str,...], urgent_terms: tuple[str,...])`.
     #[new]
-    pub fn new(rules: &PyAny) -> PyResult<Self> {
+    pub fn new(rules: &Bound<PyAny>) -> PyResult<Self> {
         let mut rules_vec: Vec<PyObject> = Vec::new();
         let mut keyword_owners: AHashMap<String, Vec<usize>> = AHashMap::new();
         let mut urgent_owners: AHashMap<String, Vec<usize>> = AHashMap::new();
@@ -213,10 +199,9 @@ impl RuleTermMatcher {
         let mut keyword_terms: AHashMap<String, String> = AHashMap::new();
         let mut urgent_terms: AHashMap<String, String> = AHashMap::new();
 
-        let iter = rules.try_iter()?;
-        for entry in iter {
+        for entry in rules.try_iter()? {
             let entry = entry?;
-            let tup = entry.downcast::<pyo3::types::PyTuple>()?;
+            let tup = entry.downcast::<PyTuple>()?;
             if tup.len() != 3 {
                 return Err(pyo3::exceptions::PyTypeError::new_err(
                     "RuleTermMatcher expects (rule, keywords, urgent_terms) tuples",
@@ -260,13 +245,12 @@ impl RuleTermMatcher {
 
     /// Return `{rule: (matched_keywords, matched_urgent_terms)}` for the text.
     /// Mirrors `RuleTermMatcher.scan`.
-    pub fn scan(&self, py: Python, text: &str) -> PyResult<Py<PyDict>> {
+    pub fn scan(&self, py: Python, text: &str) -> PyResult<Bound<PyDict>> {
         let out = PyDict::new(py);
         if text.is_empty() {
-            return Ok(out.into());
+            return Ok(out);
         }
 
-        // keyword hits
         let kw_hits = self.keyword_compiled.collect_hits(text);
         let ug_hits = self.urgent_compiled.collect_hits(text);
 
@@ -280,7 +264,7 @@ impl RuleTermMatcher {
                 for &rule_idx in owners {
                     let rule_obj = self.rules[rule_idx].clone_ref(py);
                     let (kw_list, _ug_list) = ensure_entry(&out, rule_obj, py)?;
-                    kw_list.as_ref(py).append(display.clone())?;
+                    kw_list.append(display.clone())?;
                 }
             }
         }
@@ -295,61 +279,63 @@ impl RuleTermMatcher {
                 for &rule_idx in owners {
                     let rule_obj = self.rules[rule_idx].clone_ref(py);
                     let (_kw_list, ug_list) = ensure_entry(&out, rule_obj, py)?;
-                    ug_list.as_ref(py).append(display.clone())?;
+                    ug_list.append(display.clone())?;
                 }
             }
         }
 
-        Ok(out.into())
+        Ok(out)
     }
 
     /// Return `{rule: matched_keywords}` ignoring urgent terms.
     /// Mirrors `RuleTermMatcher.matched_keywords`.
-    pub fn matched_keywords(&self, py: Python, text: &str) -> PyResult<Py<PyDict>> {
+    pub fn matched_keywords(&self, py: Python, text: &str) -> PyResult<Bound<PyDict>> {
         let out = PyDict::new(py);
         if text.is_empty() {
-            return Ok(out.into());
+            return Ok(out);
         }
         let hits = self.keyword_compiled.collect_hits(text);
         for lowered in hits {
-            let display = self.keyword_display.get(&lowered).cloned().unwrap_or(lowered.clone());
+            let display = self
+                .keyword_display
+                .get(&lowered)
+                .cloned()
+                .unwrap_or_else(|| lowered.clone());
             if let Some(owners) = self.keyword_owners.get(&lowered) {
                 for &rule_idx in owners {
                     let rule_obj = self.rules[rule_idx].clone_ref(py);
-                    let list = if let Some(existing) = out.get_item(&rule_obj)? {
-                        existing.downcast::<PyList>()?.into()
-                    } else {
-                        let l = PyList::empty(py);
-                        out.set_item(rule_obj.clone_ref(py), l.clone_ref(py))?;
-                        l.into()
+                    let list = match out.get_item(&rule_obj)? {
+                        Some(existing) => existing.downcast::<PyList>()?.clone(),
+                        None => {
+                            let l = PyList::empty(py);
+                            out.set_item(rule_obj.clone_ref(py), l.clone())?;
+                            l
+                        }
                     };
-                    list.as_ref(py).append(display.clone())?;
+                    list.append(display.clone())?;
                 }
             }
         }
-        Ok(out.into())
+        Ok(out)
     }
 }
 
 /// Ensure a `(keyword_list, urgent_list)` entry exists in `out` for `rule_obj`
 /// and return cloned references to the two `PyList`s. Used by `RuleTermMatcher::scan`.
 fn ensure_entry<'py>(
-    out: &'py Bound<PyDict>,
+    out: &Bound<'py, PyDict>,
     rule_obj: PyObject,
     py: Python<'py>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>)> {
     if let Some(existing) = out.get_item(&rule_obj)? {
-        let tup = existing.downcast::<pyo3::types::PyTuple>()?;
+        let tup = existing.downcast::<PyTuple>()?;
         let kw = tup.get_item(0)?.downcast::<PyList>()?.clone();
         let ug = tup.get_item(1)?.downcast::<PyList>()?.clone();
         return Ok((kw, ug));
     }
-    let kw = PyList::empty_bound(py);
-    let ug = PyList::empty_bound(py);
-    let tup = pyo3::types::PyTuple::new_bound(
-        py,
-        [kw.clone().into_any(), ug.clone().into_any()],
-    );
+    let kw = PyList::empty(py);
+    let ug = PyList::empty(py);
+    let tup = PyTuple::new(py, [kw.clone(), ug.clone()]);
     out.set_item(rule_obj, tup)?;
     Ok((kw, ug))
 }
@@ -367,7 +353,7 @@ fn message_fingerprint_py(text: &str) -> String {
 }
 
 #[pyfunction]
-fn matched_terms(py: Python, text: &str, terms: &PyAny) -> PyResult<Py<PyList>> {
+fn matched_terms(py: Python, text: &str, terms: &Bound<PyAny>) -> PyResult<Bound<PyList>> {
     let list = PyList::empty(py);
     for term_obj in terms.try_iter()? {
         let term = term_obj?;
@@ -377,7 +363,7 @@ fn matched_terms(py: Python, text: &str, terms: &PyAny) -> PyResult<Py<PyList>> 
             list.append(s)?;
         }
     }
-    Ok(list.into())
+    Ok(list)
 }
 
 #[pyfunction]
@@ -393,7 +379,3 @@ pub fn register(parent: &Bound<PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(term_is_negated_py, parent)?)?;
     Ok(())
 }
-
-// Silence unused-import warnings for `Arc` (kept for future sharing).
-#[allow(dead_code)]
-type _Unused = Arc<()>;

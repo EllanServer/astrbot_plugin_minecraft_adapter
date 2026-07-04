@@ -6,9 +6,9 @@
 //! so porting them to Rust removes two of the hottest per-record paths.
 
 use blake2::digest::{Update, VariableOutput};
-use blake2::VarBlake2b;
+use blake2::Blake2bVar;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBool, PyDict, PyFloat, PyLong};
 
 /// Drop-in replacement for `ObservationRecordCodec`. Holds the small set of
 /// config-derived limits needed by `normalize_record` / `record_to_json` /
@@ -38,6 +38,7 @@ impl ObservationRecordCodec {
         include_raw = false,
         dedupe_window_seconds = 120,
     ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         max_content_length: usize,
         max_tags_per_record: usize,
@@ -75,29 +76,36 @@ impl ObservationRecordCodec {
         record.setattr("tags", new_tags)?;
 
         // metrics
-        let metrics = record.getattr("metrics")?.downcast::<PyDict>()?;
-        let compacted = self.compact_dict(py, metrics)?;
-        record.setattr("metrics", compacted)?;
+        let metrics_binding = record.getattr("metrics")?;
+        let metrics = metrics_binding.downcast::<PyDict>()?;
+        let compacted_metrics = self.compact_dict(py, metrics, self.max_metric_fields)?;
+        record.setattr("metrics", compacted_metrics)?;
 
         // context
-        let context = record.getattr("context")?.downcast::<PyDict>()?;
-        let compacted = self.compact_dict(py, context)?;
-        record.setattr("context", compacted)?;
+        let context_binding = record.getattr("context")?;
+        let context = context_binding.downcast::<PyDict>()?;
+        let compacted_context = self.compact_dict(py, context, self.max_raw_fields)?;
+        record.setattr("context", compacted_context)?;
 
         // raw
         if self.include_raw {
-            let raw = record.getattr("raw")?.downcast::<PyDict>()?;
-            let compacted = self.compact_dict(py, raw)?;
-            record.setattr("raw", compacted)?;
+            let raw_binding = record.getattr("raw")?;
+            let raw = raw_binding.downcast::<PyDict>()?;
+            let compacted_raw = self.compact_dict(py, raw, self.max_raw_fields)?;
+            record.setattr("raw", compacted_raw)?;
         } else {
-            record.setattr("raw", PyDict::new_bound(py))?;
+            record.setattr("raw", PyDict::new(py))?;
         }
         Ok(())
     }
 
     /// Build the JSONL-safe dict mirroring `record_to_json`. Returns a new
     /// Python dict; the input record is left untouched.
-    pub fn record_to_json<'py>(&self, py: Python<'py>, record: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyDict>> {
+    pub fn record_to_json<'py>(
+        &self,
+        py: Python<'py>,
+        record: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
         let event_id: String = record.getattr("event_id")?.extract()?;
         let kind: String = record.getattr("kind")?.extract()?;
         let timestamp: i64 = record.getattr("timestamp")?.extract()?;
@@ -112,12 +120,12 @@ impl ObservationRecordCodec {
         let context = record.getattr("context")?;
         let metrics = record.getattr("metrics")?;
         let raw = if self.include_raw {
-            record.getattr("raw")?
+            record.getattr("raw")?.into_any()
         } else {
-            PyDict::new_bound(py).into_any()
+            PyDict::new(py).into_any()
         };
 
-        let out = PyDict::new_bound(py);
+        let out = PyDict::new(py);
         out.set_item("eventId", event_id)?;
         out.set_item("kind", kind)?;
         out.set_item("timestamp", timestamp)?;
@@ -125,7 +133,7 @@ impl ObservationRecordCodec {
         out.set_item("serverName", server_name)?;
         out.set_item("backendServer", backend_server)?;
         out.set_item("proxyId", proxy_id)?;
-        let player = PyDict::new_bound(py);
+        let player = PyDict::new(py);
         player.set_item("name", player_name)?;
         player.set_item("uuidHash", player_uuid_hash)?;
         out.set_item("player", player)?;
@@ -141,12 +149,12 @@ impl ObservationRecordCodec {
     /// Mirrors `ObservationRecordCodec.json_line`.
     pub fn json_line(&self, py: Python, record: &Bound<PyAny>) -> PyResult<String> {
         let dict = self.record_to_json(py, record)?;
-        let json_module = py.import_bound(pyo3::intern!(py, "json"))?;
-        let dumps = json_module.getattr(pyo3::intern!(py, "dumps"))?;
-        let kwargs = pyo3::types::PyDict::new_bound(py);
-        kwargs.set_item(pyo3::intern!(py, "ensure_ascii"), false)?;
-        let separators = pyo3::types::PyTuple::new_bound(py, [",", ":"]);
-        kwargs.set_item(pyo3::intern!(py, "separators"), separators)?;
+        let json_module = py.import("json")?;
+        let dumps = json_module.getattr("dumps")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("ensure_ascii", false)?;
+        let separators = pyo3::types::PyTuple::new(py, [",", ":"]);
+        kwargs.set_item("separators", separators)?;
         let result: String = dumps.call((dict,), Some(&kwargs))?.extract()?;
         Ok(result)
     }
@@ -169,24 +177,32 @@ impl ObservationRecordCodec {
         let timestamp: i64 = record.getattr("timestamp")?.extract()?;
         let bucket = timestamp / self.dedupe_window_seconds.max(1).saturating_mul(1000);
         let content_lower = normalize_ws_lower(&content);
-        let raw = format!("{}|{}|{}|{}|{}", kind, server_id, identity, content_lower, bucket);
-        let mut hasher = VarBlake2b::new(16).expect("blake2b 16 bytes");
+        let raw = format!(
+            "{}|{}|{}|{}|{}",
+            kind, server_id, identity, content_lower, bucket
+        );
+        let mut hasher = Blake2bVar::new(16).expect("blake2b 16 bytes");
         hasher.update(raw.as_bytes());
         let mut out = [0u8; 16];
-        hasher.finalize_variable(|f| {
-            out.copy_from_slice(f);
-        });
-        Ok(format!("h:{}", hex::encode(&out)))
+        hasher.finalize_variable(|f| out.copy_from_slice(f));
+        Ok(format!("h:{}", hex_encode(&out)))
     }
 }
 
 impl ObservationRecordCodec {
     /// Mirror `compact_dict`. Takes a PyDict, returns a new bounded PyDict.
-    fn compact_dict<'py>(&self, py: Python<'py>, data: &Bound<'py, PyDict>) -> PyResult<Bound<'py, PyDict>> {
-        let compact = PyDict::new_bound(py);
+    /// `max_fields` is passed per-call to match the Python signature (metrics
+    /// uses max_metric_fields, context/raw use max_raw_fields).
+    fn compact_dict<'py>(
+        &self,
+        py: Python<'py>,
+        data: &Bound<'py, PyDict>,
+        max_fields: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let compact = PyDict::new(py);
         let mut count = 0;
         for kv in data.iter() {
-            if count >= self.max_fields_limit() {
+            if count >= max_fields {
                 break;
             }
             let (key, value) = kv?;
@@ -199,44 +215,36 @@ impl ObservationRecordCodec {
     }
 
     /// Mirror `compact_value`.
-    fn compact_value<'py>(&self, py: Python<'py>, value: &Bound<'py, PyAny>) -> PyResult<PyObject> {
+    fn compact_value<'py>(
+        &self,
+        py: Python<'py>,
+        value: &Bound<'py, PyAny>,
+    ) -> PyResult<PyObject> {
         if value.is_none() {
-            return Ok(value.clone().unbind());
+            return Ok(value.clone().into_any().unbind());
         }
         // bool/int/float passthrough
-        if value.is_instance_of::<pyo3::types::PyBool>()
-            || value.is_instance_of::<pyo3::types::PyLong>()
-            || value.is_instance_of::<pyo3::types::PyFloat>()
+        if value.is_instance_of::<PyBool>()
+            || value.is_instance_of::<PyLong>()
+            || value.is_instance_of::<PyFloat>()
         {
-            return Ok(value.clone().unbind());
+            return Ok(value.clone().into_any().unbind());
         }
         // str → truncate
         if let Ok(s) = value.extract::<String>() {
             return Ok(truncate(&s, self.max_content_length).into_py(py));
         }
         // fallback: json.dumps(value, ensure_ascii=False, default=str) then truncate
-        let json_module = py.import_bound(pyo3::intern!(py, "json"))?;
-        let dumps = json_module.getattr(pyo3::intern!(py, "dumps"))?;
-        let kwargs = pyo3::types::PyDict::new_bound(py);
-        kwargs.set_item(pyo3::intern!(py, "ensure_ascii"), false)?;
-        let default_fn = pyo3::types::PyCFunction::new_closure(py, None, None, |args, _kw| {
-            // default=str: stringify unknown objects
-            args.get_item(0).map(|o| o.to_string()).unwrap_or_default()
-        })?;
-        kwargs.set_item(pyo3::intern!(py, "default"), default_fn)?;
+        let json_module = py.import("json")?;
+        let dumps = json_module.getattr("dumps")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("ensure_ascii", false)?;
+        // default=str: stringify unknown objects via a Python closure.
+        let builtins = py.import("builtins")?;
+        let str_fn = builtins.getattr("str")?;
+        kwargs.set_item("default", str_fn)?;
         let text: String = dumps.call((value,), Some(&kwargs))?.extract()?;
         Ok(truncate(&text, self.max_content_length).into_py(py))
-    }
-
-    /// Convenience accessor: the field-limit used by `compact_dict` is
-    /// `max_metric_fields` when called for metrics, `max_raw_fields` for
-    /// context/raw. We use the larger of the two as the cap (matches Python
-    /// behavior where each call passes its own limit; here we approximate by
-    /// taking max_metric_fields since metrics typically dominates).
-    /// Note: Python passes per-call max_fields; the wrapper always passes the
-    /// right one. To stay faithful, we keep two separate limits below.
-    fn max_fields_limit(&self) -> usize {
-        self.max_metric_fields
     }
 }
 
@@ -283,17 +291,15 @@ fn normalize_ws_lower(s: &str) -> String {
     out
 }
 
-// Tiny hex encoder (avoids pulling another crate just for 16 bytes).
-mod hex {
-    pub fn encode(bytes: &[u8]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            s.push(HEX[(b >> 4) as usize] as char);
-            s.push(HEX[(b & 0x0f) as usize] as char);
-        }
-        s
+/// Tiny hex encoder (avoids pulling another crate just for 16 bytes).
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
     }
+    s
 }
 
 pub fn register(parent: &Bound<PyModule>) -> PyResult<()> {

@@ -5,7 +5,6 @@
 //! report window) inside `RecentWindowBuilder.add`, so moving it off the
 //! Python interpreter is high-value.
 
-use crate::dialogue_terms::{RuleTermMatcher};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
@@ -21,7 +20,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 pub fn observation_priority_score(
     py: Python,
     record: &Bound<PyAny>,
-    matcher: Option<&Bound<PyAny>>,
+    matcher: Option<Bound<PyAny>>,
 ) -> PyResult<f64> {
     let kind: String = record.getattr("kind")?.extract()?;
     let content: String = record.getattr("content")?.extract()?;
@@ -45,14 +44,14 @@ pub fn observation_priority_score(
     match kind.as_str() {
         "CHAT" => {
             score += 1.0;
-            if let Some(m) = matcher {
+            if let Some(m) = matcher.as_ref() {
                 // scan returns dict[rule, (kw_list, ug_list)]
                 let hits = m.call_method1("scan", (text.as_str(),))?;
                 let hits_dict = hits.downcast::<PyDict>()?;
                 for item in hits_dict.items() {
-                    let tup = item?.downcast::<PyTuple>()?;
-                    let rule_obj = tup.get_item(0)?;
-                    let lists = tup.get_item(1)?.downcast::<PyTuple>()?;
+                    let pair: Bound<PyTuple> = item?.downcast::<PyTuple>()?;
+                    let rule_obj = pair.get_item(0)?;
+                    let lists = pair.get_item(1)?.downcast::<PyTuple>()?;
                     let kw_list = lists.get_item(0)?.downcast::<PyList>()?;
                     let ug_list = lists.get_item(1)?.downcast::<PyList>()?;
                     let kw_count = kw_list.len();
@@ -81,23 +80,21 @@ pub fn observation_priority_score(
         _ => {}
     }
 
+    // Silence unused-warn if py ever unused (it isn't, but be safe).
+    let _ = py;
+
     Ok(score)
 }
 
 /// Mirror `_metrics_priority`: tps/memory based scoring.
 fn metrics_priority(record: &Bound<PyAny>) -> PyResult<f64> {
-    let metrics = record.getattr("metrics")?.downcast::<PyDict>()?;
+    let metrics_binding = record.getattr("metrics")?;
+    let metrics = metrics_binding.downcast::<PyDict>()?;
     let tps = metrics
         .get_item("tps1m")
         .or_else(|| metrics.get_item("tps"))?
-        .map(|v| v.extract::<f64>())
-        .transpose()?
+        .and_then(|v| v.extract::<f64>().ok())
         .unwrap_or(20.0);
-    let tps = if tps == 0.0 && metrics.get_item("tps1m")?.is_none() && metrics.get_item("tps")?.is_none() {
-        20.0
-    } else {
-        tps
-    };
     let memory = memory_usage_percent(metrics)?;
     let mut score = 0.0_f64;
     if tps < 18.0 {
@@ -113,10 +110,8 @@ fn metrics_priority(record: &Bound<PyAny>) -> PyResult<f64> {
 }
 
 /// Mirror `metrics_context.memory_usage_percent(metrics)`:
-/// returns the percentage (0-100) or None. Looks up common metric keys.
+/// returns the percentage (0-100) or 0.0 if unknown. Looks up common keys.
 fn memory_usage_percent(metrics: &Bound<PyDict>) -> PyResult<f64> {
-    // keys tried in order: usedMemoryPercent, memoryUsagePercent, memoryPercent,
-    // then (usedMemory / maxMemory) * 100.
     for key in ["usedMemoryPercent", "memoryUsagePercent", "memoryPercent"] {
         if let Some(v) = metrics.get_item(key)? {
             if let Ok(p) = v.extract::<f64>() {
@@ -124,8 +119,12 @@ fn memory_usage_percent(metrics: &Bound<PyDict>) -> PyResult<f64> {
             }
         }
     }
-    let used = metrics.get_item("usedMemory")?.and_then(|v| v.extract::<f64>().ok());
-    let max = metrics.get_item("maxMemory")?.and_then(|v| v.extract::<f64>().ok());
+    let used = metrics
+        .get_item("usedMemory")?
+        .and_then(|v| v.extract::<f64>().ok());
+    let max = metrics
+        .get_item("maxMemory")?
+        .and_then(|v| v.extract::<f64>().ok());
     if let (Some(u), Some(m)) = (used, max) {
         if m > 0.0 {
             return Ok((u / m) * 100.0);
@@ -136,7 +135,5 @@ fn memory_usage_percent(metrics: &Bound<PyDict>) -> PyResult<f64> {
 
 pub fn register(parent: &Bound<PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(observation_priority_score, parent)?)?;
-    // Re-export RuleTermMatcher here too so callers can grab it from either module.
-    let _ = RuleTermMatcher::register;
     Ok(())
 }
