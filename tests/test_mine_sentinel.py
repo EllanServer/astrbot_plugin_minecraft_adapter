@@ -2208,6 +2208,93 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         )
         self.assertIn("daily_noise", obs["tags"])
 
+    # --- PR10 hotfix: 真实 mclo.gs 日志暴露的 3 个 bug 回归测试 ---
+    def test_vulcan_lifecycle_logs_not_flagged_as_alerts(self):
+        """Vulcan 插件生命周期日志（Loading/Enabling/Starting/hook）不应被误判为告警。
+
+        真实日志样本：[Vulcan] Loading server plugin / Enabling Vulcan / Starting Vulcan
+        这些行带 [Vulcan] 前缀但没有 'failed' 关键词，不应触发 anticheat_vulcan。
+        """
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+        runtime_config = MineSentinelRuntimeLogConfig()
+        lifecycle_lines = [
+            "[16:30:33] [Server thread/INFO]: [Vulcan] Loading server plugin Vulcan v2.9.7.22",
+            "[16:31:38] [Server thread/INFO]: [Vulcan] Enabling Vulcan v2.9.7.22",
+            "[16:31:38] [Server thread/INFO]: [Vulcan] Starting Vulcan... Server Version: 1.21.11 detected!",
+            "[16:31:38] [Server thread/INFO]: [Vulcan] LibsDisguises found. Enabling hook!",
+            "[16:31:38] [Server thread/INFO]: [Vulcan] BStats enabled!",
+            "[16:31:38] [Server thread/INFO]: [Vulcan] PlaceholderAPI found. Enabling hook!",
+        ]
+        for line in lifecycle_lines:
+            obs = self._build(line, runtime_config)
+            self.assertNotIn(
+                "anticheat_vulcan",
+                obs["tags"],
+                f"Vulcan 生命周期日志不应被误判为告警: {line}",
+            )
+
+    def test_vulcan_real_alert_with_failed_keyword_flagged(self):
+        """带 'failed' 关键词的 Vulcan 告警应被正确识别。"""
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+        runtime_config = MineSentinelRuntimeLogConfig()
+        obs = self._build(
+            "[17:00:00] [Server thread/INFO]: [Vulcan] CheaterPlayer failed Reach (VL: 5)",
+            runtime_config,
+        )
+        self.assertIn("anticheat_vulcan", obs["tags"])
+        self.assertEqual(obs["context"].get("vulcanPlayer"), "CheaterPlayer")
+        self.assertEqual(obs["context"].get("vulcanCheck"), "Reach")
+
+    def test_luckperms_warn_not_filtered_as_daily_noise(self):
+        """LuckPerms HikariCP WARN 不应被 daily_noise 过滤。
+
+        真实日志：[luckperms-worker-N/WARN]: ... Failed to validate connection
+        这是连接池异常，必须保留告警能力，即使默认 pattern 含 'luckperms-worker-N/'。
+        """
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+        runtime_config = MineSentinelRuntimeLogConfig()
+        obs = self._build(
+            "[16:55:00] [luckperms-worker-1/WARN]: [me.lucko.luckperms.lib.hikari.pool.PoolBase] "
+            "luckperms-hikari - Failed to validate connection "
+            "me.lucko.luckperms.lib.mariadb.Connection@7f8873b5 "
+            "((conn=573) Connection.setNetworkTimeout cannot be called on a closed connection).",
+            runtime_config,
+        )
+        self.assertNotIn(
+            "daily_noise",
+            obs["tags"],
+            "LuckPerms WARN 不应被 daily_noise 过滤（即使命中 luckperms-worker-N pattern）",
+        )
+        self.assertEqual(obs["context"].get("level"), "WARN")
+
+    def test_carbonchat_format_chat_message_parsed(self):
+        """CarbonChat '[Not Secure] [频道] player >> msg' 格式应被解析。
+
+        真实日志样本：[16:34:47] [Async Chat Thread - #1/INFO]:
+          [Not Secure] [生存区] TypeThe0ry >> 1
+        """
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+        runtime_config = MineSentinelRuntimeLogConfig()
+        obs = self._build(
+            "[16:34:47] [Async Chat Thread - #1/INFO]: [Not Secure] [生存区] TypeThe0ry >> 1",
+            runtime_config,
+        )
+        self.assertIn("chat_message", obs["tags"])
+        self.assertEqual(obs["context"].get("chatPlayer"), "TypeThe0ry")
+        self.assertEqual(obs["context"].get("chatMessage"), "1")
+
+    def test_chat_with_multiple_channel_tags_parsed(self):
+        """多频道标签的聊天行也应被解析（如 [Not Secure] [服1] [服2] player >> msg）。"""
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+        runtime_config = MineSentinelRuntimeLogConfig()
+        obs = self._build(
+            "[17:00:00] [Async Chat Thread - #5/INFO]: [Not Secure] [生存区] [子区] Steve >> hello",
+            runtime_config,
+        )
+        self.assertIn("chat_message", obs["tags"])
+        self.assertEqual(obs["context"].get("chatPlayer"), "Steve")
+        self.assertEqual(obs["context"].get("chatMessage"), "hello")
+
 
 class MineSentinelHourlySummaryTests(unittest.IsolatedAsyncioTestCase):
     """Tests for the hourly summary mode (no polling, per-hour log read + AI integrate)."""
@@ -4360,6 +4447,174 @@ class MineSentinelPr9HotfixV3Tests(unittest.TestCase):
             self.assertIsNotNone(stat)
             self.assertGreater(stat.ewma_count, 0.0, "flush_bucket 后 ewma_count 应 > 0")
             self.assertGreater(len(stat.window), 0, "window 应有计数")
+
+
+class MineSentinelRealLogIntegrationTests(unittest.TestCase):
+    """真实场景集成测试：用 mclo.gs 真实日志验证 daily_noise/chat/vulcan 检测。
+
+    日志来源：https://mclo.gs/PhqCOKu（4444 行，Leaf 1.21.11 服，含 CarbonChat
+    聊天插件、Vulcan 反作弊、LuckPerms + HikariCP 连接池异常等真实场景）。
+    """
+
+    FIXTURE_PATH = Path(__file__).parent / "fixtures" / "mclogs_phaocoku.log"
+
+    @classmethod
+    def setUpClass(cls):
+        """加载真实日志，逐行跑 _build_observation 生成 ObservationRecord 列表。"""
+        if not cls.FIXTURE_PATH.exists():
+            raise unittest.SkipTest(f"fixture 缺失: {cls.FIXTURE_PATH}")
+        from services.mine_sentinel.models import (
+            MineSentinelLogSourceConfig,
+            MineSentinelRuntimeLogConfig,
+        )
+        from services.mine_sentinel.runtime_log import (
+            _build_observation,
+            _parse_log_timestamp,
+        )
+        from datetime import date as _date
+
+        cls.runtime_config = MineSentinelRuntimeLogConfig()
+        source = MineSentinelLogSourceConfig(
+            server_id="survival",
+            server_name="Survival",
+            server_type="minecraft",
+        )
+        cls.records: list[ObservationRecord] = []
+        with cls.FIXTURE_PATH.open("r", encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                ts_ms = _parse_log_timestamp(line, _date.today())
+                obs = _build_observation(
+                    source=source,
+                    log_file=cls.FIXTURE_PATH,
+                    line=line,
+                    timestamp_ms=ts_ms,
+                    max_line_length=2000,
+                    runtime_config=cls.runtime_config,
+                )
+                cls.records.append(ObservationRecord.from_dict(obs, "survival", "Survival"))
+
+    def test_fixture_loaded_successfully(self):
+        """fixture 应加载出大量真实日志记录。"""
+        self.assertGreater(len(self.records), 4000, "应加载出 4000+ 条真实日志")
+
+    def test_real_chat_messages_detected_with_carbonchat_format(self):
+        """真实 CarbonChat 聊天行应被识别，玩家名提取正确。
+
+        真实格式：[Async Chat Thread - #N/INFO]: [Not Secure] [频道] player >> msg
+        共 784 条聊天行，12 位玩家，最活跃 LOCALFLVCKO (150 条)。
+        """
+        chat_records = [r for r in self.records if "chat_message" in r.tags]
+        self.assertGreater(len(chat_records), 700, "应识别出 700+ 条聊天行")
+        # 验证玩家名提取正确
+        players = {r.context.get("chatPlayer") for r in chat_records if r.context.get("chatPlayer")}
+        self.assertIn("LOCALFLVCKO", players)
+        self.assertIn("_Dawnstar_", players)
+        self.assertIn("TypeThe0ry", players)
+
+    def test_real_login_disconnect_uuid_filtered_as_daily_noise(self):
+        """真实登录/断开/UUID 日志应被打 daily_noise 标签，不形成事件。"""
+        noise_records = [r for r in self.records if "daily_noise" in r.tags]
+        # 至少应过滤掉数十条 login/disconnect/UUID 日志
+        self.assertGreater(len(noise_records), 50, "应过滤 50+ 条正常日志")
+        # 验证具体样本
+        sample_contents = " ".join(r.content for r in noise_records[:20])
+        self.assertIn("lost connection", sample_contents.lower())
+        # 都应是 INFO 级别
+        for r in noise_records:
+            self.assertEqual(r.context.get("level"), "INFO")
+
+    def test_real_luckperms_warn_not_filtered_as_noise(self):
+        """真实 LuckPerms HikariCP WARN 不应被 daily_noise 误过滤。
+
+        真实日志：[luckperms-worker-N/WARN]: ... Failed to validate connection
+        这是连接池异常，必须保留告警能力。
+        """
+        luckperms_warn = [
+            r for r in self.records
+            if "luckperms" in r.content.lower() and r.context.get("level") == "WARN"
+        ]
+        self.assertGreater(len(luckperms_warn), 0, "应存在 LuckPerms WARN 记录")
+        # 这些 WARN 不应被打 daily_noise 标签
+        for r in luckperms_warn:
+            self.assertNotIn(
+                "daily_noise",
+                r.tags,
+                f"LuckPerms WARN 不应被 daily_noise 过滤: {r.content[:80]}",
+            )
+
+    def test_real_vulcan_lifecycle_logs_not_flagged_as_alerts(self):
+        """Vulcan 插件生命周期日志（Loading/Enabling/Starting）不应被误判为告警。
+
+        真实日志只有 [Vulcan] Loading/Enabling/Starting/hook 等生命周期行，
+        没有 failed 关键词，不应触发 anticheat_vulcan 标签。
+        """
+        vulcan_alert_records = [r for r in self.records if "anticheat_vulcan" in r.tags]
+        # 这份日志没有真实 Vulcan 告警，应为空
+        self.assertEqual(
+            vulcan_alert_records,
+            [],
+            "Vulcan 生命周期日志不应被误判为告警",
+        )
+
+    def test_real_chat_topics_built_correctly(self):
+        """真实聊天热点总结应正确聚合玩家和关键词。
+
+        真实日志含 1158 条聊天行（含 Async Chat Thread 和其他线程的 >> 聊天），
+        21 位玩家，最活跃 JasonOXMO (219 条)。
+        """
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        report = builder.build(self.records, 120, "survival")
+        topics = report["chat_topics"]
+        self.assertGreater(topics["total_messages"], 1000)
+        self.assertGreaterEqual(topics["unique_players"], 15)
+        # 最活跃玩家应是 JasonOXMO（219 条，真实数据驱动）
+        top_player = topics["top_players"][0]
+        self.assertEqual(top_player["player"], "JasonOXMO")
+        self.assertGreater(top_player["message_count"], 200)
+
+    def test_real_vulcan_alerts_section_empty_when_no_real_alerts(self):
+        """这份真实日志无 Vulcan 告警，vulcan_alerts 段应为空。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        report = builder.build(self.records, 120, "survival")
+        self.assertEqual(report["vulcan_alerts"], [])
+
+    def test_real_log_does_not_form_false_incident_from_normal_login(self):
+        """真实日志中的正常登录/断开不应形成 '事件#1 服务器集中出现多类运行日志异常'。
+
+        这是用户原始诉求：正常登录/断开/UUID 被误聚合为 moderation/network 事件。
+        验证 issues 中不含由 daily_noise 记录形成的 network/moderation 事件。
+        """
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        report = builder.build(self.records, 120, "survival")
+        # 检查所有 issues 的 evidence_samples，不应有 daily_noise 记录
+        for issue in report["issues"]:
+            samples = issue.get("evidence_samples") or []
+            for sample in samples:
+                # 样本里不应包含被过滤的正常登录/断开行
+                lowered = sample.lower()
+                if "lost connection: disconnected" in lowered and "warn" not in lowered:
+                    self.fail(
+                        f"issue[{issue['category']}] 的 evidence_samples 不应包含 "
+                        f"被 daily_noise 过滤的正常断开行: {sample[:80]}"
+                    )
+
+    def test_real_log_chat_plugin_format_parsed_correctly(self):
+        """验证 CarbonChat '[Not Secure] [频道] player >> msg' 格式解析正确。
+
+        取一条真实样本：[16:34:47] [Async Chat Thread - #1/INFO]:
+          [Not Secure] [生存区] TypeThe0ry >> 1
+        """
+        chat_records = [
+            r for r in self.records
+            if "chat_message" in r.tags and r.context.get("chatPlayer") == "TypeThe0ry"
+        ]
+        self.assertGreater(len(chat_records), 0, "应识别 TypeThe0ry 的聊天行")
+        # 第一条消息应是 "1"
+        first = chat_records[0]
+        self.assertEqual(first.context.get("chatMessage"), "1")
 
 
 if __name__ == "__main__":

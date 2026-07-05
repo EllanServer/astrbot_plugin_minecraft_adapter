@@ -81,13 +81,20 @@ _ERROR_WORDS = (
 
 # 聊天行检测：Minecraft 原生 [Async Chat Thread] 线程标签或 <player> 前缀。
 # 用于 chat_summary 热点总结，提取玩家名和消息内容。
-_CHAT_THREAD_RE = re.compile(r"\[Async Chat Thread/[A-Z]+\]\s*:?\s*", re.IGNORECASE)
+_CHAT_THREAD_RE = re.compile(r"\[Async Chat Thread[^\]]*\]\s*:?\s*", re.IGNORECASE)
+# 原生聊天：<player> message
 _CHAT_PLAYER_PREFIX_RE = re.compile(r"<(?P<player>[^>\s]{1,40})>\s*(?P<message>.*)$")
-# Vulcan 反作弊插件日志检测。Vulcan 的标准格式：
-#   [Server thread/INFO]: [Vulcan] PlayerName failed CheckName (VL: 5)
-#   [Vulcan] PlayerName was rubbing ... (Verbose)
-# 兼容大小写和不同前缀写法。
-_VULCAN_PREFIX_RE = re.compile(r"\[Vulcan[\]:>]", re.IGNORECASE)
+# 聊天插件（CarbonChat 等）：[Not Secure] [频道] player >> message
+# 兼容 [Not Secure] 可选、频道名可含中文/数字、>> 分隔符。
+_CHAT_PLUGIN_RE = re.compile(
+    r"(?:\[Not Secure\]\s*)?"  # 可选的 [Not Secure] 标记
+    r"(?:\[[^\]]{1,30}\]\s*)*"  # 0 或多个 [频道] 标记
+    r"(?P<player>[A-Za-z0-9_]{1,16})\s*>>\s*(?P<message>.+)$"
+)
+# Vulcan 反作弊插件告警检测。Vulcan 告警的标准格式：
+#   [Vulcan] PlayerName failed CheckName (VL: 5)
+# 注意：[Vulcan] 前缀也会出现在插件生命周期日志（Loading/Enabling/Starting/hook），
+# 因此必须用 "failed" 关键词区分告警和生命周期日志，避免误判。
 _VULCAN_PLAYER_RE = re.compile(
     r"\[Vulcan\][\]:>\s]*"  # [Vulcan] 前缀
     r"(?P<player>[A-Za-z0-9_]{1,16})\s+"
@@ -1196,43 +1203,55 @@ def _match_noise_patterns(content: str, compiled: list["re.Pattern[str]"]) -> bo
 def _detect_chat_message(content: str) -> tuple[str, str] | None:
     """检测聊天行并返回 (player, message)，非聊天行返回 None。
 
-    识别两种 Minecraft 聊天格式：
+    识别三种 Minecraft 聊天格式：
     1. ``[Async Chat Thread/INFO]: <player> message`` — 原生聊天线程
-    2. ``<player> message`` — 直接前缀（聊天插件或控制台回放）
-    玩家名最长 40 字符（兼容某些 RCON/控制台场景），消息保留原样。
+    2. ``[Async Chat Thread/INFO]: [Not Secure] [频道] player >> message``
+       — CarbonChat 等聊天插件格式（真实 mclo.gs 日志验证）
+    3. ``<player> message`` — 直接前缀（控制台回放）
+
+    玩家名最长 16 字符（Minecraft 限制），消息保留原样。
     """
-    match = _CHAT_PLAYER_PREFIX_RE.search(content)
+    # 优先匹配聊天插件格式（>> 分隔），需要先剥掉 [Async Chat Thread] 等线程前缀
+    stripped = content
+    if _CHAT_THREAD_RE.search(content):
+        stripped = _CHAT_THREAD_RE.sub("", content).strip()
+    plugin_match = _CHAT_PLUGIN_RE.search(stripped)
+    if plugin_match:
+        player = plugin_match.group("player").strip()
+        message = plugin_match.group("message").strip()
+        if player and message:
+            return player, message
+    # 原生 <player> 前缀格式
+    match = _CHAT_PLAYER_PREFIX_RE.search(stripped)
     if match:
         player = match.group("player").strip()
         message = match.group("message").strip()
         if player and message:
             return player, message
-    # 仅当行包含 Async Chat Thread 线程标签时，视为聊天行但无明确玩家
+    # 仅当行包含 Async Chat Thread 线程标签但无法解析玩家时，视为无玩家聊天
     if _CHAT_THREAD_RE.search(content):
-        # 去掉线程前缀，剩下当作消息
-        stripped = _CHAT_THREAD_RE.sub("", content).strip()
         if stripped:
             return "", stripped
     return None
 
 
 def _detect_vulcan_alert(content: str) -> dict[str, str] | None:
-    """检测 Vulcan 反作弊告警并返回 {player, check}，非 Vulcan 行返回 None。
+    """检测 Vulcan 反作弊告警并返回 {player, check}，非告警行返回 None。
 
-    Vulcan 标准格式：``[Vulcan] PlayerName failed CheckName (VL: 5)``
+    只匹配 ``[Vulcan] PlayerName failed CheckName`` 格式的真实告警，
+    排除 ``[Vulcan] Loading/Enabling/Starting/hook`` 等插件生命周期日志
+    （这些日志也带 [Vulcan] 前缀但不是告警，真实 mclo.gs 日志验证）。
+
+    标准格式：``[Vulcan] PlayerName failed CheckName (VL: 5)``
     或带前缀：``[Server thread/INFO]: [Vulcan] PlayerName failed ...``
-    无法解析玩家名时返回 {player: "", check: ""} 表示命中但无结构化信息。
     """
-    if not _VULCAN_PREFIX_RE.search(content):
-        return None
     match = _VULCAN_PLAYER_RE.search(content)
     if match:
         return {
             "player": match.group("player").strip(),
             "check": match.group("check").strip(" :,."),
         }
-    # 命中 [Vulcan] 前缀但无法解析玩家名（如 verbose 日志）
-    return {"player": "", "check": ""}
+    return None
 
 
 def _skip_anomaly_result(
@@ -1328,15 +1347,20 @@ def _build_observation(
     vulcan_info: dict[str, str] | None = None
     if runtime_config is not None:
         if runtime_config.daily_noise_filter_enabled:
-            # 用户配置为空时使用 DEFAULT_DAILY_NOISE_PATTERNS；非空则只用用户的。
-            patterns = (
-                runtime_config.daily_noise_patterns
-                if runtime_config.daily_noise_patterns
-                else list(DEFAULT_DAILY_NOISE_PATTERNS)
-            )
-            if patterns and _match_noise_patterns(content, _compile_noise_patterns(patterns)):
-                tags.append("daily_noise")
-                daily_noise_hit = True
+            # PR10 hotfix: daily_noise 只过滤 INFO 级别，WARN/ERROR/FATAL 永远不过滤。
+            # 真实日志验证：luckperms-worker-N/WARN: Failed to validate connection
+            # 是 HikariCP 连接池异常，必须告警；如果用 'luckperms-worker-N/' pattern
+            # 一刀切过滤会把真实异常也吞掉。INFO 级别的 luckperms 常规日志才过滤。
+            if level == "INFO":
+                # 用户配置为空时使用 DEFAULT_DAILY_NOISE_PATTERNS；非空则只用用户的。
+                patterns = (
+                    runtime_config.daily_noise_patterns
+                    if runtime_config.daily_noise_patterns
+                    else list(DEFAULT_DAILY_NOISE_PATTERNS)
+                )
+                if patterns and _match_noise_patterns(content, _compile_noise_patterns(patterns)):
+                    tags.append("daily_noise")
+                    daily_noise_hit = True
         if runtime_config.chat_summary_enabled:
             chat_info = _detect_chat_message(content)
             if chat_info is not None:
