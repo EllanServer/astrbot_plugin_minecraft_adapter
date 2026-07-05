@@ -219,7 +219,12 @@ GitHub 仓库：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter
 1. 部署模式：单服 / Velocity 群组服。
 2. Minecraft 服务器根目录；Velocity 群组服需要 Velocity 根目录和每个后端服根目录。
 3. AstrBot 根目录和实际运行 Python 路径。
-4. 接收报告的 AstrBot 会话 UMO，优先使用 /sid 输出；也可提供 group: 或 qq: 简写。
+4. 接收报告的 QQ 群号 / QQ 号 / AstrBot 会话 UMO（可选，若不提供则自动检测 AstrBot 已配置的 bot 后向我确认）：
+   - 完整 UMO（最稳，推荐在 AstrBot 里对目标会话执行 /sid 拿到，例如 napcat:GroupMessage:123456）
+   - QQ 群号（如 123456789，会按 group: 简写写入配置）
+   - QQ 号（如 10001，会按 qq: 简写写入配置，私聊接收）
+   - 多个目标可一并提供，写成列表
+   - 若不同服务器的报告要发到不同群/QQ，请说明每个 server_id 对应哪个目标
 5. 服务器日志量量级：小服（<50 玩家日常）/ 大服（≥50 玩家日常或 mod 服、连锁机器多）。
 6. 是否现在重启 AstrBot 和 Minecraft 服务端。
 
@@ -230,11 +235,27 @@ GitHub 仓库：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter
 4. **可选**：如需 Rust 加速，从 GitHub Actions "Build Rust wheels" 工作流（见上方链接）最近一次成功 run 的 Artifacts 下载对应平台 wheel 并 `pip install <wheel>.whl`；未安装时插件照常运行（纯 Python 降级）。不要在目标机器本地编译 Rust。
 5. 在 mine_sentinel.runtime_log.sources 写入服务器根目录或 latest.log 路径；Velocity 群组服写入 Velocity 和所有后端服。
 6. 开启 runtime_log、backfill_on_start、loop_filter_enabled、storage、report、send_as_image、send_full_log_file。
-7. 报告目标写入 mine_sentinel.report.delivery_targets，优先使用 /sid 完整 UMO。
-8. 按日志量量级选择性能档位（见下方"性能档位参考"），写入 runtime_log.template_parse_mode、runtime_log.anomaly_track_info、runtime_log.io_workers、report.export_format、report.export_reuse_existing。
-9. 重启后执行 /mc monitor status，确认日志源数量、observation/export 目录、io_workers 是否生效。
-10. 触发或等待一条 MC 日志后执行 /mc report now <服务器ID> 30m，验证图片报告和 JSONL 附件能发送；同时检查附件文件名含 _t<秒级时间戳> 后缀（手动连续 report now 不会复用旧附件）。
-11. 最后汇总安装文件、备份位置、日志源 server_id、性能档位、是否启用 Rust 加速、验证结果和需要我手动确认的事项。
+7. 自动检测 AstrBot 已配置的 bot 平台，并据此配置报告投递目标：
+   a. 读取 `<AstrBot 根目录>/data/cmd_config.json`（注意可能是 UTF-8 BOM，用 utf-8-sig 读取），取 `platform` 数组。每项形如 `{"id": "napcat_xxx", "type": "aiocqhttp" | "qq_official" | "qq_official_webhook" | "telegram" | ..., "enable": true, ...}`。
+   b. 筛选 `enable=true` 的平台，识别其中的 QQ 类平台：
+      - `type=aiocqhttp`：NapCat / Lagrange / go-cqhttp 等 OneBot v11 协议端，平台 id 通常含 `napcat` / `aiocqhttp` / `onebot`。对应 UMO 前缀 `<id>:GroupMessage:` 或 `<id>:FriendMessage:`。
+      - `type=qq_official` 或 `qq_official_webhook`：QQ 官方 API，群用 `<id>:GroupMessage:<group_openid>`，私聊用 `<id>:FriendMessage:<user_openid>`（注意是 openid 不是 QQ 号）。
+   c. 若用户已提供 QQ 群号/QQ 号/UMO：按用户提供的内容写入 delivery_targets（写法见下方）。插件运行时会自动把 `group:` / `qq:` 简写解析到当前可用的 QQ 平台（NapCat/Lagrange 优先于 QQ 官方 API），所以简写写法不需要带平台 id。
+   d. 若用户未提供投递目标但检测到唯一一个 QQ 类平台：用该平台 id 拼 UMO 前缀，向用户确认目标群号/QQ 号后写入配置。
+   e. 若检测到多个 QQ 类平台：列出所有可用平台 id 和类型让用户选择，再按选择拼接 UMO。
+   f. 若未检测到任何 QQ 类平台：告知用户需先在 AstrBot 配置一个 QQ 适配器（aiocqhttp 或 qq_official），再继续 MineSentinel 配置。
+   g. delivery_targets 支持的写法（任选一种，多目标写成列表）：
+      - 完整 UMO（推荐）：napcat:GroupMessage:123456 / napcat:FriendMessage:10001 / qq_official:GroupMessage:group_openid（/sid 直接输出，最稳）
+      - QQ 群简写：group:123456789
+      - QQ 号简写：qq:10001（私聊）
+      - 纯数字：默认按 QQ 群处理
+      - dict 形式：{type: group, id: 123456} 或 {type: qq, id: 10001}
+8. 如果用户希望某个服务器的报告单独发到指定群/QQ（而不是走全局 delivery_targets），在该 source 下写 target_sessions，写法同上。
+9. send_to_target_sessions（默认 true）控制是否同时发到各 source 配置的 target_sessions；若只想用全局 delivery_targets，可设为 false。
+10. 按日志量量级选择性能档位（见下方"性能档位参考"），写入 runtime_log.template_parse_mode、runtime_log.anomaly_track_info、runtime_log.io_workers、report.export_format、report.export_reuse_existing。
+11. 重启后执行 /mc monitor status，确认日志源数量、observation/export 目录、io_workers 是否生效。
+12. 触发或等待一条 MC 日志后执行 /mc report now <服务器ID> 30m，验证图片报告和 JSONL 附件能发送到配置的 QQ 群/QQ 号；同时检查附件文件名含 _t<秒级时间戳> 后缀（手动连续 report now 不会复用旧附件）。
+13. 最后汇总安装文件、备份位置、日志源 server_id、性能档位、报告投递目标（哪些群/QQ）、是否启用 Rust 加速、验证结果和需要我手动确认的事项。
 
 性能档位参考（写入 mine_sentinel 配置）：
 - 小服默认档（开箱即用，功能完整）：
