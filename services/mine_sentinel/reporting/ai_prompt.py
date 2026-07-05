@@ -119,12 +119,14 @@ class AIReportPromptBuilder:
             for key in (
                 "daily",
                 "complaint",
+                "network",
+                "plugin",
+                "cross_server",
+                "moderation",
                 "bug",
                 "economy",
                 "community",
-                "moderation",
                 "suggestion",
-                "cross_server",
             )
         }
         compact_issues = []

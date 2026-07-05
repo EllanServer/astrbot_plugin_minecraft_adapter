@@ -146,6 +146,8 @@ def _event_summaries(
         for key in (
             "daily",
             "complaint",
+            "network",
+            "plugin",
             "bug",
             "cross_server",
             "economy",

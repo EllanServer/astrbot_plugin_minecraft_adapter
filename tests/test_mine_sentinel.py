@@ -458,6 +458,274 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
         )
 
 
+class MineSentinelRulesTests(unittest.TestCase):
+    """Tests for the refactored rules engine: network/plugin categories and critical direct alert."""
+
+    def _make_record(self, content, level="INFO", server_id="survival", tags=None, context=None):
+        now = int(time.time() * 1000)
+        return ObservationRecord(
+            event_id=f"log-{abs(hash(content)) % 10_000_000}",
+            kind="SERVER_LOG",
+            timestamp=now,
+            server_id=server_id,
+            server_name=server_id.capitalize(),
+            content=content,
+            tags=tags or ["server_log", "runtime_log"],
+            context={"level": level, **(context or {})},
+        )
+
+    def test_network_category_classifies_connection_reset(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "io.netty.channel.unix.Errors$NativeConnectException: connect(..) failed: Connection refused",
+            level="WARN",
+        )
+        self.assertEqual(builder.classify(record), "network")
+        self.assertEqual(builder.tag(record), "server_log_network")
+
+    def test_network_category_classifies_broken_pipe(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/WARN]: Broken pipe during packet flush",
+            level="WARN",
+        )
+        self.assertEqual(builder.classify(record), "network")
+
+    def test_plugin_category_classifies_could_not_load(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/ERROR]: Could not load plugin EssentialsX-2.20.1.jar",
+            level="ERROR",
+        )
+        self.assertEqual(builder.classify(record), "plugin")
+        self.assertEqual(builder.tag(record), "server_log_plugin")
+
+    def test_plugin_category_classifies_dependency_missing(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/ERROR]: Plugin DependsOnVault missing dependency: Vault",
+            level="ERROR",
+        )
+        self.assertEqual(builder.classify(record), "plugin")
+
+    def test_critical_marker_raises_severity_to_critical(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/FATAL]: OutOfMemoryError: Java heap space",
+            level="FATAL",
+        )
+        # 单条 critical marker 直接归 critical
+        severity = builder._severity([record])
+        self.assertEqual(severity, "critical")
+
+    def test_critical_marker_watchdog(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Watchdog thread/ERROR]: Server thread froze for 60 seconds (tick took too long)",
+            level="ERROR",
+        )
+        self.assertEqual(builder._severity([record]), "critical")
+
+    def test_critical_direct_alert_ignores_min_evidence_count(self):
+        """critical 严重级别应当绕过 min_evidence_count 直接告警。"""
+        config = MineSentinelConfig.from_dict(
+            {"alert": {"enabled": True, "min_severity": "high", "min_evidence_count": 5}}
+        )
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Server thread/FATAL]: Server stopped unexpectedly (crash)",
+            level="FATAL",
+        )
+        report = builder.build([record], 60, "survival")
+        critical_issues = [
+            issue for issue in report["issues"] if issue["severity"] == "critical"
+        ]
+        self.assertTrue(critical_issues, "expected at least one critical issue")
+        # critical 直告：即使 evidence_count=1（< min_evidence_count=5）也应当告警
+        self.assertTrue(
+            all(issue["should_alert"] for issue in critical_issues),
+            "critical issues must alert regardless of min_evidence_count",
+        )
+        self.assertTrue(report["any_alert"])
+        self.assertEqual(report["max_severity"], "critical")
+
+    def test_critical_marker_crash_in_chinese(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/ERROR]: 服务器内存溢出，进程崩溃",
+            level="ERROR",
+        )
+        self.assertEqual(builder._severity([record]), "critical")
+
+    def test_plugin_load_failure_raises_to_high(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/ERROR]: Could not enable plugin 'ShopUI' - dependency missing",
+            level="ERROR",
+        )
+        # 单条 plugin load/enable failure 即提级 high
+        self.assertEqual(builder._severity([record]), "high")
+
+    def test_performance_repeat_raises_to_high(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        # 注意：不能用 "Can't keep up! Is the server overloaded" ——
+        # 该完整短语本身是 CRITICAL_MARKER，会直接归 critical。
+        records = [
+            self._make_record(
+                "[Server thread/WARN]: Server is lagging badly, TPS dropped to 5",
+                level="WARN",
+            )
+            for _ in range(3)
+        ]
+        self.assertEqual(builder._severity(records), "high")
+
+    def test_network_error_repeat_raises_to_high(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        records = [
+            self._make_record(
+                f"[Server thread/WARN]: Connection reset by peer (player{_})",
+                level="WARN",
+            )
+            for _ in range(5)
+        ]
+        self.assertEqual(builder._severity(records), "high")
+
+    def test_multi_server_medium_forces_alert(self):
+        """多服务器 + medium 应当强制告警，即使 evidence_count 不足。"""
+        config = MineSentinelConfig.from_dict(
+            {"alert": {"enabled": True, "min_severity": "high", "min_evidence_count": 5}}
+        )
+        builder = HeuristicReportBuilder(config)
+        # 单条 ERROR 在两个不同 server 上 → severity=medium（单 ERROR）+ multi_scope → 强制告警
+        records = [
+            self._make_record(
+                "[Server thread/ERROR]: Failed to load chunk",
+                level="ERROR",
+                server_id="survival",
+            ),
+            self._make_record(
+                "[Server thread/ERROR]: Failed to load chunk",
+                level="ERROR",
+                server_id="creative",
+            ),
+        ]
+        report = builder.build(records, 60)
+        multi_issues = [
+            issue
+            for issue in report["issues"]
+            if len(issue.get("affected_servers", [])) >= 2
+        ]
+        self.assertTrue(multi_issues, "expected multi-server issue")
+        self.assertTrue(
+            any(issue["should_alert"] for issue in multi_issues),
+            "multi-server medium issue must force alert",
+        )
+
+    def test_low_severity_does_not_alert(self):
+        """low 严重级别不应当告警。"""
+        config = MineSentinelConfig.from_dict(
+            {"alert": {"enabled": True, "min_severity": "low", "min_evidence_count": 1}}
+        )
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Server thread/INFO]: Steve joined the game",
+            level="INFO",
+        )
+        report = builder.build([record], 60, "survival")
+        # daily + low 被跳过（不进 issues），但即使进了也不应告警
+        for issue in report["issues"]:
+            if issue["severity"] == "low":
+                self.assertFalse(issue["should_alert"])
+        self.assertFalse(report["any_alert"])
+
+    def test_classify_priority_community_beats_complaint(self):
+        """community 优先级最高，即便同时包含 lag/tps 等性能关键词。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/WARN]: Anticheat flagged Steve for kill aura (TPS drop reported)",
+            level="WARN",
+        )
+        self.assertEqual(builder.classify(record), "community")
+
+    def test_classify_priority_complaint_beats_network(self):
+        """complaint 优先级高于 network（即使含 disconnect 也要先归 complaint）。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/WARN]: Can't keep up! Player disconnected due to lag",
+            level="WARN",
+        )
+        self.assertEqual(builder.classify(record), "complaint")
+
+    def test_classify_priority_network_beats_bug(self):
+        """network 优先级高于 bug：连接异常不应当归入 bug。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/ERROR]: java.net.SocketException: Connection reset",
+            level="ERROR",
+        )
+        self.assertEqual(builder.classify(record), "network")
+
+    def test_classify_priority_plugin_beats_bug(self):
+        """plugin 优先级高于 bug：插件加载失败不应当归入普通 bug。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/ERROR]: Could not load plugin; see stacktrace below",
+            level="ERROR",
+        )
+        self.assertEqual(builder.classify(record), "plugin")
+
+    def test_ops_notes_include_counters(self):
+        """ops_notes 应当包含 PERFORMANCE/NETWORK/PLUGIN 计数和影响范围信息。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        records = [
+            self._make_record(
+                "[Server thread/WARN]: Can't keep up! Running behind",
+                level="WARN",
+                server_id="survival",
+            ),
+            self._make_record(
+                "[Server thread/WARN]: io.netty connection reset",
+                level="WARN",
+                server_id="creative",
+            ),
+            self._make_record(
+                "[Server thread/ERROR]: Could not load plugin ShopUI",
+                level="ERROR",
+                server_id="survival",
+            ),
+        ]
+        report = builder.build(records, 60)
+        counters = report["counters"]
+        self.assertGreaterEqual(counters["performance"], 1)
+        self.assertGreaterEqual(counters["network"], 1)
+        self.assertGreaterEqual(counters["plugin"], 1)
+        self.assertGreaterEqual(counters["error"], 1)
+        joined = " ".join(report["ops_notes"])
+        self.assertIn("PERFORMANCE", joined)
+        self.assertIn("NETWORK", joined)
+        self.assertIn("PLUGIN", joined)
+
+    def test_suggest_action_per_category(self):
+        """不同分类应当给出有针对性的推荐动作。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        cases = [
+            ("complaint", "server_log_performance", "TPS"),
+            ("network", "server_log_network", "代理到后端的连通性"),
+            ("plugin", "server_log_plugin", "依赖插件"),
+            ("community", "server_log_community", "社区管理流程"),
+            ("cross_server", "server_log_cross_server", "forwarding"),
+        ]
+        for category, tag, keyword in cases:
+            action = builder._suggest_action(category, tag, "medium")
+            self.assertIn(keyword, action, f"category={category} action missing keyword '{keyword}'")
+
+    def test_suggest_action_critical(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        action = builder._suggest_action("bug", "server_log_error", "critical")
+        self.assertIn("崩溃报告", action)
+        self.assertIn("回滚", action)
+
+
 class MineSentinelHourlySummaryTests(unittest.IsolatedAsyncioTestCase):
     """Tests for the hourly summary mode (no polling, per-hour log read + AI integrate)."""
 

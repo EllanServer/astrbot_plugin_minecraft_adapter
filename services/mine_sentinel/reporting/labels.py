@@ -9,12 +9,14 @@ from typing import Any
 CATEGORY_TITLES = {
     "daily": "日常观察",
     "complaint": "性能/可用性异常",
+    "network": "网络/连接异常",
+    "plugin": "插件相关日志",
+    "cross_server": "代理/跨服相关日志",
+    "moderation": "权限/登录相关日志",
     "bug": "服务端/插件异常",
     "economy": "经济/商店相关日志",
     "community": "社区管理",
-    "moderation": "权限/登录相关日志",
     "suggestion": "人工关注事项",
-    "cross_server": "代理/跨服相关日志",
 }
 
 GENERIC_TAG_TITLES = {
@@ -30,6 +32,10 @@ GENERIC_TAG_TITLES = {
     "server_log_loop_severe": "重复严重错误日志",
     "server_log_community": "社区管理日志",
     "server_log_auth": "权限/登录日志",
+    "server_log_network": "网络/连接日志",
+    "server_log_plugin": "插件日志",
+    "server_log_cross_server": "跨服/代理日志",
+    "server_log_economy": "经济/商店日志",
     "plugin_error": "插件错误",
     "server_switch": "跨服切换",
 }

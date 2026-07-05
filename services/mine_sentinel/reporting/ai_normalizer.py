@@ -38,12 +38,14 @@ class AIReportNormalizer:
         for key in (
             "daily",
             "complaint",
+            "network",
+            "plugin",
+            "cross_server",
+            "moderation",
             "bug",
             "economy",
             "community",
-            "moderation",
             "suggestion",
-            "cross_server",
         ):
             if not isinstance(categories.get(key), list):
                 categories[key] = []
