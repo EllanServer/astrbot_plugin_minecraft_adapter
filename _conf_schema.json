@@ -142,6 +142,36 @@
             "type": "list",
             "description": "已弃用别名：等价于把这些分类在 category_enabled 中设为 false。例：[\"chat_review\", \"player_feedback\"]。建议改用 category_enabled。",
             "default": []
+          },
+          "daily_noise_filter_enabled": {
+            "type": "bool",
+            "description": "正常日志噪声过滤总开关。开启后，命中 daily_noise_patterns 的日志行（如玩家正常断开/登录/UUID 分配/LuckPerms 常规日志）会被打 daily_noise 标签，强制归入 daily+low，不参与事件聚合，避免被误判为 moderation/network 异常事件。默认 true。",
+            "default": true
+          },
+          "daily_noise_patterns": {
+            "type": "list",
+            "description": "正常日志噪声正则列表（不区分大小写）。命中任一即标记为 daily_noise。为空时使用内置默认集（lost connection: Disconnected / logged in with entity id / UUID of player X is / [LP] LOG / luckperms-worker-N / joined the game / left the game）。非空时只用用户列表，覆盖默认集。例：[\"lost connection:\\\\s*Disconnected\", \"\\\\[MyPlugin\\\\] routine\"]。",
+            "default": []
+          },
+          "chat_summary_enabled": {
+            "type": "bool",
+            "description": "聊天内容热点总结开关。开启后会识别 [Async Chat Thread]/<player> 聊天行，提取玩家名和消息，在报告中生成 chat_topics 段（活跃玩家 + 高频关键词 + 样本消息），并交给 AI 归纳为 chat_summary。默认 true。",
+            "default": true
+          },
+          "chat_summary_max_topics": {
+            "type": "int",
+            "description": "聊天热点总结最多保留的玩家数和关键词数。默认 5。",
+            "default": 5
+          },
+          "chat_summary_max_samples": {
+            "type": "int",
+            "description": "聊天热点总结最多保留的样本消息数。默认 3。",
+            "default": 3
+          },
+          "vulcan_detect_enabled": {
+            "type": "bool",
+            "description": "Vulcan 反作弊插件告警识别开关。开启后会检测 [Vulcan] 前缀日志，提取玩家名+检查类型，打 anticheat_vulcan 标签，在报告中结构化呈现时间 + 涉及玩家 ID + 检查类型。默认 true。",
+            "default": true
           }
         }
       },

@@ -248,6 +248,31 @@ mine_sentinel:
     # category_whitelist: ["bug", "plugin", "network"]
 ```
 
+**正常日志噪声过滤**：Minecraft 服务器的"玩家正常断开/登录/UUID 分配/LuckPerms 常规日志"原本会因命中 `lost connection`/`logged in`/`uuid`/`permission` 等关键词而被归入 `network`/`moderation` 分类，并在 5 分钟窗口内聚合成"事件#1 服务器集中出现多类运行日志异常"或"事件#2 权限/登录相关运行日志异常"，造成误报。`daily_noise_filter` 通过正则把这些正常日志强制归入 `daily+low`，不参与事件聚合：
+
+- `daily_noise_filter_enabled`（bool，默认 true）：总开关。
+- `daily_noise_patterns`（list[str]）：正则列表，命中任一即标记为 `daily_noise`。为空时使用内置默认集（覆盖 `lost connection: Disconnected` / `logged in with entity id` / `UUID of player X is` / `[LP] LOG` / `luckperms-worker-N` / `joined the game` / `left the game`）。非空时只用用户列表，覆盖默认集。
+
+```yaml
+mine_sentinel:
+  runtime_log:
+    daily_noise_filter_enabled: true
+    # 追加自定义噪声（如某插件的常规心跳日志）
+    daily_noise_patterns:
+      - "lost connection:\\s*Disconnected"
+      - "\\[MyPlugin\\] heartbeat"
+```
+
+**聊天内容热点总结**：识别 `[Async Chat Thread]/<player>` 聊天行并提取玩家名和消息内容，在报告中生成 `chat_topics` 段（活跃玩家 + 高频关键词 + 样本消息），并交给 AI 归纳为 `chat_summary` 字段。关键词提取支持中英文（英文按空格分词，中文按 2-gram 滑窗），不依赖外部 NLP 库。
+
+- `chat_summary_enabled`（bool，默认 true）：开关。
+- `chat_summary_max_topics`（int，默认 5）：最多保留的活跃玩家数和关键词数。
+- `chat_summary_max_samples`（int，默认 3）：最多保留的样本消息数。
+
+**Vulcan 反作弊插件识别**：检测 `[Vulcan]` 前缀日志，提取玩家名和检查类型（如 Reach/Fly），打 `anticheat_vulcan` 标签，归入 `community` 分类，并在报告中以 `vulcan_alerts` 段结构化呈现"时间 + 涉及玩家 ID + 检查类型"，便于管理员快速定位作弊嫌疑玩家。Vulcan 告警不参与 incident 聚合，单独走结构化呈现。
+
+- `vulcan_detect_enabled`（bool，默认 true）：开关。
+
 **推荐动作**按分类细化：plugin 查依赖和版本、network 查代理连通性和转发配置、community 交社区管理流程复核、chat_review 优先处理威胁/隐私、critical 查 latest.log 和崩溃报告并评估回滚。详细规则见 [services/mine_sentinel/reporting/rules.py](services/mine_sentinel/reporting/rules.py)。
 
 ## 部署提示词

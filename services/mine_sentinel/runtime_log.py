@@ -16,7 +16,11 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .models import MineSentinelLogSourceConfig, MineSentinelRuntimeLogConfig
+from .models import (
+    DEFAULT_DAILY_NOISE_PATTERNS,
+    MineSentinelLogSourceConfig,
+    MineSentinelRuntimeLogConfig,
+)
 from .template_miner import ParsedTemplate, get_template_miner
 from .anomaly_detector import AnomalyResult, TemplateStat, get_anomaly_detector
 
@@ -73,6 +77,22 @@ _ERROR_WORDS = (
     "失败",
     "超时",
     "警告",
+)
+
+# 聊天行检测：Minecraft 原生 [Async Chat Thread] 线程标签或 <player> 前缀。
+# 用于 chat_summary 热点总结，提取玩家名和消息内容。
+_CHAT_THREAD_RE = re.compile(r"\[Async Chat Thread/[A-Z]+\]\s*:?\s*", re.IGNORECASE)
+_CHAT_PLAYER_PREFIX_RE = re.compile(r"<(?P<player>[^>\s]{1,40})>\s*(?P<message>.*)$")
+# Vulcan 反作弊插件日志检测。Vulcan 的标准格式：
+#   [Server thread/INFO]: [Vulcan] PlayerName failed CheckName (VL: 5)
+#   [Vulcan] PlayerName was rubbing ... (Verbose)
+# 兼容大小写和不同前缀写法。
+_VULCAN_PREFIX_RE = re.compile(r"\[Vulcan[\]:>]", re.IGNORECASE)
+_VULCAN_PLAYER_RE = re.compile(
+    r"\[Vulcan\][\]:>\s]*"  # [Vulcan] 前缀
+    r"(?P<player>[A-Za-z0-9_]{1,16})\s+"
+    r"failed\s+(?P<check>\S+)",
+    re.IGNORECASE,
 )
 
 # PR9: interesting-only 模式下，普通 INFO 命中这些关键词才进 template/anomaly。
@@ -1145,6 +1165,76 @@ def _skip_parsed_template(content: str, fingerprint: str) -> ParsedTemplate:
     )
 
 
+# daily_noise_patterns 编译缓存：key=tuple(patterns) → list[re.Pattern]。
+# 避免每条日志都重新编译正则；config 不变时直接复用。
+_NOISE_PATTERN_CACHE: dict[tuple[str, ...], list["re.Pattern[str]"]] = {}
+
+
+def _compile_noise_patterns(patterns: list[str]) -> list["re.Pattern[str]"]:
+    """编译 daily_noise_patterns，缓存结果。无效正则会被忽略并记日志。"""
+    key = tuple(patterns)
+    cached = _NOISE_PATTERN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    compiled: list["re.Pattern[str]"] = []
+    for raw in patterns:
+        try:
+            compiled.append(re.compile(raw, re.IGNORECASE))
+        except re.error as exc:
+            logger.warning(
+                f"[MineSentinel] daily_noise_patterns 正则 {raw!r} 编译失败：{exc}，已忽略。"
+            )
+    _NOISE_PATTERN_CACHE[key] = compiled
+    return compiled
+
+
+def _match_noise_patterns(content: str, compiled: list["re.Pattern[str]"]) -> bool:
+    """检查 content 是否命中任一编译后的噪声正则。"""
+    return any(pattern.search(content) for pattern in compiled)
+
+
+def _detect_chat_message(content: str) -> tuple[str, str] | None:
+    """检测聊天行并返回 (player, message)，非聊天行返回 None。
+
+    识别两种 Minecraft 聊天格式：
+    1. ``[Async Chat Thread/INFO]: <player> message`` — 原生聊天线程
+    2. ``<player> message`` — 直接前缀（聊天插件或控制台回放）
+    玩家名最长 40 字符（兼容某些 RCON/控制台场景），消息保留原样。
+    """
+    match = _CHAT_PLAYER_PREFIX_RE.search(content)
+    if match:
+        player = match.group("player").strip()
+        message = match.group("message").strip()
+        if player and message:
+            return player, message
+    # 仅当行包含 Async Chat Thread 线程标签时，视为聊天行但无明确玩家
+    if _CHAT_THREAD_RE.search(content):
+        # 去掉线程前缀，剩下当作消息
+        stripped = _CHAT_THREAD_RE.sub("", content).strip()
+        if stripped:
+            return "", stripped
+    return None
+
+
+def _detect_vulcan_alert(content: str) -> dict[str, str] | None:
+    """检测 Vulcan 反作弊告警并返回 {player, check}，非 Vulcan 行返回 None。
+
+    Vulcan 标准格式：``[Vulcan] PlayerName failed CheckName (VL: 5)``
+    或带前缀：``[Server thread/INFO]: [Vulcan] PlayerName failed ...``
+    无法解析玩家名时返回 {player: "", check: ""} 表示命中但无结构化信息。
+    """
+    if not _VULCAN_PREFIX_RE.search(content):
+        return None
+    match = _VULCAN_PLAYER_RE.search(content)
+    if match:
+        return {
+            "player": match.group("player").strip(),
+            "check": match.group("check").strip(" :,."),
+        }
+    # 命中 [Vulcan] 前缀但无法解析玩家名（如 verbose 日志）
+    return {"player": "", "check": ""}
+
+
 def _skip_anomaly_result(
     server_id: str,
     template_id: str,
@@ -1231,6 +1321,30 @@ def _build_observation(
     if not run_template:
         # 标记降采样记录，便于后续报告/调试识别
         tags.append("info_downsampled")
+    # PR10: daily_noise / chat_message / anticheat_vulcan 检测。
+    # 这些标签独立于上面的级别/异常标签，由专用配置开关控制。
+    daily_noise_hit = False
+    chat_info: dict[str, Any] | None = None
+    vulcan_info: dict[str, str] | None = None
+    if runtime_config is not None:
+        if runtime_config.daily_noise_filter_enabled:
+            # 用户配置为空时使用 DEFAULT_DAILY_NOISE_PATTERNS；非空则只用用户的。
+            patterns = (
+                runtime_config.daily_noise_patterns
+                if runtime_config.daily_noise_patterns
+                else list(DEFAULT_DAILY_NOISE_PATTERNS)
+            )
+            if patterns and _match_noise_patterns(content, _compile_noise_patterns(patterns)):
+                tags.append("daily_noise")
+                daily_noise_hit = True
+        if runtime_config.chat_summary_enabled:
+            chat_info = _detect_chat_message(content)
+            if chat_info is not None:
+                tags.append("chat_message")
+        if runtime_config.vulcan_detect_enabled:
+            vulcan_info = _detect_vulcan_alert(content)
+            if vulcan_info is not None:
+                tags.append("anticheat_vulcan")
     observed_ms = int(time.time() * 1000)
     server_name = source.server_name or source.server_id or "Minecraft"
     context = {
@@ -1270,6 +1384,20 @@ def _build_observation(
             },
         ),
     }
+    if daily_noise_hit:
+        context["dailyNoise"] = True
+        context["otel"]["attributes"]["daily.noise"] = True
+    if chat_info is not None:
+        player, message = chat_info
+        context["chatPlayer"] = player
+        context["chatMessage"] = message
+        context["otel"]["attributes"]["chat.player"] = player
+        context["otel"]["attributes"]["chat.message"] = message
+    if vulcan_info is not None:
+        context["vulcanPlayer"] = vulcan_info.get("player", "")
+        context["vulcanCheck"] = vulcan_info.get("check", "")
+        context["otel"]["attributes"]["vulcan.player"] = vulcan_info.get("player", "")
+        context["otel"]["attributes"]["vulcan.check"] = vulcan_info.get("check", "")
     if parsed.params:
         context["templateParams"] = parsed.params[:8]
         context["otel"]["attributes"]["template.params"] = parsed.params[:8]

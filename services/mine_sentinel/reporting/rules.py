@@ -149,6 +149,7 @@ CATEGORY_KEYS = {
         "cheat",
         "cheating",
         "anticheat",
+        "anti-cheat",
         "xray",
         "fly",
         "speed",
@@ -157,6 +158,8 @@ CATEGORY_KEYS = {
         "killaura",
         "violation",
         "vl",
+        # PR10: Vulcan 反作弊插件专用关键词，使 [Vulcan] 日志归入 community
+        "vulcan",
         "封禁",
         "禁言",
         "踢出",
@@ -386,6 +389,15 @@ def _keys_match(text: str, keys: tuple[str, ...]) -> bool:
     return any(key in text for key in keys if not _is_word_key(key))
 
 
+def _format_timestamp(ts_ms: int) -> str:
+    """把毫秒时间戳格式化为 HH:MM:SS（本地时间），用于 Vulcan 告警呈现。"""
+    if not ts_ms:
+        return ""
+    import time as _time
+
+    return _time.strftime("%H:%M:%S", _time.localtime(ts_ms / 1000))
+
+
 class HeuristicReportBuilder:
     """Build deterministic fallback facts from SERVER_LOG records."""
 
@@ -504,6 +516,10 @@ class HeuristicReportBuilder:
         any_alert = any(issue["should_alert"] for issue in issues)
         ops_notes, counters = self._ops_notes(log_records, issues, max_severity, any_alert)
 
+        # PR10: 聊天热点总结 + Vulcan 反作弊结构化告警
+        chat_topics = self._build_chat_topics(log_records)
+        vulcan_alerts = self._build_vulcan_alerts(log_records)
+
         return {
             "summary": (
                 f"最近 {window_minutes} 分钟收到 {len(log_records)} 条 "
@@ -521,10 +537,16 @@ class HeuristicReportBuilder:
             "max_severity": max_severity,
             "any_alert": any_alert,
             "counters": counters,
+            "chat_topics": chat_topics,
+            "vulcan_alerts": vulcan_alerts,
         }
 
     # --- 分类 -------------------------------------------------------------
     def classify(self, record: ObservationRecord) -> str:
+        # PR10: daily_noise 标签优先级最高，强制归入 daily，避免正常 login/disconnect
+        # 等被 moderation/network 关键词误判为异常事件。
+        if "daily_noise" in record.tags:
+            return "daily"
         text = self._record_text(record)
         # 按当前生效的优先级列表匹配（已应用 category_enabled / category_whitelist），
         # daily 兜底。被关闭的分类直接跳过，记录会落到下一优先级或 daily。
@@ -542,6 +564,9 @@ class HeuristicReportBuilder:
         level = str((record.context or {}).get("level") or "").lower()
         if "loop_suppressed" in record.tags:
             return f"server_log_loop_{level or 'warn'}"
+        # PR10: Vulcan 反作弊告警单独打 tag，便于报告里按反作弊维度聚合呈现
+        if "anticheat_vulcan" in record.tags:
+            return "server_log_anticheat_vulcan"
         # 按分类优先级给 tag
         category = self.classify(record)
         tag_map = {
@@ -575,6 +600,10 @@ class HeuristicReportBuilder:
 
     # --- 严重级别 ---------------------------------------------------------
     def _severity(self, group: list[ObservationRecord]) -> str:
+        # PR10: 全员 daily_noise 的 group 强制 low，避免被 EWMA 突增/网络关键词
+        # 提级，保证正常 login/disconnect/UUID 等绝不形成事件。
+        if group and all("daily_noise" in record.tags for record in group):
+            return "low"
         text = " ".join(self._record_text(record) for record in group)
         n = len(group)
         # 异常分数提级：模板计数突增（EWMA + 分位数）达到高分直接提级
@@ -885,6 +914,171 @@ class HeuristicReportBuilder:
             "cross_server": categories.get("cross_server", []),
             "suggestion": categories.get("suggestion", []),
         }
+
+    # --- 聊天热点总结（PR10）---------------------------------------------
+    def _build_chat_topics(
+        self, records: list[ObservationRecord]
+    ) -> dict[str, Any]:
+        """从 chat_message 标签记录中聚合聊天热点。
+
+        返回结构：
+        - total_messages: 聊天消息总数
+        - unique_players: 不同玩家数
+        - top_players: 按消息数排序的活跃玩家，含样本消息
+        - top_keywords: 高频关键词（去除停用词后）
+        - sample_messages: 时间序样本消息
+
+        chat_summary_enabled=false 时返回空字典。
+        """
+        if not self.config.runtime_log.chat_summary_enabled:
+            return {}
+        chat_records = [
+            record for record in records if "chat_message" in record.tags
+        ]
+        if not chat_records:
+            return {
+                "total_messages": 0,
+                "unique_players": 0,
+                "top_players": [],
+                "top_keywords": [],
+                "sample_messages": [],
+            }
+        max_topics = max(1, self.config.runtime_log.chat_summary_max_topics)
+        max_samples = max(1, self.config.runtime_log.chat_summary_max_samples)
+
+        # 按玩家聚合
+        player_messages: dict[str, list[ObservationRecord]] = defaultdict(list)
+        all_messages: list[str] = []
+        for record in chat_records:
+            ctx = record.context or {}
+            player = str(ctx.get("chatPlayer") or "").strip()
+            message = str(ctx.get("chatMessage") or record.content).strip()
+            player_messages[player].append(record)
+            if message:
+                all_messages.append(message)
+
+        top_players_sorted = sorted(
+            player_messages.items(),
+            key=lambda item: len(item[1]),
+            reverse=True,
+        )[:max_topics]
+        top_players = []
+        for player, group in top_players_sorted:
+            samples = [
+                str((r.context or {}).get("chatMessage") or r.content).strip()
+                for r in group[:max_samples]
+            ]
+            top_players.append(
+                {
+                    "player": player or "(unknown)",
+                    "message_count": len(group),
+                    "samples": [s for s in samples if s],
+                }
+            )
+
+        # 高频关键词（简单分词 + 停用词过滤，不依赖外部 NLP 库）
+        top_keywords = self._extract_top_keywords(all_messages, max_topics)
+
+        # 时间序样本消息（覆盖整个窗口）
+        sample_messages = []
+        step = max(1, len(chat_records) // max_samples)
+        for index in range(0, len(chat_records), step):
+            record = chat_records[index]
+            ctx = record.context or {}
+            player = str(ctx.get("chatPlayer") or "").strip()
+            message = str(ctx.get("chatMessage") or record.content).strip()
+            if message:
+                prefix = f"<{player}> " if player else ""
+                sample_messages.append(prefix + message)
+            if len(sample_messages) >= max_samples:
+                break
+
+        return {
+            "total_messages": len(chat_records),
+            "unique_players": len(player_messages),
+            "top_players": top_players,
+            "top_keywords": top_keywords,
+            "sample_messages": sample_messages,
+        }
+
+    @staticmethod
+    def _extract_top_keywords(
+        messages: list[str], limit: int
+    ) -> list[dict[str, Any]]:
+        """从聊天消息中提取高频关键词。
+
+        简单实现：英文按空格分词，过滤短词/停用词；中文按 2-3 字滑窗。
+        不依赖 jieba 等分词库，结果用于 AI 进一步归纳的线索。
+        """
+        if not messages:
+            return []
+        stop_words = {
+            "the", "a", "an", "and", "or", "but", "is", "are", "was", "were",
+            "to", "of", "in", "on", "at", "for", "with", "by", "this", "that",
+            "it", "as", "be", "have", "has", "do", "does", "i", "you", "he",
+            "she", "we", "they", "me", "him", "her", "us", "them",
+            "yes", "no", "ok", "okay", "lol", "haha", "ha", "le", "la", "de",
+            "的", "了", "是", "在", "我", "你", "他", "她", "们", "个", "这",
+            "那", "啊", "吧", "吗", "呢", "哦", "嗯", "呀",
+        }
+        counter: dict[str, int] = defaultdict(int)
+        for message in messages:
+            lowered = message.lower()
+            # 英文词
+            for word in re.findall(r"[a-z]{3,}", lowered):
+                if word in stop_words:
+                    continue
+                counter[word] += 1
+            # 中文 2-3 字滑窗
+            for match in re.finditer(r"[\u4e00-\u9fa5]{2,}", message):
+                segment = match.group(0)
+                # 2-gram
+                for i in range(len(segment) - 1):
+                    gram = segment[i : i + 2]
+                    if gram[0] in stop_words or gram[1] in stop_words:
+                        continue
+                    counter[gram] += 1
+        # 至少出现 2 次才算热点
+        hot = [(kw, count) for kw, count in counter.items() if count >= 2]
+        hot.sort(key=lambda item: item[1], reverse=True)
+        return [
+            {"keyword": kw, "count": count} for kw, count in hot[:limit] if count > 0
+        ]
+
+    # --- Vulcan 反作弊告警结构化（PR10）-----------------------------------
+    def _build_vulcan_alerts(
+        self, records: list[ObservationRecord]
+    ) -> list[dict[str, Any]]:
+        """从 anticheat_vulcan 标签记录中提取结构化告警。
+
+        每条返回：timestamp_ms, time_text, server_id, player, check, content。
+        按时间排序，最多保留 50 条避免报告过长。Vulcan 检测关闭时返回空列表。
+        """
+        if not self.config.runtime_log.vulcan_detect_enabled:
+            return []
+        vulcan_records = [
+            record for record in records if "anticheat_vulcan" in record.tags
+        ]
+        if not vulcan_records:
+            return []
+        vulcan_records.sort(key=lambda r: r.timestamp)
+        alerts: list[dict[str, Any]] = []
+        for record in vulcan_records[:50]:
+            ctx = record.context or {}
+            player = str(ctx.get("vulcanPlayer") or "").strip()
+            check = str(ctx.get("vulcanCheck") or "").strip()
+            ts = int(record.timestamp or 0)
+            alerts.append(
+                {
+                    "timestamp_ms": ts,
+                    "time_text": _format_timestamp(ts),
+                    "server_id": record.server_id or "",
+                    "player": player,
+                    "check": check,
+                    "content": record.content,
+                }
+            )
+        return alerts
 
     @staticmethod
     def _issue_terms(group: list[ObservationRecord]) -> list[str]:

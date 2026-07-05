@@ -156,7 +156,19 @@ class IncidentGrouper:
 
 
 def is_passive_issue(issue: dict[str, Any]) -> bool:
-    return str(issue.get("category") or "").lower() == "daily"
+    """daily 分类或 daily_noise 标签的 issue 视为被动，不参与 incident 聚合。
+
+    PR10: daily_noise 标签的记录即使因聚合被分到非 daily 类（理论上不会，
+    因为 rules.classify 已强制归 daily），也作为兜底被动处理，避免正常
+    login/disconnect/UUID 等形成"事件#1 服务器集中出现多类运行日志异常"。
+    """
+    if str(issue.get("category") or "").lower() == "daily":
+        return True
+    tag = str(issue.get("tag") or "").lower()
+    if tag == "server_log_anticheat_vulcan":
+        # Vulcan 告警单独走结构化 vulcan_alerts 段，不进 incident 聚合
+        return True
+    return False
 
 
 def issue_sort_key(issue: dict[str, Any]) -> tuple[int, int, str]:

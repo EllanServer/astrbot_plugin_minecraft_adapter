@@ -38,12 +38,16 @@ class AIReportPromptBuilder:
             for record in self.sample_for_ai(records, fallback)
         ]
         anomaly_evidence = self.anomaly_evidence(records)
+        chat_topics = fallback.get("chat_topics") or {}
+        vulcan_alerts = fallback.get("vulcan_alerts") or []
         return self.fit_prompt(
             window_minutes,
             fallback_json,
             timeline,
             compact_records,
             anomaly_evidence,
+            chat_topics,
+            vulcan_alerts,
         )
 
     def fit_prompt(
@@ -53,15 +57,25 @@ class AIReportPromptBuilder:
         timeline_chunks: list[dict[str, Any]],
         compact_records: list[dict[str, Any]],
         anomaly_evidence: list[dict[str, Any]],
+        chat_topics: dict[str, Any] | None = None,
+        vulcan_alerts: list[dict[str, Any]] | None = None,
     ) -> str:
         max_chars = self.config.report.max_ai_prompt_chars
         records = list(compact_records)
         chunks = [dict(chunk) for chunk in timeline_chunks]
         evidence = [dict(item) for item in anomaly_evidence]
+        chat_topics_data = dict(chat_topics or {})
+        vulcan_alerts_data = list(vulcan_alerts or [])
 
         while True:
             prompt = self.prompt_text(
-                window_minutes, fallback_json, chunks, records, evidence
+                window_minutes,
+                fallback_json,
+                chunks,
+                records,
+                evidence,
+                chat_topics_data,
+                vulcan_alerts_data,
             )
             if len(prompt) <= max_chars:
                 return prompt
@@ -76,6 +90,13 @@ class AIReportPromptBuilder:
                 continue
             if self.trim_anomaly_samples(evidence):
                 continue
+            # 压缩 Vulcan 告警：先减半，再清空 content
+            if vulcan_alerts_data and len(vulcan_alerts_data) > 3:
+                vulcan_alerts_data = vulcan_alerts_data[: max(3, len(vulcan_alerts_data) * 3 // 4)]
+                continue
+            if vulcan_alerts_data:
+                vulcan_alerts_data = []
+                continue
             if len(evidence) > 3:
                 evidence = evidence[: max(3, len(evidence) * 3 // 4)]
                 continue
@@ -88,7 +109,11 @@ class AIReportPromptBuilder:
         timeline_chunks: list[dict[str, Any]],
         compact_records: list[dict[str, Any]],
         anomaly_evidence: list[dict[str, Any]],
+        chat_topics: dict[str, Any] | None = None,
+        vulcan_alerts: list[dict[str, Any]] | None = None,
     ) -> str:
+        chat_topics_json = json.dumps(chat_topics or {}, ensure_ascii=False)
+        vulcan_alerts_json = json.dumps(vulcan_alerts or [], ensure_ascii=False)
         return (
             "你是 Minecraft 服务器只读旁路监控 MineSentinel 的报告代理。"
             "只输出合法 JSON，不要执行任何管理动作。"
@@ -97,7 +122,7 @@ class AIReportPromptBuilder:
             "player_feedback,community_ops,moderation,cross_server,suggestion),"
             "issues(category,tag,incident_index,severity,affected_locations,issue_terms,"
             "evidence_count,signal_count,suggested_action),"
-            "ops_notes。"
+            "chat_summary,vulcan_alerts,ops_notes。"
             "异常检测已由模板解析（Drain3）+ EWMA/分位数突增检测 + 关键词规则完成，"
             "你的职责是解释异常证据、判断可能原因、给出排查建议，而不是重新检测异常。"
             "输入里的'异常证据'是预计算的结构化异常列表，每条含 template_id、score、"
@@ -131,8 +156,19 @@ class AIReportPromptBuilder:
             "incident_index 只能表示真实事故序号，同一批上下文不要重复输出多个 事件 #1；"
             "每个事故最多保留 2 到 4 条关键证据，避免在多个事件中重复粘贴同一批上下文；"
             "如果窗口内只有一个明显异常时间点，应说明其他时间段未发现明显持续异常。"
+            "聊天热点总结：输入里的 chat_topics 是预计算的聊天统计（活跃玩家、高频关键词、"
+            "样本消息），你必须在 chat_summary 字段输出 1-3 句面向管理员的聊天热点归纳，"
+            "包含最活跃玩家和讨论主题；没有聊天记录时输出空字符串。"
+            "Vulcan 反作弊告警：输入里的 vulcan_alerts 是预提取的结构化告警列表，"
+            "每条含 time_text/player/check；你必须在 vulcan_alerts 字段按时间顺序输出"
+            "可读的告警摘要（时间 + 涉及玩家 ID + 检查类型），"
+            "用于管理员快速定位作弊嫌疑玩家；无告警时输出空数组。"
+            "正常登录/断开/UUID 分配/LuckPerms 常规日志已被 daily_noise 过滤，"
+            "不要把它们当作异常事件输出。"
             f"时间窗口: 最近 {window_minutes} 分钟。\n"
             f"异常证据: {json.dumps(anomaly_evidence, ensure_ascii=False)}\n"
+            f"聊天热点统计: {chat_topics_json}\n"
+            f"Vulcan 反作弊告警: {vulcan_alerts_json}\n"
             f"启发式初稿: {fallback_json}\n"
             f"分段时间线: {json.dumps(timeline_chunks, ensure_ascii=False)}\n"
             f"抽样观察: {json.dumps(compact_records, ensure_ascii=False)}"
