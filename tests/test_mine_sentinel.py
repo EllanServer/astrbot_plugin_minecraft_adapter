@@ -1418,7 +1418,11 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertEqual(builder.classify(record), "chat_review")
 
     def test_chat_review_word_boundary_ad_does_not_match_load(self):
-        """短词 'ad' 不应匹配 'load'/'road' 等普通英文词（词边界保护）。"""
+        """'ad' 子串不应匹配 'load'/'road'/'dadada'/'already connected' 等普通词。
+
+        PR10 真实日志验证：'ad' 子串误判 dadada/already connected 为 chat_review，
+        已从 chat_review 关键词移除 'ad'，改用高置信度 URL/交易信号。
+        """
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         record = self._make_record(
             "[Server thread/INFO]: Failed to load datapack road builder",
@@ -1427,14 +1431,51 @@ class MineSentinelRulesTests(unittest.TestCase):
         # 不应被误判为 chat_review
         self.assertNotEqual(builder.classify(record), "chat_review")
 
-    def test_chat_review_word_boundary_ad_matches_standalone_ad(self):
-        """独立的 'ad' 词应当匹配 chat_review。"""
+    def test_chat_review_ad_keyword_removed_no_false_positive(self):
+        """'ad' 关键词已移除，独立 'ad' 不再触发 chat_review（避免误判）。
+
+        PR10 真实日志验证：[生存区] player >> dadada 被误判为 chat_review，
+        因为 'ad' 子串命中。现已移除 'ad'，普通聊天不再误判。
+        'posted an ad for shop' 应归入 economy（shop 关键词）而非 chat_review。
+        """
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         record = self._make_record(
             "[Async Chat Thread]: <Spammer> posted an ad for shop",
             level="INFO",
         )
+        # 'ad' 已移除，不应归入 chat_review
+        self.assertNotEqual(builder.classify(record), "chat_review")
+
+    def test_chat_review_url_signal_triggers_classification(self):
+        """URL/外链信号应触发 chat_review 分类（高置信度广告/引流指标）。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        # discord.gg 链接
+        record = self._make_record(
+            "[Async Chat Thread]: <Spammer> 加入我们的群 discord.gg/xxxxxxx",
+            level="INFO",
+        )
         self.assertEqual(builder.classify(record), "chat_review")
+        # http:// 链接
+        record2 = self._make_record(
+            "[Async Chat Thread]: <Spammer> 访问 http://example.com 买金币",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record2), "chat_review")
+
+    def test_chat_review_chinese_transaction_signals(self):
+        """中文交易/代练广告信号应触发 chat_review 分类。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        for content in (
+            "[生存区] Spammer >> 代练等级 50元起",
+            "[生存区] Spammer >> 出售账号 联系加微信",
+            "[生存区] Spammer >> 卖号 100元",
+        ):
+            record = self._make_record(content, level="INFO")
+            self.assertEqual(
+                builder.classify(record),
+                "chat_review",
+                f"应识别交易广告: {content}",
+            )
 
     def test_chat_review_threat_raises_to_high_and_alerts(self):
         """chat_review 命中威胁敏感词应提级 high 并强制告警。"""
@@ -2306,6 +2347,54 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertIn("chat_message", obs["tags"])
         self.assertEqual(obs["context"].get("chatPlayer"), "Steve")
         self.assertEqual(obs["context"].get("chatMessage"), "hello")
+
+    def test_chat_spam_repeat_char_detected(self):
+        """单字符连续重复 >=8 次的聊天应被识别为 chat_spam（repeat_char）。
+
+        真实日志样本：[生存区] LilyFairy_uwu >> qqqqqqqqqqqqqqqqqqqqqqqwq
+        含 22 个连续 q，必须打 chat_spam 标签并记录 spam_type=repeat_char。
+        """
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+        runtime_config = MineSentinelRuntimeLogConfig()
+        obs = self._build(
+            "[00:16:42] [Async Chat Thread - #1737/INFO]: [生存区] LilyFairy_uwu >> qqqqqqqqqqqqqqqqqqqqqqqwq",
+            runtime_config,
+        )
+        self.assertIn("chat_message", obs["tags"])
+        self.assertIn("chat_spam", obs["tags"])
+        self.assertEqual(obs["context"].get("chatSpamType"), "repeat_char")
+
+    def test_chat_spam_long_run_detected(self):
+        """超长无意义消息（>=40 字符、>80% 字母数字、无空格）应识别为 long_run。"""
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+        runtime_config = MineSentinelRuntimeLogConfig()
+        # 40+ 字符的随机字母数字串，无空格
+        long_message = "asdfghjkl1234567890qwertyuiopzxcvbnm1234567890"
+        obs = self._build(
+            f"[17:00:00] [Async Chat Thread/INFO]: <Spammer> {long_message}",
+            runtime_config,
+        )
+        self.assertIn("chat_spam", obs["tags"])
+        self.assertEqual(obs["context"].get("chatSpamType"), "long_run")
+
+    def test_chat_normal_message_not_spam(self):
+        """普通聊天消息不应被误判为 chat_spam。"""
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+        runtime_config = MineSentinelRuntimeLogConfig()
+        for content in (
+            "[17:00:00] [Async Chat Thread/INFO]: <Steve> hello world",
+            "[17:00:00] [Async Chat Thread/INFO]: [生存区] Player >> 有人在吗",
+            "[17:00:00] [Async Chat Thread/INFO]: <Steve> dadada",  # 真实日志误判样本
+            "[17:00:00] [Server thread/INFO]: Player already connected to this proxy",  # 真实日志误判样本
+        ):
+            obs = self._build(content, runtime_config)
+            # dadada/already connected 不应被 chat_spam 误判
+            if "chat_message" in obs["tags"]:
+                self.assertNotIn(
+                    "chat_spam",
+                    obs["tags"],
+                    f"普通聊天不应被误判为 chat_spam: {content}",
+                )
 
 
 class MineSentinelHourlySummaryTests(unittest.IsolatedAsyncioTestCase):
@@ -4850,6 +4939,170 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
             self.assertIn("player", sample)
             self.assertIn("check", sample)
             self.assertTrue(sample["player"])  # 玩家名非空
+
+    # --- 真实场景聊天审计测试（PR10：误判修复 + 刷屏识别）---
+    # 用户原始诉求：测试真实场景下聊天的审计输出。
+    # 这组测试验证 chat_review 关键词清理（移除 'ad'/'私聊' 等高误判词）
+    # 与新增的 chat_spam 形态检测（重复字符/超长无意义消息）。
+    def test_real_dadada_not_misclassified_as_chat_review(self):
+        """真实日志 'dadada' 不应被误判为 chat_review。
+
+        PR10 修复前：'ad' 子串命中 dadada，导致 Eplge627 的正常聊天被误审。
+        真实日志样本：[Not Secure] [生存区] Eplge627 >> dadada
+        """
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        dadada_records = [
+            r for r in self.records
+            if "chat_message" in r.tags
+            and r.context.get("chatMessage") == "dadada"
+        ]
+        self.assertGreater(len(dadada_records), 0, "应存在 dadada 聊天记录")
+        for record in dadada_records:
+            category = builder.classify(record)
+            self.assertNotEqual(
+                category,
+                "chat_review",
+                f"dadada 不应被误判为 chat_review: {record.content[:80]}",
+            )
+
+    def test_real_already_connected_chat_not_misclassified(self):
+        """真实日志含 'already connected' 的聊天不应被误判为 chat_review。
+
+        PR10 修复前：'ad' 子串命中 already，导致正常聊天被误审。
+        真实日志样本：[Not Secure] [生存区] Georgie0617 >>
+        重进时显示you are already connected to this proxy吗
+        """
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        already_records = [
+            r for r in self.records
+            if "chat_message" in r.tags
+            and "already connected" in r.context.get("chatMessage", "").lower()
+        ]
+        self.assertGreater(len(already_records), 0, "应存在 'already connected' 聊天记录")
+        for record in already_records:
+            category = builder.classify(record)
+            self.assertNotEqual(
+                category,
+                "chat_review",
+                f"'already connected' 聊天不应被误判为 chat_review: {record.content[:80]}",
+            )
+
+    def test_real_siliao_chat_not_misclassified(self):
+        """真实日志含 '私聊' 的正常聊天不应被误判为 chat_review。
+
+        PR10 修复前：'私聊' 关键词命中 '一个个私聊'，导致正常聊天被误审。
+        '私聊' 是常用词，已从 chat_review 关键词移除，改用 '举报聊天' 表达投诉意图。
+        真实日志样本：[Not Secure] [生存区] Caesar_Galahad >> 一个个私聊
+        """
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        siliao_records = [
+            r for r in self.records
+            if "chat_message" in r.tags
+            and "私聊" in r.context.get("chatMessage", "")
+        ]
+        self.assertGreater(len(siliao_records), 0, "应存在 '私聊' 聊天记录")
+        for record in siliao_records:
+            category = builder.classify(record)
+            self.assertNotEqual(
+                category,
+                "chat_review",
+                f"'私聊' 聊天不应被误判为 chat_review: {record.content[:80]}",
+            )
+
+    def test_real_chat_spam_qqq_detected_and_classified_as_chat_review(self):
+        """真实日志 'qqqqqqqqqqqqqqqqqqqqqqqwq' 应被识别为 chat_spam 并归入 chat_review。
+
+        PR10 修复前：刷屏消息无关键词命中，被分类为 daily 漏审。
+        真实日志样本：[生存区] LilyFairy_uwu >> qqqqqqqqqqqqqqqqqqqqqqqwq（22 个连续 q）
+        """
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        spam_records = [
+            r for r in self.records
+            if "chat_message" in r.tags
+            and "qqqqqqqq" in r.context.get("chatMessage", "")
+        ]
+        self.assertGreater(len(spam_records), 0, "应存在 qqq... 刷屏聊天记录")
+        for record in spam_records:
+            # 1. 应被打 chat_spam 标签
+            self.assertIn(
+                "chat_spam",
+                record.tags,
+                f"qqq 刷屏应被打 chat_spam 标签: {record.content[:80]}",
+            )
+            # 2. 应记录 spam_type
+            self.assertEqual(
+                record.context.get("chatSpamType"),
+                "repeat_char",
+                f"qqq 刷屏 spam_type 应为 repeat_char: {record.content[:80]}",
+            )
+            # 3. 应被强制分类为 chat_review
+            category = builder.classify(record)
+            self.assertEqual(
+                category,
+                "chat_review",
+                f"chat_spam 记录应归入 chat_review: {record.content[:80]}",
+            )
+
+    def test_real_chat_spam_triggers_alert(self):
+        """真实日志 chat_spam 记录应触发告警（避免审核漏报）。
+
+        PR10 修复前：chat_review 默认不告警，刷屏被漏报。
+        修复后：chat_spam 标签的记录强制告警，确保审核可见。
+        """
+        config = MineSentinelConfig.from_dict(
+            {"alert": {"enabled": True, "min_severity": "high", "min_evidence_count": 5}}
+        )
+        builder = HeuristicReportBuilder(config)
+        report = builder.build(self.records, 120, "survival")
+        chat_issues = [
+            issue for issue in report["issues"] if issue["category"] == "chat_review"
+        ]
+        # 应存在由 chat_spam 形成的 chat_review issue
+        self.assertTrue(chat_issues, "应存在 chat_review issue")
+        # 至少一个 chat_review issue 应触发告警（chat_spam 强制告警）
+        alert_issues = [issue for issue in chat_issues if issue.get("should_alert")]
+        self.assertTrue(
+            alert_issues,
+            "chat_spam 形成的 chat_review issue 应触发告警",
+        )
+
+    def test_real_chat_audit_no_false_positive_for_normal_chats(self):
+        """真实日志中的普通聊天（无 URL/交易/辱骂/刷屏信号）不应形成 chat_review issue。
+
+        验证整体审计精度：扫遍所有聊天记录，无 chat_spam 标签且不含 chat_review
+        关键词的普通聊天，不应被分类为 chat_review。
+        """
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        # chat_review 关键词列表（与 rules.py CATEGORY_KEYS["chat_review"] 对齐）
+        chat_review_signals = (
+            "swear", "profanity", "insult", "abuse", "harassment", "threat", "toxic",
+            "advertising", "discord.gg", "discord.com/invite",
+            "http://", "https://", "www.", ".com/", ".cn/",
+            "辱骂", "骂人", "脏话", "骚扰", "威胁", "开盒", "人肉", "刷屏",
+            "代练", "代打", "出售账号", "卖号", "买号",
+            "加群", "加微信", "加qq", "举报聊天",
+        )
+        normal_chat_misclassified = []
+        for record in self.records:
+            if "chat_message" not in record.tags:
+                continue
+            if "chat_spam" in record.tags:
+                continue  # 刷屏应进 chat_review，跳过
+            category = builder.classify(record)
+            if category == "chat_review":
+                # 进一步验证：full content（classify 实际匹配的文本）确实
+                # 命中了 chat_review 关键词（URL/交易/辱骂等），而非误判
+                content_lower = (record.content or "").lower()
+                has_signal = any(signal in content_lower for signal in chat_review_signals)
+                if not has_signal:
+                    normal_chat_misclassified.append(record.content[:80])
+        # 允许少量边界情况，但不应有大量误判
+        self.assertLess(
+            len(normal_chat_misclassified),
+            5,
+            f"普通聊天不应被大量误判为 chat_review（最多 5 条边界）："
+            f"{normal_chat_misclassified[:5]}",
+        )
 
 
 if __name__ == "__main__":

@@ -167,9 +167,11 @@ CATEGORY_KEYS = {
         "外挂",
     ),
     "chat_review": (
-        # 仅保留违规信号词；generic chat/message/said/tell/msg/whisper/pm
+        # 仅保留高置信度违规信号词；generic chat/message/said/tell/msg/whisper/pm
         # 会命中所有 [Async Chat Thread] 日志，导致 player_feedback 永远不可达，
         # 且与"辱骂/广告/骚扰/刷屏归 chat_review"的设计意图不符。
+        # 真实日志验证：'ad' 子串会误判 dadada/already，'link'/'url' 误判正常技术讨论，
+        # '私聊' 是正常常用词——均已移除。
         "swear",
         "profanity",
         "insult",
@@ -178,18 +180,31 @@ CATEGORY_KEYS = {
         "threat",
         "toxic",
         "advertising",
-        "ad",
-        "link",
-        "url",
+        # URL/外链信号（高置信度广告/引流指标）
         "discord.gg",
+        "discord.com/invite",
+        "http://",
+        "https://",
+        "www.",
+        ".com/",
+        ".cn/",
+        # 中文辱骂/骚扰/广告信号
         "辱骂",
         "骂人",
         "脏话",
         "骚扰",
         "威胁",
-        "广告",
+        "开盒",
+        "人肉",
         "刷屏",
-        "私聊",
+        "代练",
+        "代打",
+        "出售账号",
+        "卖号",
+        "买号",
+        "加群",
+        "加微信",
+        "加qq",
         "举报聊天",
     ),
     "player_feedback": (
@@ -547,6 +562,11 @@ class HeuristicReportBuilder:
         # 等被 moderation/network 关键词误判为异常事件。
         if "daily_noise" in record.tags:
             return "daily"
+        # PR10: chat_spam 标签强制归入 chat_review（若该分类开启），
+        # 真实日志验证：qqqqqqqqqqqqqqqqqqqqqqqwq 等刷屏无关键词命中，
+        # 必须靠形态标签兜底，否则会被分类为 daily 而漏审。
+        if "chat_spam" in record.tags and "chat_review" in self._active_priority:
+            return "chat_review"
         text = self._record_text(record)
         # 按当前生效的优先级列表匹配（已应用 category_enabled / category_whitelist），
         # daily 兜底。被关闭的分类直接跳过，记录会落到下一优先级或 daily。
@@ -699,10 +719,13 @@ class HeuristicReportBuilder:
         if multi_scope and severity in {"medium", "high"}:
             return True
         # chat_review 特殊规则：默认不告警，除非 severity>=high / evidence_count>=5 / 命中敏感词
+        # / 命中 chat_spam 标签（刷屏形态已强制 chat_review，需单独触发告警，否则审核漏报）
         if category == "chat_review":
             if severity in {"high", "critical"}:
                 return True
             if any(marker in text for marker in CHAT_SENSITIVE_MARKERS):
+                return True
+            if any("chat_spam" in record.tags for record in group):
                 return True
             return evidence_count >= 5
         # player_feedback 通常不告警

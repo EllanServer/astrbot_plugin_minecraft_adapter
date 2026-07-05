@@ -1238,6 +1238,35 @@ def _detect_chat_message(content: str) -> tuple[str, str] | None:
     return None
 
 
+# 刷屏检测阈值
+_CHAT_SPAM_REPEAT_CHAR_MIN = 8  # 同一字符连续重复 >=8 次视为刷屏（如 qqqqqqqq）
+_CHAT_SPAM_REPEAT_CHAR_RE = re.compile(r"(.)\1{" + str(_CHAT_SPAM_REPEAT_CHAR_MIN - 1) + r",}")
+
+
+def _detect_chat_spam(message: str) -> str | None:
+    """检测聊天刷屏形态，返回刷屏类型字符串，非刷屏返回 None。
+
+    识别两种刷屏：
+    1. ``repeat_char``: 单字符连续重复 >=8 次（如 qqqqqqqq、wwwwwwww）
+    2. ``long_run``: 超长无意义消息 >=40 字符且字母/数字占比 >80%
+       （如随机键盘乱敲 asdfghjkl1234567890...）
+
+    真实日志验证：[生存区] LilyFairy_uwu >> qqqqqqqqqqqqqqqqqqqqqqqwq
+    含 22 个连续 q，应识别为 repeat_char。
+    """
+    if not message:
+        return None
+    # 1. 单字符连续重复
+    if _CHAT_SPAM_REPEAT_CHAR_RE.search(message):
+        return "repeat_char"
+    # 2. 超长无意义消息（字母/数字占比高且无空格分词）
+    if len(message) >= 40:
+        alnum_count = sum(1 for c in message if c.isalnum())
+        if alnum_count / len(message) > 0.8 and " " not in message:
+            return "long_run"
+    return None
+
+
 def _detect_vulcan_alert(content: str) -> dict[str, str] | None:
     """检测 Vulcan 反作弊告警并返回 {player, check}，非告警行返回 None。
 
@@ -1364,10 +1393,15 @@ def _build_observation(
                 if patterns and _match_noise_patterns(content, _compile_noise_patterns(patterns)):
                     tags.append("daily_noise")
                     daily_noise_hit = True
+        chat_spam_type: str | None = None
         if runtime_config.chat_summary_enabled:
             chat_info = _detect_chat_message(content)
             if chat_info is not None:
                 tags.append("chat_message")
+                # PR10: 聊天刷屏形态检测（独立于关键词，按消息形态识别）
+                chat_spam_type = _detect_chat_spam(chat_info[1])
+                if chat_spam_type is not None:
+                    tags.append("chat_spam")
         if runtime_config.vulcan_detect_enabled:
             vulcan_info = _detect_vulcan_alert(content)
             if vulcan_info is not None:
@@ -1420,6 +1454,9 @@ def _build_observation(
         context["chatMessage"] = message
         context["otel"]["attributes"]["chat.player"] = player
         context["otel"]["attributes"]["chat.message"] = message
+        if chat_spam_type is not None:
+            context["chatSpamType"] = chat_spam_type
+            context["otel"]["attributes"]["chat.spam_type"] = chat_spam_type
     if vulcan_info is not None:
         context["vulcanPlayer"] = vulcan_info.get("player", "")
         context["vulcanCheck"] = vulcan_info.get("check", "")
