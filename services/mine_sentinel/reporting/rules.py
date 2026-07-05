@@ -993,6 +993,7 @@ class HeuristicReportBuilder:
                 "top_players": [],
                 "top_keywords": [],
                 "sample_messages": [],
+                "review_evidence": [],
             }
         max_topics = max(1, self.config.runtime_log.chat_summary_max_topics)
         max_samples = max(1, self.config.runtime_log.chat_summary_max_samples)
@@ -1044,13 +1045,72 @@ class HeuristicReportBuilder:
             if len(sample_messages) >= max_samples:
                 break
 
+        # PR10: 聊天审查证据——把 chat_spam 和 chat_review 命中的聊天记录
+        # 结构化（player/message/spam_type/time_text），让 LLM 在 chat_summary
+        # 里能贴出聊天原文上下文，便于管理员复核。否则 LLM 只看到统计数字，
+        # 无法输出具体违规内容。
+        review_evidence = self._build_chat_review_evidence(chat_records, max_samples=10)
+
         return {
             "total_messages": len(chat_records),
             "unique_players": len(player_messages),
             "top_players": top_players,
             "top_keywords": top_keywords,
             "sample_messages": sample_messages,
+            "review_evidence": review_evidence,
         }
+
+    def _build_chat_review_evidence(
+        self, chat_records: list[ObservationRecord], max_samples: int = 10
+    ) -> list[dict[str, Any]]:
+        """从聊天记录中提取需要审查的证据样本（chat_spam + chat_review 命中）。
+
+        返回结构化列表，每条含：
+        - player: 玩家名
+        - message: 聊天原文
+        - spam_type: 刷屏类型（repeat_char/long_run），非刷屏为空
+        - reason: 命中原因（spam/keyword），keyword 时列出命中的关键词
+        - time_text: HH:MM:SS 时间
+        """
+        evidence: list[dict[str, Any]] = []
+        for record in chat_records:
+            ctx = record.context or {}
+            tags = record.tags or []
+            is_spam = "chat_spam" in tags
+            # 非 spam 记录只保留命中 chat_review 关键词的（避免把所有聊天都贴给 LLM）
+            hit_keys: list[str] = []
+            if not is_spam:
+                content_lower = (record.content or "").lower()
+                for key in CHAT_REVIEW_GENERAL_MARKERS:
+                    if _is_word_key(key):
+                        # 短词用词边界
+                        if _word_boundary_regex((key,)) and _word_boundary_regex((key,)).search(content_lower):
+                            hit_keys.append(key)
+                    elif key in content_lower:
+                        hit_keys.append(key)
+                # URL 信号对 chat_message 记录生效
+                for key in CHAT_REVIEW_URL_MARKERS:
+                    if key in content_lower:
+                        hit_keys.append(key)
+                if not hit_keys:
+                    continue
+            player = str(ctx.get("chatPlayer") or "").strip() or "(unknown)"
+            message = str(ctx.get("chatMessage") or record.content).strip()
+            spam_type = str(ctx.get("chatSpamType") or "").strip()
+            time_text = _format_timestamp(record.timestamp) if record.timestamp else ""
+            evidence.append(
+                {
+                    "player": player,
+                    "message": message[:200],
+                    "spam_type": spam_type,
+                    "reason": "spam" if is_spam else "keyword",
+                    "hit_keys": hit_keys[:5],
+                    "time_text": time_text,
+                }
+            )
+            if len(evidence) >= max_samples:
+                break
+        return evidence
 
     @staticmethod
     def _extract_top_keywords(

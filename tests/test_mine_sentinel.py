@@ -2081,6 +2081,57 @@ class MineSentinelRulesTests(unittest.TestCase):
         keywords = {item["keyword"] for item in topics["top_keywords"]}
         self.assertIn("hello", keywords)
 
+    def test_chat_topics_review_evidence_includes_spam_and_keyword_hits(self):
+        """chat_topics.review_evidence 应包含 chat_spam 和 chat_review 关键词命中的聊天原文。
+
+        PR10: LLM 需要 chat_summary 字段贴出聊天原文上下文，便于管理员复核。
+        review_evidence 结构化呈现 player/message/spam_type/reason/hit_keys/time_text。
+        """
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        records = [
+            # 1. 刷屏记录（chat_spam 标签）
+            self._make_record(
+                "[Async Chat Thread/INFO]: <Spammer> qqqqqqqqqqqqqqqqqqqqqqqwq",
+                tags=["server_log", "chat_message", "chat_spam"],
+                context={
+                    "chatPlayer": "Spammer",
+                    "chatMessage": "qqqqqqqqqqqqqqqqqqqqqqqwq",
+                    "chatSpamType": "repeat_char",
+                },
+            ),
+            # 2. URL 命中（chat_review 关键词）
+            self._make_record(
+                "[Async Chat Thread/INFO]: <AdBot> 加入群 discord.gg/xxxxxxx",
+                tags=["server_log", "chat_message"],
+                context={
+                    "chatPlayer": "AdBot",
+                    "chatMessage": "加入群 discord.gg/xxxxxxx",
+                },
+            ),
+            # 3. 普通聊天（不应进 review_evidence）
+            self._make_record(
+                "[Async Chat Thread/INFO]: <Steve> hello world",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Steve", "chatMessage": "hello world"},
+            ),
+        ]
+        report = builder.build(records, 60, "survival")
+        review_evidence = report["chat_topics"]["review_evidence"]
+        # 应有 2 条证据（刷屏 + URL），普通聊天不进
+        self.assertEqual(len(review_evidence), 2)
+        # 第一条：刷屏
+        spam_ev = review_evidence[0]
+        self.assertEqual(spam_ev["player"], "Spammer")
+        self.assertEqual(spam_ev["message"], "qqqqqqqqqqqqqqqqqqqqqqqwq")
+        self.assertEqual(spam_ev["spam_type"], "repeat_char")
+        self.assertEqual(spam_ev["reason"], "spam")
+        # 第二条：URL 关键词命中
+        url_ev = review_evidence[1]
+        self.assertEqual(url_ev["player"], "AdBot")
+        self.assertEqual(url_ev["reason"], "keyword")
+        self.assertIn("discord.gg", url_ev["hit_keys"])
+
     def test_chat_summary_disabled_returns_empty_dict(self):
         """chat_summary_enabled=false 时 chat_topics 段返回空字典。"""
         config = MineSentinelConfig.from_dict(
@@ -5076,6 +5127,30 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
             alert_issues,
             "chat_spam 形成的 chat_review issue 应触发告警",
         )
+
+    def test_real_chat_topics_review_evidence_includes_spam(self):
+        """真实日志 chat_topics.review_evidence 应包含 chat_spam 的聊天原文。
+
+        PR10: LLM 需要 chat_summary 字段贴出聊天原文上下文，便于管理员复核。
+        review_evidence 结构化呈现 player/message/spam_type/time_text。
+        """
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        report = builder.build(self.records, 120, "survival")
+        review_evidence = report["chat_topics"].get("review_evidence") or []
+        # 应有 chat_spam 证据（LilyFairy_uwu 的 qqq... 和 RivetenGaming 的 hhh...）
+        spam_evidence = [ev for ev in review_evidence if ev.get("reason") == "spam"]
+        self.assertGreater(len(spam_evidence), 0, "应存在 chat_spam 审查证据")
+        # 验证结构化字段完整
+        for ev in spam_evidence:
+            self.assertIn("player", ev)
+            self.assertIn("message", ev)
+            self.assertIn("spam_type", ev)
+            self.assertIn("time_text", ev)
+            self.assertTrue(ev["player"], "玩家名非空")
+            self.assertTrue(ev["message"], "消息原文非空")
+        # 应包含 LilyFairy_uwu 的 qqq 刷屏
+        messages = " ".join(ev["message"] for ev in spam_evidence)
+        self.assertIn("qqqqqqqq", messages, "应贴出 qqq 刷屏原文")
 
     def test_real_chat_audit_no_false_positive_for_normal_chats(self):
         """真实日志中的普通聊天（无 URL/交易/辱骂/刷屏信号）不应形成 chat_review issue。
