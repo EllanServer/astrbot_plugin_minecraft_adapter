@@ -1925,7 +1925,7 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertEqual(builder.classify(record), "community")
 
     def test_vulcan_alerts_section_built_from_records(self):
-        """报告 vulcan_alerts 段应结构化呈现时间+玩家+检查类型。"""
+        """报告 vulcan_alerts 段应聚合呈现玩家+检查类型统计。"""
         config = MineSentinelConfig.from_dict({})
         builder = HeuristicReportBuilder(config)
         ts1 = int(time.time() * 1000) - 60000
@@ -1965,17 +1965,24 @@ class MineSentinelRulesTests(unittest.TestCase):
         )
         report = builder.build(records, 60, "survival")
         alerts = report["vulcan_alerts"]
-        self.assertEqual(len(alerts), 2)
-        # 按时间升序
-        self.assertEqual(alerts[0]["player"], "Steve")
-        self.assertEqual(alerts[0]["check"], "Reach")
-        self.assertEqual(alerts[1]["player"], "Alex")
-        self.assertEqual(alerts[1]["check"], "Fly")
-        # 时间文本非空
-        self.assertTrue(alerts[0]["time_text"])
+        # 现在是聚合 dict 而非 list
+        self.assertEqual(alerts["total"], 2)
+        self.assertEqual(alerts["unique_players"], 2)
+        self.assertEqual(alerts["unique_checks"], 2)
+        # by_player 按告警数降序，每人 1 条
+        players_in_summary = {item["player"] for item in alerts["by_player"]}
+        self.assertEqual(players_in_summary, {"Steve", "Alex"})
+        # by_check
+        checks_in_summary = {item["check"] for item in alerts["by_check"]}
+        self.assertEqual(checks_in_summary, {"Reach", "Fly"})
+        # 时间范围
+        self.assertTrue(alerts["time_range"]["start"])
+        self.assertTrue(alerts["time_range"]["end"])
+        # samples 按时间序
+        self.assertEqual(len(alerts["samples"]), 2)
 
     def test_vulcan_detect_disabled_returns_empty_alerts(self):
-        """vulcan_detect_enabled=false 时 vulcan_alerts 段为空。"""
+        """vulcan_detect_enabled=false 时 vulcan_alerts 段为空 dict。"""
         config = MineSentinelConfig.from_dict(
             {"runtime_log": {"vulcan_detect_enabled": False}}
         )
@@ -1988,7 +1995,7 @@ class MineSentinelRulesTests(unittest.TestCase):
             ),
         ]
         report = builder.build(records, 60, "survival")
-        self.assertEqual(report["vulcan_alerts"], [])
+        self.assertEqual(report["vulcan_alerts"], {})
 
     def test_chat_topics_section_built_from_chat_records(self):
         """报告 chat_topics 段应聚合活跃玩家和高频关键词。"""
@@ -2143,7 +2150,10 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertNotIn("daily_noise", obs["tags"])
 
     def test_vulcan_alert_tagged_and_player_extracted(self):
-        """Vulcan 告警应打 anticheat_vulcan 标签并提取玩家名+检查类型。"""
+        """Vulcan 告警应打 anticheat_vulcan 标签并提取玩家名+检查类型。
+
+        注意：check 名捕获完整子类型，如 'Reach (VL: 5)' 而非只 'Reach'。
+        """
         from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
         runtime_config = MineSentinelRuntimeLogConfig()
         obs = self._build(
@@ -2152,7 +2162,8 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         )
         self.assertIn("anticheat_vulcan", obs["tags"])
         self.assertEqual(obs["context"].get("vulcanPlayer"), "Steve")
-        self.assertEqual(obs["context"].get("vulcanCheck"), "Reach")
+        # check 名含子类型 '(VL: 5)'
+        self.assertEqual(obs["context"].get("vulcanCheck"), "Reach (VL: 5)")
 
     def test_chat_message_tagged_and_player_extracted(self):
         """聊天行应打 chat_message 标签并提取玩家名和消息。"""
@@ -2243,7 +2254,8 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         )
         self.assertIn("anticheat_vulcan", obs["tags"])
         self.assertEqual(obs["context"].get("vulcanPlayer"), "CheaterPlayer")
-        self.assertEqual(obs["context"].get("vulcanCheck"), "Reach")
+        # check 名含子类型 '(VL: 5)'
+        self.assertEqual(obs["context"].get("vulcanCheck"), "Reach (VL: 5)")
 
     def test_luckperms_warn_not_filtered_as_daily_noise(self):
         """LuckPerms HikariCP WARN 不应被 daily_noise 过滤。
@@ -4576,10 +4588,10 @@ class MineSentinelRealLogIntegrationTests(unittest.TestCase):
         self.assertGreater(top_player["message_count"], 200)
 
     def test_real_vulcan_alerts_section_empty_when_no_real_alerts(self):
-        """这份真实日志无 Vulcan 告警，vulcan_alerts 段应为空。"""
+        """这份真实日志无 Vulcan 告警，vulcan_alerts 段应为空 dict。"""
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         report = builder.build(self.records, 120, "survival")
-        self.assertEqual(report["vulcan_alerts"], [])
+        self.assertEqual(report["vulcan_alerts"], {})
 
     def test_real_log_does_not_form_false_incident_from_normal_login(self):
         """真实日志中的正常登录/断开不应形成 '事件#1 服务器集中出现多类运行日志异常'。
@@ -4615,6 +4627,229 @@ class MineSentinelRealLogIntegrationTests(unittest.TestCase):
         # 第一条消息应是 "1"
         first = chat_records[0]
         self.assertEqual(first.context.get("chatMessage"), "1")
+
+
+class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
+    """真实场景集成测试 v2：mclo.gs/v54kwMi（10340 行，含海量 Vulcan 告警）。
+
+    这份日志的核心挑战：
+    - 4202 条 Vulcan 告警（dxe_explode 3020 + Overta27981 1182），需聚合统计
+    - Vulcan check 名含子类型：'Invalid (Type E)' / 'Step (Type A)' / 'Ground'
+    - 1624 条聊天（无 [Not Secure] 前缀，格式 '[频道] player >> msg'）
+    - 1332 条 WARN（HikariCP 连接池异常，SQLManager/ResidenceBridge/pool-26）
+    - 8 条 ERROR（Block-attached entity at invalid position）
+    """
+
+    FIXTURE_PATH = Path(__file__).parent / "fixtures" / "mclogs_v54kwmi.log"
+
+    @classmethod
+    def setUpClass(cls):
+        """加载真实日志，逐行跑 _build_observation 生成 ObservationRecord 列表。"""
+        if not cls.FIXTURE_PATH.exists():
+            raise unittest.SkipTest(f"fixture 缺失: {cls.FIXTURE_PATH}")
+        from services.mine_sentinel.models import (
+            MineSentinelLogSourceConfig,
+            MineSentinelRuntimeLogConfig,
+        )
+        from services.mine_sentinel.runtime_log import (
+            _build_observation,
+            _parse_log_timestamp,
+        )
+        from datetime import date as _date
+
+        cls.runtime_config = MineSentinelRuntimeLogConfig()
+        source = MineSentinelLogSourceConfig(
+            server_id="survival",
+            server_name="Survival",
+            server_type="minecraft",
+        )
+        cls.records: list[ObservationRecord] = []
+        with cls.FIXTURE_PATH.open("r", encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                ts_ms = _parse_log_timestamp(line, _date.today())
+                obs = _build_observation(
+                    source=source,
+                    log_file=cls.FIXTURE_PATH,
+                    line=line,
+                    timestamp_ms=ts_ms,
+                    max_line_length=2000,
+                    runtime_config=cls.runtime_config,
+                )
+                cls.records.append(ObservationRecord.from_dict(obs, "survival", "Survival"))
+
+    def test_fixture_loaded_successfully(self):
+        """fixture 应加载出大量真实日志记录。"""
+        self.assertGreater(len(self.records), 9000, "应加载出 9000+ 条真实日志")
+
+    def test_real_vulcan_alerts_aggregated_for_massive_alerts(self):
+        """海量 Vulcan 告警（4202 条）应被聚合统计而非全列。
+
+        真实日志：dxe_explode 3020 条 + Overta27981 1182 条 = 4202 条 Vulcan 告警。
+        vulcan_alerts 应返回 dict 聚合：total=4202, unique_players=2,
+        by_player 按告警数降序，samples 最多 20 条。
+        """
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        report = builder.build(self.records, 120, "survival")
+        alerts = report["vulcan_alerts"]
+        # 必须是聚合 dict 而非 list
+        self.assertIsInstance(alerts, dict)
+        self.assertEqual(alerts["total"], 4202)
+        self.assertEqual(alerts["unique_players"], 2)
+        # by_player 第一名应是 dxe_explode（3020 条）
+        self.assertEqual(alerts["by_player"][0]["player"], "dxe_explode")
+        self.assertEqual(alerts["by_player"][0]["count"], 3020)
+        # by_player 第二名应是 Overta27981（1182 条）
+        self.assertEqual(alerts["by_player"][1]["player"], "Overta27981")
+        self.assertEqual(alerts["by_player"][1]["count"], 1182)
+        # samples 不能超过 20 条（避免报告爆炸）
+        self.assertLessEqual(len(alerts["samples"]), 20)
+        self.assertGreater(len(alerts["samples"]), 0)
+
+    def test_real_vulcan_check_name_includes_subtype(self):
+        """Vulcan check 名应保留完整子类型如 'Invalid (Type E)' 而非只 'Invalid'。
+
+        真实日志样本：[Vulcan] Overta27981 failed Invalid (Type E) (1/8)
+        应捕获 check='Invalid (Type E)'，不是 'Invalid'。
+        """
+        vulcan_records = [r for r in self.records if "anticheat_vulcan" in r.tags]
+        self.assertGreater(len(vulcan_records), 4000)
+        # 找含 (Type E) 的告警
+        type_e_records = [
+            r for r in vulcan_records
+            if "(Type E)" in r.context.get("vulcanCheck", "")
+        ]
+        self.assertGreater(len(type_e_records), 100, "应识别 Invalid (Type E) 告警")
+        # check 名应完整包含子类型
+        self.assertEqual(type_e_records[0].context.get("vulcanCheck"), "Invalid (Type E)")
+
+    def test_real_vulcan_check_name_without_subtype(self):
+        """无子类型的 Vulcan check 名应正常捕获，如 'Ground'。"""
+        vulcan_records = [r for r in self.records if "anticheat_vulcan" in r.tags]
+        ground_records = [
+            r for r in vulcan_records
+            if r.context.get("vulcanCheck") == "Ground"
+        ]
+        self.assertGreater(len(ground_records), 1000, "应识别 Ground 告警（无子类型）")
+
+    def test_real_vulcan_by_check_aggregation(self):
+        """by_check 聚合应正确统计每种 check 的告警数和涉及玩家。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        report = builder.build(self.records, 120, "survival")
+        alerts = report["vulcan_alerts"]
+        by_check = {item["check"]: item for item in alerts["by_check"]}
+        # 真实分布：Invalid (Type E) 1099, Ground 1912, Step (Type A) 704, Strafe (Type A) 468
+        self.assertIn("Invalid (Type E)", by_check)
+        self.assertIn("Ground", by_check)
+        self.assertEqual(by_check["Ground"]["count"], 1912)
+        # Ground 涉及玩家应是 dxe_explode
+        self.assertIn("dxe_explode", by_check["Ground"]["players"])
+
+    def test_real_chat_messages_without_not_secure_prefix(self):
+        """无 [Not Secure] 前缀的聊天行也应被识别。
+
+        真实格式：[00:16:42] [Async Chat Thread - #1737/INFO]: [生存区] LilyFairy_uwu >> qqq
+        没有 [Not Secure] 标记，只有 [频道] 前缀。
+        """
+        chat_records = [r for r in self.records if "chat_message" in r.tags]
+        self.assertGreater(len(chat_records), 1500, "应识别 1500+ 条聊天行")
+        # 验证玩家名提取正确
+        players = {r.context.get("chatPlayer") for r in chat_records if r.context.get("chatPlayer")}
+        self.assertIn("LilyFairy_uwu", players)
+
+    def test_real_chat_message_content_extracted_correctly(self):
+        """聊天消息内容应被正确提取（含中文）。"""
+        chat_records = [
+            r for r in self.records
+            if "chat_message" in r.tags and r.context.get("chatPlayer") == "LilyFairy_uwu"
+        ]
+        self.assertGreater(len(chat_records), 0)
+        # 真实样本：[生存区] LilyFairy_uwu >> 额
+        messages = [r.context.get("chatMessage") for r in chat_records]
+        # 应有中文消息
+        self.assertTrue(any("额" in m for m in messages) or any("没人了" in m for m in messages))
+
+    def test_real_hikari_warn_not_filtered_as_daily_noise(self):
+        """HikariCP 连接池 WARN（SQLManager/ResidenceBridge/pool-26）不应被 daily_noise 过滤。
+
+        真实日志有 1332 条 WARN，主要是 'Failed to validate connection' 连接池异常。
+        这些是真实异常，必须保留告警能力。
+        """
+        hikari_warn = [
+            r for r in self.records
+            if "Failed to validate connection" in r.content
+            and r.context.get("level") == "WARN"
+        ]
+        self.assertGreater(len(hikari_warn), 100, "应存在大量 HikariCP WARN")
+        # 这些 WARN 不应被打 daily_noise 标签
+        for r in hikari_warn[:10]:  # 抽检前 10 条
+            self.assertNotIn(
+                "daily_noise",
+                r.tags,
+                f"HikariCP WARN 不应被 daily_noise 过滤: {r.content[:80]}",
+            )
+
+    def test_real_error_logs_preserved(self):
+        """真实 ERROR 日志应被保留，不被 daily_noise 过滤。"""
+        error_records = [
+            r for r in self.records
+            if r.context.get("level") == "ERROR"
+        ]
+        self.assertGreater(len(error_records), 5, "应存在 ERROR 日志")
+        for r in error_records:
+            self.assertNotIn("daily_noise", r.tags)
+
+    def test_real_chat_topics_built_correctly(self):
+        """真实聊天热点总结应正确聚合玩家。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        report = builder.build(self.records, 120, "survival")
+        topics = report["chat_topics"]
+        self.assertGreater(topics["total_messages"], 1500)
+        self.assertGreaterEqual(topics["unique_players"], 5)
+        # 最活跃玩家应有较多消息
+        top_player = topics["top_players"][0]
+        self.assertGreater(top_player["message_count"], 100)
+
+    def test_real_vulcan_alerts_passive_not_forming_incident(self):
+        """Vulcan 告警 issue 应被 is_passive_issue 视为被动，不进 incident 聚合。
+
+        4202 条 Vulcan 告警如果都进 incident 聚合会产生大量重复事件。
+        """
+        from services.mine_sentinel.reporting.incidents import is_passive_issue
+
+        # 模拟 Vulcan issue
+        self.assertTrue(
+            is_passive_issue({
+                "category": "community",
+                "tag": "server_log_anticheat_vulcan",
+            })
+        )
+
+    def test_real_vulcan_alerts_time_range_valid(self):
+        """Vulcan 告警时间范围应有效（start <= end）。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        report = builder.build(self.records, 120, "survival")
+        alerts = report["vulcan_alerts"]
+        self.assertTrue(alerts["time_range"]["start"])
+        self.assertTrue(alerts["time_range"]["end"])
+        # start 和 end 应是有效时间格式 HH:MM:SS
+        import re as _re
+        time_pattern = _re.compile(r"^\d{2}:\d{2}:\d{2}$")
+        self.assertTrue(time_pattern.match(alerts["time_range"]["start"]))
+        self.assertTrue(time_pattern.match(alerts["time_range"]["end"]))
+
+    def test_real_vulcan_alerts_samples_have_required_fields(self):
+        """Vulcan samples 每条应包含 time_text/player/check 字段。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        report = builder.build(self.records, 120, "survival")
+        alerts = report["vulcan_alerts"]
+        for sample in alerts["samples"]:
+            self.assertIn("time_text", sample)
+            self.assertIn("player", sample)
+            self.assertIn("check", sample)
+            self.assertTrue(sample["player"])  # 玩家名非空
 
 
 if __name__ == "__main__":

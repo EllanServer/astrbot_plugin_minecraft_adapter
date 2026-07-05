@@ -93,12 +93,15 @@ _CHAT_PLUGIN_RE = re.compile(
 )
 # Vulcan 反作弊插件告警检测。Vulcan 告警的标准格式：
 #   [Vulcan] PlayerName failed CheckName (VL: 5)
+#   [Vulcan] PlayerName failed CheckName (Type X) (N/M)   ← 真实 mclo.gs 格式
 # 注意：[Vulcan] 前缀也会出现在插件生命周期日志（Loading/Enabling/Starting/hook），
 # 因此必须用 "failed" 关键词区分告警和生命周期日志，避免误判。
+# check 名捕获完整子类型：如 "Invalid (Type E)" 而非只 "Invalid"。
 _VULCAN_PLAYER_RE = re.compile(
     r"\[Vulcan\][\]:>\s]*"  # [Vulcan] 前缀
     r"(?P<player>[A-Za-z0-9_]{1,16})\s+"
-    r"failed\s+(?P<check>\S+)",
+    r"failed\s+"
+    r"(?P<check>[A-Za-z]+(?:\s*\([^)]+\))?)",  # CheckName 或 CheckName (Type X)
     re.IGNORECASE,
 )
 

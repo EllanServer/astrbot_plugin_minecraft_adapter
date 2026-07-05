@@ -58,14 +58,14 @@ class AIReportPromptBuilder:
         compact_records: list[dict[str, Any]],
         anomaly_evidence: list[dict[str, Any]],
         chat_topics: dict[str, Any] | None = None,
-        vulcan_alerts: list[dict[str, Any]] | None = None,
+        vulcan_alerts: dict[str, Any] | None = None,
     ) -> str:
         max_chars = self.config.report.max_ai_prompt_chars
         records = list(compact_records)
         chunks = [dict(chunk) for chunk in timeline_chunks]
         evidence = [dict(item) for item in anomaly_evidence]
         chat_topics_data = dict(chat_topics or {})
-        vulcan_alerts_data = list(vulcan_alerts or [])
+        vulcan_alerts_data = dict(vulcan_alerts or {})
 
         while True:
             prompt = self.prompt_text(
@@ -90,12 +90,14 @@ class AIReportPromptBuilder:
                 continue
             if self.trim_anomaly_samples(evidence):
                 continue
-            # 压缩 Vulcan 告警：先减半，再清空 content
-            if vulcan_alerts_data and len(vulcan_alerts_data) > 3:
-                vulcan_alerts_data = vulcan_alerts_data[: max(3, len(vulcan_alerts_data) * 3 // 4)]
+            # 压缩 Vulcan 告警：先减半 samples，再清空 samples
+            if vulcan_alerts_data.get("samples") and len(vulcan_alerts_data["samples"]) > 3:
+                vulcan_alerts_data["samples"] = vulcan_alerts_data["samples"][
+                    : max(3, len(vulcan_alerts_data["samples"]) * 3 // 4)
+                ]
                 continue
-            if vulcan_alerts_data:
-                vulcan_alerts_data = []
+            if vulcan_alerts_data.get("samples"):
+                vulcan_alerts_data = {k: v for k, v in vulcan_alerts_data.items() if k != "samples"}
                 continue
             if len(evidence) > 3:
                 evidence = evidence[: max(3, len(evidence) * 3 // 4)]
@@ -159,10 +161,11 @@ class AIReportPromptBuilder:
             "聊天热点总结：输入里的 chat_topics 是预计算的聊天统计（活跃玩家、高频关键词、"
             "样本消息），你必须在 chat_summary 字段输出 1-3 句面向管理员的聊天热点归纳，"
             "包含最活跃玩家和讨论主题；没有聊天记录时输出空字符串。"
-            "Vulcan 反作弊告警：输入里的 vulcan_alerts 是预提取的结构化告警列表，"
-            "每条含 time_text/player/check；你必须在 vulcan_alerts 字段按时间顺序输出"
-            "可读的告警摘要（时间 + 涉及玩家 ID + 检查类型），"
-            "用于管理员快速定位作弊嫌疑玩家；无告警时输出空数组。"
+            "Vulcan 反作弊告警：输入里的 vulcan_alerts 是预聚合的结构化统计（total/"
+            "unique_players/unique_checks/by_player/by_check/time_range/samples），"
+            "你必须在 vulcan_alerts 字段输出面向管理员的告警摘要：先说总数和涉及玩家，"
+            "再按玩家列出告警数和主要检查类型（如 dxe_explode 3020 条告警，主要是 Ground/Step/Strafe），"
+            "最后给出时间范围；用于管理员快速定位作弊嫌疑玩家。无告警时输出空对象。"
             "正常登录/断开/UUID 分配/LuckPerms 常规日志已被 daily_noise 过滤，"
             "不要把它们当作异常事件输出。"
             f"时间窗口: 最近 {window_minutes} 分钟。\n"

@@ -1048,37 +1048,110 @@ class HeuristicReportBuilder:
     # --- Vulcan 反作弊告警结构化（PR10）-----------------------------------
     def _build_vulcan_alerts(
         self, records: list[ObservationRecord]
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """从 anticheat_vulcan 标签记录中提取结构化告警。
 
-        每条返回：timestamp_ms, time_text, server_id, player, check, content。
-        按时间排序，最多保留 50 条避免报告过长。Vulcan 检测关闭时返回空列表。
+        返回结构（应对海量告警，如真实日志 4202 条/2 玩家的场景）：
+        - total: 告警总数
+        - unique_players: 涉及不同玩家数
+        - unique_checks: 涉及不同检查类型数
+        - by_player: [{player, count, top_checks: [(check, count)]}] 按告警数降序
+        - by_check: [{check, count, players: [player]}] 按告警数降序
+        - time_range: {start, end} 最早/最晚告警时间文本
+        - samples: 最多 20 条原始告警（time_text + player + check），按时间序
+
+        Vulcan 检测关闭时返回空字典。
         """
         if not self.config.runtime_log.vulcan_detect_enabled:
-            return []
+            return {}
         vulcan_records = [
             record for record in records if "anticheat_vulcan" in record.tags
         ]
         if not vulcan_records:
-            return []
+            return {}
         vulcan_records.sort(key=lambda r: r.timestamp)
-        alerts: list[dict[str, Any]] = []
-        for record in vulcan_records[:50]:
+
+        # 按玩家聚合
+        player_alerts: dict[str, list[tuple[str, ObservationRecord]]] = defaultdict(list)
+        check_alerts: dict[str, list[tuple[str, ObservationRecord]]] = defaultdict(list)
+        for record in vulcan_records:
             ctx = record.context or {}
-            player = str(ctx.get("vulcanPlayer") or "").strip()
-            check = str(ctx.get("vulcanCheck") or "").strip()
-            ts = int(record.timestamp or 0)
-            alerts.append(
+            player = str(ctx.get("vulcanPlayer") or "").strip() or "(unknown)"
+            check = str(ctx.get("vulcanCheck") or "").strip() or "(unknown)"
+            ts_text = _format_timestamp(int(record.timestamp or 0))
+            player_alerts[player].append((check, record))
+            check_alerts[check].append((player, record))
+
+        # by_player 排序
+        by_player = []
+        for player, items in sorted(
+            player_alerts.items(), key=lambda kv: len(kv[1]), reverse=True
+        ):
+            check_counter: dict[str, int] = defaultdict(int)
+            for check, _ in items:
+                check_counter[check] += 1
+            top_checks = sorted(
+                check_counter.items(), key=lambda kv: kv[1], reverse=True
+            )[:3]
+            by_player.append(
                 {
-                    "timestamp_ms": ts,
-                    "time_text": _format_timestamp(ts),
-                    "server_id": record.server_id or "",
                     "player": player,
-                    "check": check,
-                    "content": record.content,
+                    "count": len(items),
+                    "top_checks": [
+                        {"check": c, "count": n} for c, n in top_checks
+                    ],
                 }
             )
-        return alerts
+
+        # by_check 排序
+        by_check = []
+        for check, items in sorted(
+            check_alerts.items(), key=lambda kv: len(kv[1]), reverse=True
+        ):
+            players = sorted({p for p, _ in items})
+            by_check.append(
+                {
+                    "check": check,
+                    "count": len(items),
+                    "players": players,
+                }
+            )
+
+        # 时间范围
+        first_ts = int(vulcan_records[0].timestamp or 0)
+        last_ts = int(vulcan_records[-1].timestamp or 0)
+        time_range = {
+            "start": _format_timestamp(first_ts),
+            "end": _format_timestamp(last_ts),
+        }
+
+        # 样本（最多 20 条，覆盖整个时间范围）
+        sample_records = vulcan_records
+        max_samples = 20
+        if len(sample_records) > max_samples:
+            step = max(1, len(sample_records) // max_samples)
+            sample_records = [sample_records[i] for i in range(0, len(sample_records), step)][:max_samples]
+        samples = []
+        for record in sample_records:
+            ctx = record.context or {}
+            samples.append(
+                {
+                    "time_text": _format_timestamp(int(record.timestamp or 0)),
+                    "server_id": record.server_id or "",
+                    "player": str(ctx.get("vulcanPlayer") or "").strip(),
+                    "check": str(ctx.get("vulcanCheck") or "").strip(),
+                }
+            )
+
+        return {
+            "total": len(vulcan_records),
+            "unique_players": len(player_alerts),
+            "unique_checks": len(check_alerts),
+            "by_player": by_player,
+            "by_check": by_check,
+            "time_range": time_range,
+            "samples": samples,
+        }
 
     @staticmethod
     def _issue_terms(group: list[ObservationRecord]) -> list[str]:
