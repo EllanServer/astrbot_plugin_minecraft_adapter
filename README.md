@@ -28,10 +28,22 @@ mine_sentinel:
     sources:
       - server_id: survival
         server_name: 生存服
-        root: "D:\\minecraftserver"
+        server_type: minecraft      # minecraft | velocity，默认 minecraft
+        root: "D:\\minecraftserver"  # 服务器根目录，自动读取 root/logs/latest.log
+      # Velocity 群组服示例（多服指定）：
+      # - server_id: proxy
+      #   server_name: 代理
+      #   server_type: velocity
+      #   logs_dir: "/opt/velocity/logs"   # 直接指定日志目录，优先级高于 root
+      # - server_id: creative
+      #   server_type: minecraft
+      #   log_file: "/opt/creative/logs/latest.log"  # 直接指定文件，优先级最高
     backfill_on_start: true
     backfill_window_minutes: 480
     loop_filter_enabled: true
+    poll_interval_seconds: 5         # 轮询间隔；AstrBot 仅从文件系统读取日志，不与 MC 进程通信，不影响 mspt/tps
+    max_bytes_per_poll: 262144       # 单次轮询最大读取字节数
+    max_lines_per_poll: 200          # 单次轮询最大写入行数
   storage:
     enabled: true
   report:
@@ -44,7 +56,19 @@ mine_sentinel:
     send_full_log_file: true
 ```
 
-`root` 会自动定位到 `root/logs/latest.log`。也可以直接写 `log_file: "D:\\server\\logs\\latest.log"`。Velocity 群组服把 Velocity 根目录和每个后端服根目录都列到 `runtime_log.sources`。
+每个 source 支持三种日志路径指定方式，优先级从高到低：
+
+1. `log_file`：直接指定 `latest.log` 路径
+2. `logs_dir`：直接指定日志目录，自动读取 `<logs_dir>/latest.log`
+3. `root`：服务器根目录，自动读取 `<root>/logs/latest.log`
+
+也支持把 source 写成字符串（自动按上述规则切分）。`server_type` 用于报告分类：`minecraft`（Paper/Spigot/Purpur/Folia 等均归一为 minecraft）或 `velocity`（代理服）。
+
+Velocity 群组服请把 Velocity 根目录和每个后端服分别添加为一个 source，`server_type` 分别设为 `velocity` 和 `minecraft`。
+
+**性能说明**：MineSentinel 通过异步文件尾读 (`asyncio.to_thread`) 从 `logs/latest.log` 增量读取，单次读取有字节数和行数上限，不与 Minecraft 服务端进程通信，不会影响服务器的 mspt 和 tps。可以通过 `poll_interval_seconds`、`max_bytes_per_poll`、`max_lines_per_poll` 进一步调优。
+
+**启动提示**：如果 `runtime_log.sources` 为空或全部无效，启动时会输出 WARN 日志提示用户去配置。
 
 每个 source 可以单独写 `delivery_targets` 或 `target_sessions`，用于把特定服务器报告发到指定 AstrBot 会话；全局 `mine_sentinel.report.delivery_targets` 用于总报告投递。目标建议优先使用 `/sid` 输出的完整 UMO，也支持 `group:`、`qq:` 简写。
 

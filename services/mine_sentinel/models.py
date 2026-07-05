@@ -105,7 +105,9 @@ class MineSentinelStorageConfig:
 class MineSentinelLogSourceConfig:
     server_id: str = ""
     server_name: str = ""
+    server_type: str = "minecraft"  # minecraft | velocity
     root: str = ""
+    logs_dir: str = ""
     log_file: str = ""
     target_sessions: list[Any] = field(default_factory=list)
     delivery_targets: list[Any] = field(default_factory=list)
@@ -309,26 +311,33 @@ def _runtime_log_source(item: Any, index: int) -> MineSentinelLogSourceConfig | 
     root = str(item.get("root") or item.get("server_root") or "").strip()
     log_file = str(item.get("log_file") or item.get("log") or "").strip()
     logs_dir = str(item.get("logs_dir") or "").strip()
-    if raw_path and not (root or log_file):
+    if raw_path and not (root or log_file or logs_dir):
         root, log_file = _split_runtime_log_path(raw_path)
     if logs_dir and not log_file:
         log_file = str(Path(logs_dir) / "latest.log")
 
-    source_hint = root or log_file
+    source_hint = root or logs_dir or log_file
     server_id = str(item.get("server_id") or "").strip()
     server_name = str(item.get("server_name") or item.get("name") or "").strip()
     if not server_id:
         server_id = server_name or _infer_log_source_id(source_hint, index)
     if not server_name:
         server_name = server_id
-    if not (root or log_file):
+    if not (root or log_file or logs_dir):
         return None
+    server_type = str(item.get("server_type") or item.get("type") or "").strip().lower()
+    if server_type not in {"minecraft", "velocity", "paper", "spigot", "purpur", "folia"}:
+        server_type = "minecraft" if not server_type else "velocity" if server_type == "velocity" else "minecraft"
+    if server_type in {"paper", "spigot", "purpur", "folia"}:
+        server_type = "minecraft"
     target_sessions = _list_values(item.get("target_sessions"))
     delivery_targets = _list_values(item.get("delivery_targets"))
     return MineSentinelLogSourceConfig(
         server_id=server_id,
         server_name=server_name,
+        server_type=server_type,
         root=root,
+        logs_dir=logs_dir,
         log_file=log_file,
         target_sessions=target_sessions,
         delivery_targets=delivery_targets,

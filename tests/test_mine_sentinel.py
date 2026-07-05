@@ -85,7 +85,12 @@ if "mine_sentinel_rs" not in sys.modules:
 
 from services.mine_sentinel.models import MineSentinelConfig, ObservationRecord
 from services.mine_sentinel.reporting.rules import HeuristicReportBuilder
-from services.mine_sentinel.runtime_log import MineSentinelRuntimeLogTailer
+from services.mine_sentinel.runtime_log import (
+    MineSentinelRuntimeLogTailer,
+    _build_observation,
+    _resolve_log_file,
+    _logs_dir,
+)
 from services.mine_sentinel.storage import DiskObservationStore
 from handlers.mine_sentinel_commands import parse_report_args, parse_window_minutes
 
@@ -293,6 +298,155 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
 
         self.assertTrue(report["categories"]["community"])
         self.assertTrue(any(issue["category"] == "community" for issue in report["issues"]))
+
+    def test_log_source_supports_logs_dir_and_server_type(self):
+        config = MineSentinelConfig.from_dict(
+            {
+                "runtime_log": {
+                    "sources": [
+                        {
+                            "server_id": "proxy",
+                            "server_name": "Velocity 代理",
+                            "server_type": "velocity",
+                            "logs_dir": "/opt/velocity/logs",
+                        },
+                        {
+                            "server_id": "survival",
+                            "server_type": "paper",
+                            "root": "/opt/paper",
+                        },
+                        {
+                            "server_id": "creative",
+                            "log_file": "/opt/creative/logs/latest.log",
+                        },
+                    ]
+                }
+            }
+        )
+
+        sources = config.runtime_log.sources
+        self.assertEqual(len(sources), 3)
+
+        proxy = sources[0]
+        self.assertEqual(proxy.server_type, "velocity")
+        self.assertEqual(proxy.logs_dir, "/opt/velocity/logs")
+        self.assertEqual(
+            _resolve_log_file(proxy),
+            Path("/opt/velocity/logs/latest.log"),
+        )
+        self.assertEqual(_logs_dir(proxy), Path("/opt/velocity/logs"))
+
+        survival = sources[1]
+        self.assertEqual(survival.server_type, "minecraft")  # paper 归一为 minecraft
+        self.assertEqual(
+            _resolve_log_file(survival),
+            Path("/opt/paper/logs/latest.log"),
+        )
+
+        creative = sources[2]
+        self.assertEqual(creative.server_type, "minecraft")
+        self.assertEqual(
+            _resolve_log_file(creative),
+            Path("/opt/creative/logs/latest.log"),
+        )
+
+    def test_resolve_log_file_prefers_log_file_over_logs_dir_and_root(self):
+        from services.mine_sentinel.models import MineSentinelLogSourceConfig
+
+        source = MineSentinelLogSourceConfig(
+            root="/opt/paper",
+            logs_dir="/var/log/paper",
+            log_file="/tmp/explicit.log",
+        )
+        self.assertEqual(_resolve_log_file(source), Path("/tmp/explicit.log"))
+        self.assertEqual(_logs_dir(source), Path("/var/log/paper"))
+
+        source_no_logfile = MineSentinelLogSourceConfig(
+            root="/opt/paper",
+            logs_dir="/var/log/paper",
+        )
+        self.assertEqual(
+            _resolve_log_file(source_no_logfile),
+            Path("/var/log/paper/latest.log"),
+        )
+
+        source_only_root = MineSentinelLogSourceConfig(root="/opt/paper")
+        self.assertEqual(
+            _resolve_log_file(source_only_root),
+            Path("/opt/paper/logs/latest.log"),
+        )
+
+    def test_build_observation_marks_velocity_proxy_tag(self):
+        from services.mine_sentinel.models import MineSentinelLogSourceConfig
+
+        proxy_source = MineSentinelLogSourceConfig(
+            server_id="proxy",
+            server_name="Velocity",
+            server_type="velocity",
+        )
+        observation = _build_observation(
+            proxy_source,
+            Path("/opt/velocity/logs/latest.log"),
+            "[12:00:00 INFO]: [connected player] Bob -> survival",
+            1700000000000,
+            1000,
+        )
+        self.assertIn("velocity", observation["tags"])
+        self.assertIn("proxy", observation["tags"])
+        self.assertEqual(observation["context"]["serverType"], "velocity")
+
+        mc_source = MineSentinelLogSourceConfig(
+            server_id="survival",
+            server_name="Survival",
+            server_type="minecraft",
+        )
+        observation_mc = _build_observation(
+            mc_source,
+            Path("/opt/paper/logs/latest.log"),
+            "[12:00:00 INFO]: Done!",
+            1700000000000,
+            1000,
+        )
+        self.assertIn("minecraft", observation_mc["tags"])
+        self.assertNotIn("velocity", observation_mc["tags"])
+        self.assertEqual(observation_mc["context"]["serverType"], "minecraft")
+
+    def test_start_warns_when_no_sources_configured(self):
+        captured = []
+
+        class CaptureLogger:
+            def warning(self, msg, *args, **kwargs):
+                captured.append(msg)
+
+            def info(self, *args, **kwargs):
+                pass
+
+            def error(self, *args, **kwargs):
+                pass
+
+            def debug(self, *args, **kwargs):
+                pass
+
+        import services.mine_sentinel.runtime_log as runtime_log_module
+
+        original_logger = runtime_log_module.logger
+        runtime_log_module.logger = CaptureLogger()
+        try:
+            config = MineSentinelConfig.from_dict({"runtime_log": {"enabled": True}})
+            tailer = MineSentinelRuntimeLogTailer(
+                config.runtime_log,
+                batch_handler=lambda *a, **kw: None,
+                io_runner=_run_sync,
+            )
+            tailer.start()
+        finally:
+            runtime_log_module.logger = original_logger
+
+        self.assertTrue(captured)
+        self.assertTrue(
+            any("未配置任何 Minecraft 运行日志源" in msg for msg in captured),
+            f"expected no-sources warning, got: {captured}",
+        )
 
 
 async def _run_sync(func, *args):

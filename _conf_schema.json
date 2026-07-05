@@ -29,8 +29,8 @@
           },
           "sources": {
             "type": "list",
-            "description": "Minecraft 日志来源",
-            "hint": "支持字符串或对象。字符串可填服务器根目录，AstrBot 会自动读取 root/logs/latest.log；也可直接填 latest.log 路径。对象字段：server_id、server_name、root、log_file、enabled、delivery_targets。",
+            "description": "Minecraft 日志来源（支持多服）",
+            "hint": "支持字符串或对象。字符串可填服务器根目录、logs 目录或 latest.log 路径。对象字段：server_id、server_name、server_type（minecraft|velocity，默认 minecraft）、root（服务器根目录，会自动读取 root/logs/latest.log）、logs_dir（直接指定日志目录，优先级高于 root）、log_file（直接指定 latest.log 路径，优先级最高）、enabled、target_sessions、delivery_targets。Velocity 群组服请把 Velocity 根目录和每个后端服分别配置为一个 source，server_type 分别设为 velocity 和 minecraft。",
             "default": []
           },
           "poll_interval_seconds": {

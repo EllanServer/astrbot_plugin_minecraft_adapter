@@ -238,7 +238,13 @@ class MineSentinelRuntimeLogTailer:
             return
         sources = self.enabled_sources
         if not sources:
-            logger.info("[MineSentinel] runtime log ingestion has no configured sources")
+            logger.warning(
+                "[MineSentinel] 未配置任何 Minecraft 运行日志源，"
+                "请在 _conf_schema 的 mine_sentinel.runtime_log.sources 中指定一个或多个服务器，"
+                "例如：{server_id: 'survival', server_type: 'minecraft', root: '/path/to/paper'} "
+                "或 {server_type: 'velocity', logs_dir: '/path/to/velocity/logs'}。"
+                "Velocity 群组服请把 Velocity 根目录和每个后端服分别添加为一个 source。"
+            )
             return
         self._stopping.clear()
         for source in sources:
@@ -246,7 +252,10 @@ class MineSentinelRuntimeLogTailer:
             if log_file is None:
                 continue
             self._tasks.append(asyncio.create_task(self._run_source(source, log_file)))
-        logger.info(f"[MineSentinel] runtime log ingestion started: {len(self._tasks)} source(s)")
+        logger.info(
+            f"[MineSentinel] runtime log ingestion started: {len(self._tasks)} source(s) "
+            f"-> {', '.join(f'{s.server_id}({s.server_type})' for s in sources if _resolve_log_file(s) is not None)}"
+        )
 
     async def stop(self):
         self._stopping.set()
@@ -403,12 +412,16 @@ class MineSentinelRuntimeLogTailer:
 def _resolve_log_file(source: MineSentinelLogSourceConfig) -> Path | None:
     if source.log_file:
         return Path(source.log_file).expanduser()
+    if source.logs_dir:
+        return Path(source.logs_dir).expanduser() / "latest.log"
     if source.root:
         return Path(source.root).expanduser() / "logs" / "latest.log"
     return None
 
 
 def _logs_dir(source: MineSentinelLogSourceConfig) -> Path | None:
+    if source.logs_dir:
+        return Path(source.logs_dir).expanduser()
     if source.root:
         return Path(source.root).expanduser() / "logs"
     log_file = _resolve_log_file(source)
@@ -571,6 +584,12 @@ def _build_observation(
         f"{source.server_id}:{timestamp_ms}:{fingerprint}:{log_file.name}".encode("utf-8")
     ).hexdigest()[:20]
     tags = ["server_log", "runtime_log", level.lower()]
+    server_type = (source.server_type or "minecraft").lower()
+    if server_type == "velocity":
+        tags.append("velocity")
+        tags.append("proxy")
+    else:
+        tags.append("minecraft")
     lowered = content.lower()
     if "exception" in lowered:
         tags.append("exception")
@@ -592,6 +611,7 @@ def _build_observation(
             "level": level,
             "fingerprint": fingerprint,
             "compressed": log_file.name.lower().endswith(".gz"),
+            "serverType": server_type,
         },
     }
 
