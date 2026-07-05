@@ -149,6 +149,12 @@ class MineSentinelStorageConfig:
     include_raw: bool = False
     max_content_length: int = 4000
     dedupe_memory_limit: int = 100000
+    # PR9 hotfix v2: 旧 .idx 文件（无 #trust_legacy header）是否可信。
+    # True（默认）：旧 .idx 按 monotonic=True 处理，保持向后兼容。
+    # False：保守模式，旧 .idx 视为非单调，禁用 seek/early-break，
+    #        读取会全量扫描，性能下降但保证不漏日志。
+    # 新写入的 .idx 始终带 #trust_legacy\t1，不受此开关影响。
+    trust_legacy_index: bool = True
 
 
 @dataclass
@@ -253,6 +259,10 @@ class MineSentinelConfig:
                 dedupe_memory_limit=_positive_int(
                     storage_data.get("dedupe_memory_limit"),
                     100000,
+                ),
+                trust_legacy_index=_as_bool(
+                    storage_data.get("trust_legacy_index"),
+                    True,
                 ),
             ),
             runtime_log=MineSentinelRuntimeLogConfig(

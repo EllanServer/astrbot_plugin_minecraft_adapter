@@ -14,14 +14,23 @@ Optional header lines starting with ``#`` carry metadata. Currently
 recognized::
 
     #monotonic\t<0|1>
+    #trust_legacy\t<0|1>
 
 ``#monotonic\t0`` marks the file as having out-of-order timestamps;
 ``read_jsonl_window`` will then disable seek + early-break optimization
 for that file and fall back to a full scan with filter, so window reads
 never miss records even when the JSONL is not strictly time-ordered
 (e.g. backfill mixing multiple source files, log rotation races, or
-clock skew). When the header is absent the file is assumed monotonic
-(legacy behavior).
+clock skew).
+
+``#trust_legacy\t0`` marks the file as a legacy index (no monotonic
+guarantee for the rows between index entries). When set, the caller
+treats the file as non-monotonic even if the recorded index entries
+themselves are non-decreasing — because the absence of per-row tracking
+in older versions means we can't prove the rows *between* index points
+were ordered. New indexes written by this version always emit
+``#trust_legacy\t1`` once the first row is observed, indicating the
+per-row ``_last_seen_ts`` tracking is active.
 """
 
 from __future__ import annotations
@@ -39,11 +48,20 @@ class JsonlOffsetIndex:
     This keeps the index small (≈1 entry per 256 lines or per minute)
     while bounding the worst-case scan overshoot to at most one interval.
 
-    PR9 hotfix: ``maybe_index`` tracks whether the recorded timestamps
-    stay non-decreasing. As soon as an out-of-order timestamp is observed
-    the index is marked non-monotonic and persisted via ``#monotonic\\t0``;
-    ``seek_offset`` then returns 0 (scan from start) and the caller is
-    expected to skip the early-break optimization.
+    PR9 hotfix v2: ``maybe_index`` tracks ``_last_seen_ts`` — the maximum
+    timestamp seen across *all* rows, not just indexed ones. Every call
+    compares the incoming timestamp against ``_last_seen_ts`` and flips
+    ``_monotonic`` to False on any regression. This closes the gap where
+    out-of-order rows between two index entries would escape detection
+    (e.g. 1000 indexed → 1100/1200/1150 unindexed → 1150 > 1000 so the
+    old check passed).
+
+    Legacy ``.idx`` files written before this version have no
+    ``#trust_legacy`` header. On load they are treated as
+    non-monotonic-by-default unless ``trust_legacy_index=True`` is
+    configured, because we cannot prove the rows between index entries
+    were ordered. New indexes written by this version emit
+    ``#trust_legacy\t1`` once ``_last_seen_ts`` tracking is active.
     """
 
     DEFAULT_LINE_INTERVAL = 256
@@ -54,14 +72,23 @@ class JsonlOffsetIndex:
         index_path: Path,
         line_interval: int = DEFAULT_LINE_INTERVAL,
         time_interval_ms: int = DEFAULT_TIME_INTERVAL_MS,
+        trust_legacy_index: bool = True,
     ):
         self.index_path = index_path
         self.line_interval = max(1, int(line_interval))
         self.time_interval_ms = max(1, int(time_interval_ms))
+        # When False, a legacy .idx without #trust_legacy header is treated
+        # as non-monotonic (conservative). Default True keeps backward
+        # compatibility with existing deployments.
+        self.trust_legacy_index = bool(trust_legacy_index)
         # Parallel lists for bisect; kept sorted by timestamp (append-only).
         self._timestamps: list[int] = []
         self._offsets: list[int] = []
         self._last_indexed_ts: int = 0
+        # Max timestamp seen across ALL rows (indexed or not). Updated on
+        # every maybe_index() call. Used for strict per-row monotonicity
+        # detection that survives gaps between index entries.
+        self._last_seen_ts: int = 0
         self._lines_since_last_index: int = 0
         # How many entries have been persisted to disk. Entries beyond this
         # count are new and need to be flushed.
@@ -73,6 +100,16 @@ class JsonlOffsetIndex:
         # Whether the on-disk monotonic flag has been written. Used to
         # decide whether flush() needs to rewrite the header.
         self._monotonic_persisted: bool = True
+        # Whether the on-disk #trust_legacy header has been written.
+        # Initialized to None (unknown); load() sets True when the header
+        # is present (legacy or new persisted), and maybe_index() sets
+        # False on first call for a new file so flush() will write it.
+        self._trust_legacy_persisted: bool | None = None
+        # Whether per-row _last_seen_ts tracking is in effect for this
+        # index. True for any index created/written by this version;
+        # False for legacy .idx files without the #trust_legacy header
+        # (when trust_legacy_index=False, those are treated as non-monotonic).
+        self._trust_legacy: bool = True
 
     @classmethod
     def for_jsonl(
@@ -80,6 +117,7 @@ class JsonlOffsetIndex:
         jsonl_path: Path,
         line_interval: int = DEFAULT_LINE_INTERVAL,
         time_interval_ms: int = DEFAULT_TIME_INTERVAL_MS,
+        trust_legacy_index: bool = True,
     ) -> "JsonlOffsetIndex":
         """Create an index path that sits next to ``jsonl_path``.
 
@@ -89,6 +127,7 @@ class JsonlOffsetIndex:
             jsonl_path.with_suffix(".idx"),
             line_interval=line_interval,
             time_interval_ms=time_interval_ms,
+            trust_legacy_index=trust_legacy_index,
         )
 
     # ------------------------------------------------------------------
@@ -97,17 +136,33 @@ class JsonlOffsetIndex:
     def load(self) -> None:
         """Load existing index entries from disk (once).
 
-        Recognizes an optional ``#monotonic\t<0|1>`` header. Absent header
-        means monotonic=True (legacy behavior).
+        Recognizes optional headers:
+        - ``#monotonic\t<0|1>``: explicit monotonic flag.
+        - ``#trust_legacy\t<0|1>``: whether per-row ``_last_seen_ts``
+          tracking was active when the file was written.
+
+        Absent ``#monotonic`` header means monotonic=True (legacy).
+        Absent ``#trust_legacy`` header means the file is a legacy index;
+        when ``trust_legacy_index=False`` is configured, such files are
+        treated as non-monotonic because we cannot prove the rows between
+        index entries were ordered.
         """
         if self._loaded:
             return
         self._timestamps.clear()
         self._offsets.clear()
-        # Start optimistic; only flip to False if we see #monotonic\t0 or
-        # detect out-of-order entries while loading.
+        # Start optimistic; only flip to False if we see #monotonic\t0,
+        # detect out-of-order entries while loading, or encounter a legacy
+        # file without #trust_legacy header (when configured conservative).
         self._monotonic = True
         self._monotonic_persisted = True
+        self._trust_legacy = True
+        # After load, mark as persisted only if the header was actually
+        # present. None means "unknown / file not loaded / empty file" —
+        # maybe_index() will set False on first call for a new file.
+        self._trust_legacy_persisted: bool | None = None
+        saw_trust_legacy_header = False
+        saw_monotonic_header = False
         try:
             with self.index_path.open("r", encoding="utf-8") as handle:
                 for line in handle:
@@ -118,12 +173,21 @@ class JsonlOffsetIndex:
                         # Header line: parse metadata.
                         parts = raw.split("\t")
                         if len(parts) == 2 and parts[0] == "#monotonic":
+                            saw_monotonic_header = True
                             if parts[1] == "0":
                                 self._monotonic = False
                                 self._monotonic_persisted = True
                             elif parts[1] == "1":
                                 self._monotonic = True
                                 self._monotonic_persisted = True
+                        elif len(parts) == 2 and parts[0] == "#trust_legacy":
+                            saw_trust_legacy_header = True
+                            if parts[1] == "0":
+                                self._trust_legacy = False
+                                self._trust_legacy_persisted = True
+                            elif parts[1] == "1":
+                                self._trust_legacy = True
+                                self._trust_legacy_persisted = True
                         continue
                     parts = raw.split("\t")
                     if len(parts) != 2:
@@ -144,37 +208,69 @@ class JsonlOffsetIndex:
             pass
         except OSError:
             pass
+        # Legacy file: no #trust_legacy header → we cannot prove per-row
+        # ordering between index entries. When configured conservative,
+        # treat as non-monotonic so reads fall back to full scan.
+        if not saw_trust_legacy_header and not self._is_empty_after_load():
+            self._trust_legacy = self.trust_legacy_index
+            # Legacy file has no trust_legacy header on disk → mark as
+            # not persisted so flush() will write it on next write.
+            self._trust_legacy_persisted = False
+            if not self.trust_legacy_index:
+                # Conservative mode: legacy files are non-monotonic.
+                # Don't clobber an explicit #monotonic\t1 header though.
+                if not saw_monotonic_header:
+                    self._monotonic = False
+                    self._monotonic_persisted = False
+        elif saw_trust_legacy_header:
+            # Header was present on disk → already persisted.
+            self._trust_legacy_persisted = True
+        # If file is empty / new (no entries, no headers), leave
+        # _trust_legacy_persisted as None so maybe_index() will mark it
+        # False and trigger a header write on first flush.
         if self._timestamps:
             self._last_indexed_ts = self._timestamps[-1]
+            # _last_seen_ts starts at the last indexed ts; subsequent
+            # maybe_index() calls will track the true max across all rows.
+            self._last_seen_ts = self._timestamps[-1]
         self._persisted_count = len(self._timestamps)
         self._loaded = True
 
-    def flush(self) -> None:
-        """Persist new entries (and monotonic header if changed) to disk.
+    def _is_empty_after_load(self) -> bool:
+        """Helper used during load() before _loaded is set."""
+        return not self._timestamps
 
-        The monotonic flag is written as ``#monotonic\\t0`` at the top of
-        the file. Because the file is append-only, we only emit the header
-        when monotonicity flips to False for the first time after load —
-        in that case we rewrite the whole file (rare event, acceptable
-        cost). Subsequent flushes keep appending data rows.
+    def flush(self) -> None:
+        """Persist new entries (and headers if changed) to disk.
+
+        Headers written:
+        - ``#monotonic\\t0`` when monotonicity flips to False.
+        - ``#trust_legacy\\t1`` on first flush of a new file, indicating
+          per-row ``_last_seen_ts`` tracking is active.
+
+        Both headers require a full file rewrite (rare). Subsequent
+        flushes append data rows only.
         """
         if not self._loaded:
             self.load()
         new_count = len(self._timestamps) - self._persisted_count
         needs_header_rewrite = (
-            not self._monotonic and not self._monotonic_persisted
+            (not self._monotonic and not self._monotonic_persisted)
+            or (self._trust_legacy_persisted is False)
         )
         if new_count <= 0 and not needs_header_rewrite:
             return
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         if needs_header_rewrite:
-            # Rewrite the entire file with the header. Rare path.
+            # Rewrite the entire file with headers. Rare path.
             with self.index_path.open("w", encoding="utf-8") as handle:
-                handle.write("#monotonic\t0\n")
+                handle.write(f"#trust_legacy\t{1 if self._trust_legacy else 0}\n")
+                handle.write(f"#monotonic\t{1 if self._monotonic else 0}\n")
                 for ts, off in zip(self._timestamps, self._offsets):
                     handle.write(f"{ts}\t{off}\n")
             self._persisted_count = len(self._timestamps)
             self._monotonic_persisted = True
+            self._trust_legacy_persisted = True
             return
         with self.index_path.open("a", encoding="utf-8") as handle:
             for i in range(self._persisted_count, len(self._timestamps)):
@@ -191,22 +287,44 @@ class JsonlOffsetIndex:
         timestamp and its starting byte offset. Returns ``True`` if a
         new index entry was added.
 
-        PR9 hotfix: every call (not just indexed ones) checks whether
-        ``timestamp_ms`` is smaller than the last recorded timestamp.
-        If so the file is marked non-monotonic, which disables seek +
-        early-break on read so window queries never miss records.
+        PR9 hotfix v2: every call updates ``_last_seen_ts`` (the max
+        timestamp seen across ALL rows, not just indexed ones) and
+        compares the incoming timestamp against it. This catches
+        regressions that happen *between* index entries, which the
+        previous check against ``_last_indexed_ts`` would miss:
+
+            indexed ts=1000
+            row ts=1100 (not indexed)
+            row ts=1200 (not indexed)
+            row ts=1150 (not indexed)  ← regression vs 1200, but > 1000
+
+        With the old check (vs ``_last_indexed_ts``) this regression
+        escaped detection. With ``_last_seen_ts`` it is caught and the
+        file is marked non-monotonic.
         """
         # Ensure any existing on-disk entries are loaded before we append,
         # so we don't lose them when flush() writes only new entries.
         if not self._loaded:
             self.load()
-        # Monotonicity check on every line (cheap). Compare against the
-        # last *recorded* timestamp, not just the last *indexed* one, so
-        # we catch regressions even between index entries.
-        if self._last_indexed_ts > 0 and timestamp_ms < self._last_indexed_ts:
+        # Strict per-row monotonicity check: compare against the max
+        # timestamp seen across ALL rows, not just the last indexed one.
+        if self._last_seen_ts > 0 and timestamp_ms < self._last_seen_ts:
             if self._monotonic:
                 self._monotonic = False
                 self._monotonic_persisted = False
+        # Update _last_seen_ts to the running max. We use max (not just
+        # assignment) so that a regression doesn't lower the bar for
+        # future rows — once we've seen ts=1200, a later ts=1100 also
+        # counts as a regression even after we already flagged it.
+        if timestamp_ms > self._last_seen_ts:
+            self._last_seen_ts = timestamp_ms
+        # Mark that this index has per-row tracking active (new file).
+        # _trust_legacy_persisted is None (new/empty file) or False (legacy
+        # file without header); either way, set it to False so flush()
+        # will write the #trust_legacy\t1 header on next write.
+        if self._trust_legacy_persisted is None or not self._trust_legacy_persisted:
+            self._trust_legacy = True
+            self._trust_legacy_persisted = False  # will be written on flush
         self._lines_since_last_index += 1
         # Only compare time gap if we have a previous entry; otherwise
         # _last_indexed_ts == 0 would make time_gap == timestamp_ms (huge)

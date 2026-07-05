@@ -82,7 +82,10 @@ class DiskObservationStore:
                     handle = stack.enter_context(path.open("a", encoding="utf-8"))
                     handles[path] = handle
                     # Load or create the offset index sidecar for this file.
-                    idx = JsonlOffsetIndex.for_jsonl(path)
+                    idx = JsonlOffsetIndex.for_jsonl(
+                        path,
+                        trust_legacy_index=self.config.storage.trust_legacy_index,
+                    )
                     idx.load()
                     indexes[path] = idx
                 idx = indexes[path]
@@ -140,7 +143,10 @@ class DiskObservationStore:
         with self._dedupe_tracker() as seen:
             for path in self._candidate_files(server_id, cutoff_ms):
                 # 加载 .idx 偏移索引，让 read_jsonl_window 从 cutoff 附近 seek。
-                idx = JsonlOffsetIndex.for_jsonl(path)
+                idx = JsonlOffsetIndex.for_jsonl(
+                    path,
+                    trust_legacy_index=self.config.storage.trust_legacy_index,
+                )
                 idx.load()
                 for row in self.codec.read_jsonl_window(
                     path, cutoff_ms, end_ms, index=idx
@@ -224,7 +230,10 @@ class DiskObservationStore:
         with self._dedupe_tracker() as seen:
             with self._open_export(path) as handle:
                 for source_path in self._candidate_files(server_id, cutoff_ms):
-                    idx = JsonlOffsetIndex.for_jsonl(source_path)
+                    idx = JsonlOffsetIndex.for_jsonl(
+                        source_path,
+                        trust_legacy_index=self.config.storage.trust_legacy_index,
+                    )
                     idx.load()
                     for row in self.codec.read_jsonl_window(
                         source_path, cutoff_ms, end_ms, index=idx

@@ -163,6 +163,11 @@
             "type": "int",
             "description": "读取/导出窗口时去重 key 的内存上限",
             "default": 100000
+          },
+          "trust_legacy_index": {
+            "type": "bool",
+            "description": "旧 .idx 索引文件（无 #trust_legacy header）是否可信。true（默认）：按单调处理，性能优先；false：保守模式，视为非单调，全量扫描，保证不漏日志但性能下降。新写入的 .idx 始终可信，不受此开关影响。",
+            "default": true
           }
         }
       },

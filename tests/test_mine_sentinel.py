@@ -3420,5 +3420,157 @@ class MineSentinelPr9HotfixTests(unittest.TestCase):
         self.assertEqual(cfg.report.export_format, "jsonl.gz")
 
 
+class MineSentinelPr9HotfixV2Tests(unittest.TestCase):
+    """验证 PR9 hotfix v2 修复的核心漏洞：_last_seen_ts 严格非单调检测。
+
+    上一轮 hotfix 的 maybe_index() 只拿 timestamp 跟 _last_indexed_ts
+    比较，但 _last_indexed_ts 只在真正写入索引条目时更新。如果乱序
+    发生在两个索引点之间（1000 indexed → 1100/1200/1150 unindexed），
+    1150 > 1000 不会被检测到，文件仍被标记 monotonic，读取时 early
+    break 仍可能漏日志。
+
+    本测试组验证 _last_seen_ts 跨索引点严格跟踪，以及旧 .idx 文件
+    在 trust_legacy_index=False 时的保守处理。
+    """
+
+    def test_last_seen_ts_detects_regression_between_index_entries(self):
+        """乱序发生在两个索引点之间也应被检测到。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx = JsonlOffsetIndex(
+                Path(tmp_dir) / "test.idx",
+                line_interval=10,  # 每 10 行才索引一条
+                time_interval_ms=10_000_000,
+            )
+            idx.load()
+            self.assertTrue(idx.is_monotonic)
+            # 第一条被索引（line_interval=10，首行触发）
+            idx.maybe_index(1000, 0)
+            self.assertTrue(idx.is_monotonic)
+            # 接下来几条不触发索引，但 _last_seen_ts 应持续更新
+            idx.maybe_index(1100, 10)
+            idx.maybe_index(1200, 20)
+            self.assertTrue(idx.is_monotonic)
+            # 1150 < 1200（_last_seen_ts），即使 > 1000（_last_indexed_ts），
+            # 也应被检测为乱序
+            idx.maybe_index(1150, 30)
+            self.assertFalse(idx.is_monotonic)
+            # seek_offset 应返回 0
+            self.assertEqual(idx.seek_offset(900), 0)
+
+    def test_new_file_flushes_trust_legacy_header(self):
+        """新文件首次 flush 应写入 #trust_legacy\t1 头部。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx_path = Path(tmp_dir) / "test.idx"
+            idx = JsonlOffsetIndex(idx_path, line_interval=1, time_interval_ms=10_000_000)
+            idx.maybe_index(1000, 0)
+            idx.flush()
+            content = idx_path.read_text(encoding="utf-8")
+            self.assertIn("#trust_legacy\t1", content)
+            self.assertIn("#monotonic\t1", content)
+
+    def test_new_file_reload_keeps_monotonic_with_trust_legacy(self):
+        """带 #trust_legacy\t1 头部的文件 reload 后保持 monotonic。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx_path = Path(tmp_dir) / "test.idx"
+            idx = JsonlOffsetIndex(idx_path, line_interval=1, time_interval_ms=10_000_000)
+            idx.maybe_index(1000, 0)
+            idx.maybe_index(1100, 10)
+            idx.flush()
+            # reload
+            idx2 = JsonlOffsetIndex(idx_path, line_interval=1, time_interval_ms=10_000_000)
+            idx2.load()
+            self.assertTrue(idx2.is_monotonic)
+
+    def test_legacy_idx_without_header_treated_as_monotonic_by_default(self):
+        """默认 trust_legacy_index=True：旧 .idx 无 header 仍按 monotonic 处理。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx_path = Path(tmp_dir) / "test.idx"
+            # 模拟旧版本写入的 .idx（无任何 header）
+            idx_path.write_text("1000\t0\n1100\t10\n1200\t20\n", encoding="utf-8")
+            idx = JsonlOffsetIndex(idx_path, trust_legacy_index=True)
+            idx.load()
+            # 默认信任旧文件
+            self.assertTrue(idx.is_monotonic)
+            # seek_offset(1150) 应返回 offset 10（1100 那条的 byte offset），
+            # 因为 1150 落在 1100 和 1200 之间，seek 到 1100 的 offset。
+            self.assertEqual(idx.seek_offset(1150), 10)
+
+    def test_legacy_idx_conservative_mode_treats_as_non_monotonic(self):
+        """trust_legacy_index=False：旧 .idx 无 header 视为非单调。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx_path = Path(tmp_dir) / "test.idx"
+            # 模拟旧版本写入的 .idx（无任何 header，索引点本身单调）
+            idx_path.write_text("1000\t0\n1100\t10\n1200\t20\n", encoding="utf-8")
+            idx = JsonlOffsetIndex(idx_path, trust_legacy_index=False)
+            idx.load()
+            # 保守模式：无法证明索引点之间的行单调，视为非单调
+            self.assertFalse(idx.is_monotonic)
+            # seek_offset 返回 0，强制全扫
+            self.assertEqual(idx.seek_offset(1050), 0)
+
+    def test_legacy_idx_with_explicit_monotonic_header_respected(self):
+        """即使 trust_legacy_index=False，显式 #monotonic\t1 仍被尊重。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx_path = Path(tmp_dir) / "test.idx"
+            # 旧 .idx 但带显式 monotonic header（虽然是旧版本写的）
+            idx_path.write_text(
+                "#monotonic\t1\n1000\t0\n1100\t10\n1200\t20\n",
+                encoding="utf-8",
+            )
+            idx = JsonlOffsetIndex(idx_path, trust_legacy_index=False)
+            idx.load()
+            # 显式 header 优先于 trust_legacy_index 默认
+            self.assertTrue(idx.is_monotonic)
+
+    def test_read_window_uses_full_scan_for_legacy_conservative(self):
+        """trust_legacy_index=False + 旧 .idx：read_jsonl_window 不 early break。"""
+        _install_astrbot_stubs()
+        from services.mine_sentinel.storage.codec import ObservationRecordCodec
+        config = MineSentinelConfig.from_dict({"storage": {"trust_legacy_index": False}})
+        base_ts = int(time.time() * 1000)
+        # 构造 JSONL：第一条 ts 在窗口外（未来），第二条在窗口内
+        # 如果 early break，第二条会被漏掉
+        rows_data = [
+            {"eventId": "future", "timestamp": base_ts + 100_000, "serverId": "s", "content": "future"},
+            {"eventId": "in_window", "timestamp": base_ts - 10_000, "serverId": "s", "content": "in"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            jsonl_path = Path(tmp_dir) / "test.jsonl"
+            with jsonl_path.open("w", encoding="utf-8") as f:
+                for r in rows_data:
+                    f.write(json.dumps(r) + "\n")
+            # 旧 .idx 无 header，且 trust_legacy_index=False
+            idx_path = jsonl_path.with_suffix(".idx")
+            idx_path.write_text(
+                f"{base_ts + 100_000}\t0\n",
+                encoding="utf-8",
+            )
+            idx = JsonlOffsetIndex(
+                idx_path,
+                trust_legacy_index=config.storage.trust_legacy_index,
+            )
+            idx.load()
+            self.assertFalse(idx.is_monotonic)  # 保守模式
+            codec = ObservationRecordCodec(config)
+            cutoff = base_ts - 60_000
+            end = base_ts + 1
+            rows = list(codec.read_jsonl_window(jsonl_path, cutoff, end, index=idx))
+            ids = [r["eventId"] for r in rows]
+            # 必须包含 in_window，即使它出现在 future 之后
+            self.assertIn("in_window", ids)
+
+    def test_trust_legacy_index_config_propagates_to_store(self):
+        """storage.trust_legacy_index 配置应能从 from_dict 解析。"""
+        _install_astrbot_stubs()
+        from services.mine_sentinel.models import MineSentinelConfig
+        cfg = MineSentinelConfig.from_dict({
+            "storage": {"trust_legacy_index": False},
+        })
+        self.assertFalse(cfg.storage.trust_legacy_index)
+        # 默认值
+        cfg2 = MineSentinelConfig.from_dict({})
+        self.assertTrue(cfg2.storage.trust_legacy_index)
+
+
 if __name__ == "__main__":
     unittest.main()
