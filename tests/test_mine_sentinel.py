@@ -777,6 +777,42 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
         self.assertIsInstance(otel["attributes"], dict)
         self.assertEqual(otel["attributes"]["template.id"], "T1")
 
+    def test_read_jsonl_window_end_ms_is_exclusive(self):
+        """read_jsonl_window 的 end_ms 应是右开边界：ts == end_ms 的行不包含在窗口内。
+
+        PR8 修复：之前代码用 ``ts > end_ms`` 判断（即 ts == end_ms 仍 yield），
+        与注释 ``[cutoff_ms, end_ms)`` 语义不一致。现在改为 ``ts >= end_ms``。
+        """
+        from services.mine_sentinel.storage.codec import ObservationRecordCodec
+
+        config = MineSentinelConfig.from_dict({})
+        codec = ObservationRecordCodec(config)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "window.jsonl"
+            # 写入 5 行，timestamp 分别为 1000/2000/3000/4000/5000
+            rows = [{"timestamp": ts, "content": f"line-{ts}"} for ts in range(1000, 6000, 1000)]
+            with path.open("w", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(row) + "\n")
+
+            # 窗口 [2000, 4000)：应只包含 2000 和 3000，不含 4000
+            collected = list(codec.read_jsonl_window(path, cutoff_ms=2000, end_ms=4000))
+            timestamps = [r["timestamp"] for r in collected]
+            self.assertEqual(timestamps, [2000, 3000], f"end_ms 应是右开，实际 {timestamps}")
+            # 4000 不应出现
+            self.assertNotIn(4000, timestamps, "ts == end_ms 不应在窗口内")
+
+            # 窗口 [1000, 5000)：应包含 1000/2000/3000/4000，不含 5000
+            collected = list(codec.read_jsonl_window(path, cutoff_ms=1000, end_ms=5000))
+            timestamps = [r["timestamp"] for r in collected]
+            self.assertEqual(timestamps, [1000, 2000, 3000, 4000])
+            self.assertNotIn(5000, timestamps)
+
+            # end_ms=None：包含到文件末尾
+            collected = list(codec.read_jsonl_window(path, cutoff_ms=3000, end_ms=None))
+            timestamps = [r["timestamp"] for r in collected]
+            self.assertEqual(timestamps, [3000, 4000, 5000])
+
     def test_ai_prompt_includes_anomaly_evidence(self):
         """AI prompt 应当包含预计算的异常证据，而非让 LLM 重新检测。"""
         from services.mine_sentinel.reporting.ai_prompt import AIReportPromptBuilder

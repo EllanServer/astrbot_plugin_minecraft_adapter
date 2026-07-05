@@ -117,7 +117,9 @@ class DiskObservationStore:
         cutoff_ms = int((now - window_minutes * 60) * 1000)
         # window end bound = now; lets read_jsonl_window stop scanning a file
         # once it encounters records beyond the window upper bound.
-        end_ms = int(now * 1000)
+        # +1ms 余量：read_jsonl_window 的 end_ms 是右开边界（ts >= end_ms break），
+        # 当前时刻写入的记录 timestamp == int(now*1000) 不应被排除。
+        end_ms = int(now * 1000) + 1
         limit = max(1, max_records or self.config.report.max_records_in_memory)
         builder = RecentWindowBuilder(limit)
         with self._dedupe_tracker() as seen:
@@ -168,7 +170,9 @@ class DiskObservationStore:
 
         now_ts = int(time.time())
         cutoff_ms = int((now_ts - window_minutes * 60) * 1000)
-        end_ms = int(now_ts * 1000)
+        # +1ms 余量：read_jsonl_window 的 end_ms 是右开边界（ts >= end_ms break），
+        # 当前时刻写入的记录不应被排除。
+        end_ms = int(now_ts * 1000) + 1
         path = export_path(self.export_dir, window_minutes, server_id, label, now_ts)
 
         written = 0
