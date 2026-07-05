@@ -79,7 +79,14 @@ class DiskObservationStore:
                 handle = handles.get(path)
                 if handle is None:
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    handle = stack.enter_context(path.open("a", encoding="utf-8"))
+                    # PR9 hotfix v3: 用二进制 append 模式打开。
+                    # 文本模式的 tell() 返回 TextIO cookie，不应被当作
+                    # 二进制 byte offset 用于 read_jsonl_window 的 seek()。
+                    # UTF-8 中文日志、不同换行处理、缓冲状态下 cookie 与
+                    # raw byte offset 不一致，会导致 seek 到错误位置，
+                    # 轻则读到半截 JSON 行被 JSONDecodeError 跳过，
+                    # 重则窗口报告漏日志。
+                    handle = stack.enter_context(path.open("ab"))
                     handles[path] = handle
                     # Load or create the offset index sidecar for this file.
                     idx = JsonlOffsetIndex.for_jsonl(
@@ -90,10 +97,13 @@ class DiskObservationStore:
                     indexes[path] = idx
                 idx = indexes[path]
                 # Record the byte offset of this line's start before writing.
+                # binary handle.tell() 返回真实 byte offset，与
+                # read_jsonl_window 的 binary seek 一致。
                 line_offset = handle.tell()
                 idx.maybe_index(record.timestamp, line_offset)
-                handle.write(self.codec.json_line(record))
-                handle.write("\n")
+                # 写入 UTF-8 编码的 JSON 行 + 换行。
+                handle.write(self.codec.json_line(record).encode("utf-8"))
+                handle.write(b"\n")
                 written += 1
 
             # Flush all touched indexes so reads can use them immediately.

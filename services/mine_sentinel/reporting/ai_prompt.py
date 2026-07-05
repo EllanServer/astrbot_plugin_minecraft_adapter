@@ -153,18 +153,23 @@ class AIReportPromptBuilder:
         anomalies = snapshot.get("anomalies") or []
         if not anomalies:
             return []
-        # 按 template_id 分组记录，便于取代表样本
-        records_by_template: dict[str, list[ObservationRecord]] = {}
+        # PR9 hotfix v3: 按 (server_id, template_id) 分组记录。
+        # template_miner 已按 server namespace 隔离，不同 server 的
+        # Drain3 cluster id 都从 1、2、3 开始，仅按 template_id 分组
+        # 会让 survival 的异常附上 creative 的日志样本。
+        records_by_template: dict[tuple[str, str], list[ObservationRecord]] = {}
         for record in records:
             ctx = record.context or {}
             tid = str(ctx.get("templateId") or "")
             if tid:
-                records_by_template.setdefault(tid, []).append(record)
+                key = (str(record.server_id or ""), tid)
+                records_by_template.setdefault(key, []).append(record)
 
         evidence: list[dict[str, Any]] = []
         for anomaly in anomalies[:MAX_ANOMALY_EVIDENCE]:
             tid = anomaly.get("template_id") or ""
-            samples = records_by_template.get(tid, [])
+            server_id = str(anomaly.get("server_id") or "")
+            samples = records_by_template.get((server_id, tid), [])
             # 取最近几条作为代表样本
             sample_texts: list[str] = []
             for record in samples[-MAX_ANOMALY_SAMPLES:]:
