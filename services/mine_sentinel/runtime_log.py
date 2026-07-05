@@ -424,14 +424,26 @@ class MineSentinelRuntimeLogTailer:
         state.missing_logged = False
 
         if size < state.position:
+            # 日志轮转：旧文件被截断/重命名，新文件从头开始。
+            # PR9 hotfix: 不要直接清空 backlog——未处理的旧行应继续被 drain。
+            # partial_line 是旧文件最后一条未闭合的行，轮转意味着旧文件已 EOF，
+            # 把它作为完整行追加到 backlog（避免与新文件首行拼接产生垃圾）。
+            had_pending = bool(state.backlog) or bool(state.partial_line)
+            if state.partial_line:
+                state.backlog.append(state.partial_line)
+                state.partial_line = ""
+                state.partial = ""
             await self._backfill_source(
                 state,
                 max(10, self.config.poll_interval_seconds * 3 // 60 + 1),
             )
             state.position = 0
-            state.partial = ""
-            state.partial_line = ""
-            state.backlog.clear()
+            if had_pending:
+                logger.info(
+                    f"[MineSentinel] runtime log {state.source.server_id} "
+                    f"rotated; {len(state.backlog)} pending backlog line(s) "
+                    f"will be drained before reading new file content."
+                )
         if size == state.position and not state.has_pending:
             # 无新数据且无 backlog：本轮无事可做。
             # 注意：如果有 backlog 未处理，即使文件没新数据也必须继续，
@@ -769,16 +781,23 @@ def _read_backfill_lines(
 # 同一个 .log.gz 文件内容不会变化（归档后只读），同一进程内对同一小时
 # 重复扫描会浪费 CPU 和磁盘 IO。缓存键 (path, mtime, hour_start_ms)，
 # 命中时直接复用上次结果。latest.log 不缓存（实时增长）。
-# 上限：避免长期运行内存膨胀，超过 _GZ_SCAN_CACHE_MAX_BYTES 时清空最旧条目。
+# PR9 hotfix: 改用 OrderedDict 实现 LRU 淘汰，命中时移到末尾（最近使用），
+# 上限超过时弹出最旧（最久未用）条目，替代原来按 key 字典序保留的粗略策略。
+from collections import OrderedDict as _OrderedDict
+
 _GZ_SCAN_CACHE_MAX_ENTRIES = 64
-_gz_scan_cache: dict[tuple[str, int, int], list[tuple[str, int, str]]] = {}
+_gz_scan_cache: _OrderedDict[tuple[str, int, int], list[tuple[str, int, str]]] = _OrderedDict()
 
 
 def _gz_scan_cache_get(
     path: Path, mtime: int, hour_start_ms: int
 ) -> list[tuple[str, int, str]] | None:
     key = (str(path), mtime, hour_start_ms)
-    return _gz_scan_cache.get(key)
+    value = _gz_scan_cache.get(key)
+    if value is not None:
+        # LRU: 命中时移到末尾（最近使用）。
+        _gz_scan_cache.move_to_end(key)
+    return value
 
 
 def _gz_scan_cache_put(
@@ -787,12 +806,15 @@ def _gz_scan_cache_put(
     hour_start_ms: int,
     rows: list[tuple[str, int, str]],
 ) -> None:
-    if len(_gz_scan_cache) >= _GZ_SCAN_CACHE_MAX_ENTRIES:
-        # 简单淘汰：清空最旧的一半。.gz 扫描结果较小，逐条 LRU 收益有限。
-        keep = sorted(_gz_scan_cache.items())[: _GZ_SCAN_CACHE_MAX_ENTRIES // 2]
-        _gz_scan_cache.clear()
-        _gz_scan_cache.update(keep)
     key = (str(path), mtime, hour_start_ms)
+    if key in _gz_scan_cache:
+        # 已存在：更新值并移到末尾。
+        _gz_scan_cache[key] = rows
+        _gz_scan_cache.move_to_end(key)
+        return
+    while len(_gz_scan_cache) >= _GZ_SCAN_CACHE_MAX_ENTRIES:
+        # LRU 淘汰：弹出最旧（最久未用）的条目。
+        _gz_scan_cache.popitem(last=False)
     _gz_scan_cache[key] = rows
 
 
@@ -925,7 +947,11 @@ def build_hour_observations(
     Does not write to disk; the caller decides what to do with the result.
     """
     rows = read_hour_log_lines(
-        source, hour_start_ms, hour_end_ms, max_lines=max_lines
+        source,
+        hour_start_ms,
+        hour_end_ms,
+        max_lines=max_lines,
+        max_line_length=max_line_length,
     )
     if not rows:
         return []

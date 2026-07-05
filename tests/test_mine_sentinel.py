@@ -3214,5 +3214,211 @@ class MineSentinelGzScanCacheTests(unittest.TestCase):
             self.assertEqual(rows, [])
 
 
+class MineSentinelPr9HotfixTests(unittest.TestCase):
+    """验证 PR9 hotfix 修复的正确性风险。"""
+
+    def test_offset_index_detects_non_monotonic_and_disables_seek(self):
+        """非单调时间戳应被检测并标记，seek_offset 返回 0。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx = JsonlOffsetIndex(
+                Path(tmp_dir) / "test.idx",
+                line_interval=1,  # 每行都索引
+                time_interval_ms=10_000_000,
+            )
+            idx.load()
+            self.assertTrue(idx.is_monotonic)
+            # 单调递增
+            idx.maybe_index(1000, 0)
+            idx.maybe_index(1100, 10)
+            self.assertTrue(idx.is_monotonic)
+            # 时间戳回退 → 标记非单调
+            idx.maybe_index(900, 20)
+            self.assertFalse(idx.is_monotonic)
+            # seek_offset 应返回 0（禁用 seek）
+            self.assertEqual(idx.seek_offset(950), 0)
+
+    def test_offset_index_persists_non_monotonic_header(self):
+        """非单调标记应持久化到 .idx 文件头部，重载后仍生效。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx_path = Path(tmp_dir) / "test.idx"
+            idx = JsonlOffsetIndex(idx_path, line_interval=1, time_interval_ms=10_000_000)
+            idx.maybe_index(1000, 0)
+            idx.maybe_index(900, 10)  # 时间戳回退，触发非单调
+            idx.flush()
+            # 文件应包含 #monotonic\t0 头部
+            content = idx_path.read_text(encoding="utf-8")
+            self.assertIn("#monotonic\t0", content)
+            # 重新加载
+            idx2 = JsonlOffsetIndex(idx_path, line_interval=1, time_interval_ms=10_000_000)
+            idx2.load()
+            self.assertFalse(idx2.is_monotonic)
+
+    def test_read_jsonl_window_does_not_break_on_non_monotonic(self):
+        """非单调文件中，窗口内记录出现在 end_ms 之后时不应被漏掉。"""
+        config = MineSentinelConfig.from_dict({})
+        base_ts = int(time.time() * 1000)
+        # 构造非单调 JSONL：第一条 ts=base_ts+100s（超出窗口），
+        # 第二条 ts=base_ts-10s（窗口内），第三条 ts=base_ts+200s（超出窗口）
+        rows_data = [
+            {"eventId": "future1", "timestamp": base_ts + 100_000, "serverId": "s", "content": "future1"},
+            {"eventId": "in_window", "timestamp": base_ts - 10_000, "serverId": "s", "content": "in"},
+            {"eventId": "future2", "timestamp": base_ts + 200_000, "serverId": "s", "content": "future2"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            jsonl_path = Path(tmp_dir) / "test.jsonl"
+            with jsonl_path.open("w", encoding="utf-8") as f:
+                for r in rows_data:
+                    f.write(json.dumps(r) + "\n")
+            # 标记为非单调的索引
+            idx = JsonlOffsetIndex.for_jsonl(jsonl_path)
+            idx.load()
+            idx._monotonic = False
+            idx._monotonic_persisted = True
+            cutoff = base_ts - 60_000
+            end = base_ts + 1
+            from services.mine_sentinel.storage.codec import ObservationRecordCodec
+            codec = ObservationRecordCodec(config)
+            rows = list(codec.read_jsonl_window(jsonl_path, cutoff, end, index=idx))
+            # 必须包含 in_window，即使它出现在 future1 之后
+            ids = [r["eventId"] for r in rows]
+            self.assertIn("in_window", ids)
+
+    def test_export_path_label_always_in_filename(self):
+        """label 非空时始终加入文件名，即使基础路径不存在。"""
+        from services.mine_sentinel.storage.paths import export_path
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            export_dir = Path(tmp_dir) / "exports"
+            export_dir.mkdir()
+            # 第一次调用，基础路径不存在
+            p1 = export_path(export_dir, 30, "srv", label="alert", now=1700000000)
+            self.assertIn("alert", p1.name)
+            # 无 label 时不包含
+            p2 = export_path(export_dir, 30, "srv", label="", now=1700000000)
+            self.assertNotIn("alert", p2.name)
+            # 不同 label 生成不同文件名
+            p3 = export_path(export_dir, 30, "srv", label="manual", now=1700000000)
+            self.assertNotEqual(p1.name, p3.name)
+
+    def test_rotation_preserves_backlog(self):
+        """文件轮转时 backlog 不应被清空，partial_line 提升为完整行。"""
+        _install_astrbot_stubs()
+        from services.mine_sentinel.runtime_log import (
+            MineSentinelRuntimeLogTailer,
+            MineSentinelRuntimeLogConfig,
+            _SourceState,
+        )
+        from services.mine_sentinel.models import MineSentinelLogSourceConfig
+        collected = []
+
+        async def batch_handler(server_id, payload):
+            for obs in payload.get("observations", []):
+                collected.append(obs)
+
+        async def io_runner(fn, *args):
+            return fn(*args)
+
+        config = MineSentinelRuntimeLogConfig(
+            enabled=True,
+            poll_interval_seconds=1,
+            max_lines_per_poll=2,
+            max_bytes_per_poll=4096,
+            backfill_on_start=False,
+            initial_lines=0,
+        )
+        source = MineSentinelLogSourceConfig(
+            server_id="srv",
+            server_type="minecraft",
+            log_file=None,
+            root=None,
+            logs_dir=None,
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "latest.log"
+            # 写入 5 行，max_lines_per_poll=2，会产生 3 行 backlog
+            log_path.write_text(
+                "[12:00:00 INFO]: line 0\n"
+                "[12:00:01 INFO]: line 1\n"
+                "[12:00:02 INFO]: line 2\n"
+                "[12:00:03 INFO]: line 3\n"
+                "[12:00:04 INFO]: line 4\n",
+                encoding="utf-8",
+            )
+            tailer = MineSentinelRuntimeLogTailer(config, batch_handler, io_runner=io_runner)
+            state = _SourceState(source=source, log_file=log_path)
+            state.position = 0  # 从头读，模拟首轮 poll
+
+            async def run():
+                await tailer._poll_source(state)
+                # 第一轮：读 5 行，前 2 进 lines，后 3 进 backlog
+                self.assertEqual(
+                    len(state.backlog), 3,
+                    f"首轮应产生 3 行 backlog，实际 {len(state.backlog)}",
+                )
+                # 模拟轮转：文件截断为更小内容
+                log_path.write_text("[13:00:00 INFO]: new file\n", encoding="utf-8")
+                await tailer._poll_source(state)
+                # 轮转后 backlog 应保留（不被清空），position 归零
+                self.assertGreater(len(state.backlog), 0, "轮转后 backlog 不应被清空")
+                self.assertEqual(state.position, 0)
+
+            asyncio.run(run())
+
+    def test_gz_scan_cache_lru_eviction(self):
+        """LRU 缓存满时应淘汰最久未用的条目，而非按 key 字典序。"""
+        _install_astrbot_stubs()
+        from services.mine_sentinel.runtime_log import (
+            _gz_scan_cache,
+            _gz_scan_cache_get,
+            _gz_scan_cache_put,
+            _GZ_SCAN_CACHE_MAX_ENTRIES,
+        )
+        _gz_scan_cache.clear()
+        try:
+            # 填满缓存
+            for i in range(_GZ_SCAN_CACHE_MAX_ENTRIES):
+                _gz_scan_cache_put(Path(f"/a/{i}.log.gz"), i, 0, [(f"line{i}", 0, f"/a/{i}.log.gz")])
+            self.assertEqual(len(_gz_scan_cache), _GZ_SCAN_CACHE_MAX_ENTRIES)
+            # 访问第 0 个（最旧），使其变最近使用
+            _gz_scan_cache_get(Path("/a/0.log.gz"), 0, 0)
+            # 插入新条目，应淘汰最久未用的（第 1 个，而非第 0 个）
+            _gz_scan_cache_put(Path("/a/new.log.gz"), 99, 0, [("new", 0, "/a/new.log.gz")])
+            self.assertEqual(len(_gz_scan_cache), _GZ_SCAN_CACHE_MAX_ENTRIES)
+            # 第 0 个应仍存在（最近访问过）
+            self.assertIsNotNone(_gz_scan_cache_get(Path("/a/0.log.gz"), 0, 0))
+            # 第 1 个应被淘汰（最久未用）
+            self.assertIsNone(_gz_scan_cache_get(Path("/a/1.log.gz"), 0, 0))
+        finally:
+            _gz_scan_cache.clear()
+
+    def test_enum_validation_invalid_export_format_falls_back(self):
+        """非法 export_format 应回退到默认 jsonl。"""
+        _install_astrbot_stubs()
+        from services.mine_sentinel.models import MineSentinelConfig
+        cfg = MineSentinelConfig.from_dict({
+            "report": {"export_format": "csv"},
+        })
+        self.assertEqual(cfg.report.export_format, "jsonl")
+
+    def test_enum_validation_invalid_template_parse_mode_falls_back(self):
+        """非法 template_parse_mode 应回退到默认 all。"""
+        _install_astrbot_stubs()
+        from services.mine_sentinel.models import MineSentinelConfig
+        cfg = MineSentinelConfig.from_dict({
+            "runtime_log": {"template_parse_mode": "verbose"},
+        })
+        self.assertEqual(cfg.runtime_log.template_parse_mode, "all")
+
+    def test_enum_validation_valid_values_preserved(self):
+        """合法的枚举值应被保留（大小写不敏感）。"""
+        _install_astrbot_stubs()
+        from services.mine_sentinel.models import MineSentinelConfig
+        cfg = MineSentinelConfig.from_dict({
+            "runtime_log": {"template_parse_mode": "Interesting"},
+            "report": {"export_format": "JSONL.GZ"},
+        })
+        self.assertEqual(cfg.runtime_log.template_parse_mode, "interesting")
+        self.assertEqual(cfg.report.export_format, "jsonl.gz")
+
+
 if __name__ == "__main__":
     unittest.main()
