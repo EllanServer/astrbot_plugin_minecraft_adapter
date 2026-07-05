@@ -121,15 +121,40 @@ hourly 模式会自动遍历 `logs/` 目录里的 `latest.log` 和所有 `.log.g
 
 报告正文默认渲染为 PNG；如果图片组件或字体加载失败，会自动回退为文本。完整窗口记录会导出到 `mine_sentinel/exports/*.jsonl` 并尝试作为群文件附件发送，方便管理员复核原始日志。
 
-分类包括：
+分类采用 Minecraft 服务器运营诊断体系，共 12 类，按固定优先级匹配（高优先级先命中）：
 
-- `bug`：ERROR、Exception、插件加载失败、崩溃等。
-- `complaint`：TPS、卡顿、超时、Can't keep up、Overloaded 等性能/可用性日志。
-- `community`：社区管理事件，如封禁、踢出、禁言、举报、刷屏、作弊、破坏。
-- `moderation`：权限、登录、白名单、认证相关日志。
-- `economy`：经济、商店、Vault、金币等相关日志。
-- `cross_server`：Velocity、proxy、backend、跨服转发相关日志。
-- `daily`：普通启动、停止和信息日志。
+```
+community > chat_review > player_feedback > community_ops
+         > complaint > network > plugin > cross_server
+         > moderation > bug > economy > daily
+```
+
+| 分类 | 含义 |
+|------|------|
+| `community` | 封禁、踢出、禁言、作弊、外挂、反作弊（anticheat/VL/xray/kill aura） |
+| `chat_review` | 聊天审查：辱骂、广告、骚扰、刷屏、威胁、隐私泄露（discord.gg/开盒/人肉） |
+| `player_feedback` | 玩家建议、功能请求（建议/希望/能不能/加个/优化/改进） |
+| `community_ops` | 社区运营：活动、公告、奖励、投票、赛季、比赛 |
+| `complaint` | 性能投诉：Can't keep up、Overloaded、TPS、MSPT、卡顿、延迟 |
+| `network` | 网络/连接：connection reset、broken pipe、io.netty、socket、断连 |
+| `plugin` | 插件：could not load/enable、dependency、softdepend、加载失败 |
+| `cross_server` | 跨服/代理：Velocity、BungeeCord、proxy、forwarding、server switch |
+| `moderation` | 权限/登录：whitelist、permission、auth、login、UUID、正版验证 |
+| `bug` | 服务端异常：error、exception、failed、crash、NPE、报错、崩溃 |
+| `economy` | 经济：Vault、shop、money、balance、trade、拍卖、金币 |
+| `daily` | 日常：started/stopped/done/join/quit/connected/disconnected |
+| `suggestion` | AI 补充建议分类，默认无关键词，由 LLM 按需写入 |
+
+**严重级别**：
+
+- `critical`：fatal/severe/crash、OutOfMemoryError、watchdog、server stopped、tick took too long、代理/后端大面积不可用 —— 直接告警，不受 `min_evidence_count` 限制。
+- `high`：循环刷屏（loop_suppressed）、ERROR≥2、PERFORMANCE≥3、NETWORK≥5、插件加载失败、多服务器/多后端受影响、chat_review 命中威胁/隐私、community_ops 活动事故。
+- `medium`：单条 ERROR、WARN≥2、单次性能警告、网络异常、权限/登录异常、单次聊天违规、3 条以上同类玩家建议。
+- `low`：单条 WARN、普通 daily、单个玩家 join/quit、普通玩家建议、普通活动公告 —— 不告警。
+
+**告警策略**：critical 直告；high 默认 `evidence_count >= 3` 告警；medium 仅在影响多服务器/多后端或证据数较多时告警；low 不告警。`chat_review` 默认不告警，除非 severity≥high、evidence_count≥5 或命中威胁/隐私敏感词；`player_feedback` 通常不告警，仅进入运营待办；`community_ops` 仅 high/critical 才告警。
+
+**推荐动作**按分类细化：plugin 查依赖和版本、network 查代理连通性和转发配置、community 交社区管理流程复核、chat_review 优先处理威胁/隐私、critical 查 latest.log 和崩溃报告并评估回滚。详细规则见 [services/mine_sentinel/reporting/rules.py](services/mine_sentinel/reporting/rules.py)。
 
 ## 部署提示词
 
