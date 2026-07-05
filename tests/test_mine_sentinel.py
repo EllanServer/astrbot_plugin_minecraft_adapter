@@ -1127,12 +1127,12 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
 class MineSentinelRulesTests(unittest.TestCase):
     """Tests for the refactored rules engine: network/plugin categories and critical direct alert."""
 
-    def _make_record(self, content, level="INFO", server_id="survival", tags=None, context=None):
+    def _make_record(self, content, level="INFO", server_id="survival", tags=None, context=None, timestamp=None):
         now = int(time.time() * 1000)
         return ObservationRecord(
             event_id=f"log-{abs(hash(content)) % 10_000_000}",
             kind="SERVER_LOG",
-            timestamp=now,
+            timestamp=timestamp if timestamp is not None else now,
             server_id=server_id,
             server_name=server_id.capitalize(),
             content=content,
@@ -2081,25 +2081,26 @@ class MineSentinelRulesTests(unittest.TestCase):
         keywords = {item["keyword"] for item in topics["top_keywords"]}
         self.assertIn("hello", keywords)
 
-    def test_chat_topics_review_evidence_includes_spam_and_keyword_hits(self):
-        """chat_topics.review_evidence 应包含 chat_spam 和 chat_review 关键词命中的聊天原文。
+    def test_chat_topics_review_evidence_includes_flood_and_keyword_hits(self):
+        """chat_topics.review_evidence 应包含 chat_flood 刷屏和 chat_review 关键词命中的聊天原文。
 
-        PR10: LLM 需要 chat_summary 字段贴出聊天原文上下文，便于管理员复核。
-        review_evidence 结构化呈现 player/message/spam_type/reason/hit_keys/time_text。
+        PR10 v2: 刷屏是玩家级时间窗口聚合行为，参与刷屏的记录被打 chat_flood 标签。
+        review_evidence 结构化呈现 player/message/flood_types/reason/hit_keys/time_text。
         """
         config = MineSentinelConfig.from_dict({})
         builder = HeuristicReportBuilder(config)
+        base_ts = 1700000000000
         records = [
-            # 1. 刷屏记录（chat_spam 标签）
-            self._make_record(
-                "[Async Chat Thread/INFO]: <Spammer> qqqqqqqqqqqqqqqqqqqqqqqwq",
-                tags=["server_log", "chat_message", "chat_spam"],
-                context={
-                    "chatPlayer": "Spammer",
-                    "chatMessage": "qqqqqqqqqqqqqqqqqqqqqqqwq",
-                    "chatSpamType": "repeat_char",
-                },
-            ),
+            # 1. 刷屏记录：Spammer 5 分钟内发 3 条相同消息（重复刷屏）
+            *[
+                self._make_record(
+                    "[Async Chat Thread/INFO]: <Spammer> 加群啊",
+                    tags=["server_log", "chat_message"],
+                    context={"chatPlayer": "Spammer", "chatMessage": "加群啊"},
+                    timestamp=base_ts + i * 60000,
+                )
+                for i in range(3)
+            ],
             # 2. URL 命中（chat_review 关键词）
             self._make_record(
                 "[Async Chat Thread/INFO]: <AdBot> 加入群 discord.gg/xxxxxxx",
@@ -2108,29 +2109,119 @@ class MineSentinelRulesTests(unittest.TestCase):
                     "chatPlayer": "AdBot",
                     "chatMessage": "加入群 discord.gg/xxxxxxx",
                 },
+                timestamp=base_ts,
             ),
             # 3. 普通聊天（不应进 review_evidence）
             self._make_record(
                 "[Async Chat Thread/INFO]: <Steve> hello world",
                 tags=["server_log", "chat_message"],
                 context={"chatPlayer": "Steve", "chatMessage": "hello world"},
+                timestamp=base_ts,
             ),
         ]
         report = builder.build(records, 60, "survival")
         review_evidence = report["chat_topics"]["review_evidence"]
-        # 应有 2 条证据（刷屏 + URL），普通聊天不进
-        self.assertEqual(len(review_evidence), 2)
-        # 第一条：刷屏
-        spam_ev = review_evidence[0]
-        self.assertEqual(spam_ev["player"], "Spammer")
-        self.assertEqual(spam_ev["message"], "qqqqqqqqqqqqqqqqqqqqqqqwq")
-        self.assertEqual(spam_ev["spam_type"], "repeat_char")
-        self.assertEqual(spam_ev["reason"], "spam")
-        # 第二条：URL 关键词命中
-        url_ev = review_evidence[1]
+        # 应有刷屏证据（3 条 Spammer 重复消息）+ 1 条 URL 关键词命中
+        flood_evs = [ev for ev in review_evidence if ev.get("reason") == "flood"]
+        keyword_evs = [ev for ev in review_evidence if ev.get("reason") == "keyword"]
+        self.assertGreater(len(flood_evs), 0, "应有刷屏证据")
+        self.assertGreater(len(keyword_evs), 0, "应有 URL 关键词命中证据")
+        # URL 证据应命中 discord.gg
+        url_ev = next(ev for ev in keyword_evs if "discord.gg" in ev.get("hit_keys", []))
         self.assertEqual(url_ev["player"], "AdBot")
-        self.assertEqual(url_ev["reason"], "keyword")
-        self.assertIn("discord.gg", url_ev["hit_keys"])
+
+    def test_chat_flood_high_frequency_detected(self):
+        """同一玩家 30 秒内发送 >=8 条消息应识别为高频刷屏（high_frequency）。
+
+        PR10 v2: 刷屏=同一ID短时间集中发送大量重复/相似信息。
+        阈值 30 秒 8 条（轰炸级别），避免误判活跃玩家（60 秒 5 条是正常活跃）。
+        """
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        # Spammer 在 28 秒内发 8 条消息（高频刷屏/轰炸）
+        base_ts = 1700000000000
+        records = []
+        for i in range(8):
+            records.append(self._make_record(
+                f"[Async Chat Thread/INFO]: <Spammer> spam {i}",
+                level="INFO",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Spammer", "chatMessage": f"spam {i}"},
+                timestamp=base_ts + i * 4000,  # 每 4 秒一条，8 条共 28 秒
+            ))
+        report = builder.build(records, 60, "survival")
+        flood_players = report["chat_topics"].get("flood_players") or []
+        self.assertTrue(flood_players, "应检测到刷屏玩家")
+        spammer = next((p for p in flood_players if p["player"] == "Spammer"), None)
+        self.assertIsNotNone(spammer, "Spammer 应在刷屏玩家列表中")
+        self.assertIn("high_frequency", spammer["flood_types"])
+
+    def test_chat_flood_high_frequency_not_triggered_for_normal_active_player(self):
+        """活跃玩家 60 秒内发 5 条不同内容消息不应被误判为高频刷屏。
+
+        验证：5 条不同内容消息在 60 秒内，低于 high_frequency 阈值（30秒8条），
+        不应触发刷屏。
+        """
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        records = []
+        for i in range(5):
+            records.append(self._make_record(
+                f"[Async Chat Thread/INFO]: <ActivePlayer> message {i} about game",
+                level="INFO",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "ActivePlayer", "chatMessage": f"message {i} about game"},
+                timestamp=base_ts + i * 12000,  # 每 12 秒一条，5 条共 48 秒
+            ))
+        report = builder.build(records, 60, "survival")
+        flood_players = report["chat_topics"].get("flood_players") or []
+        # 活跃玩家不应被误判为刷屏
+        active = next((p for p in flood_players if p["player"] == "ActivePlayer"), None)
+        self.assertIsNone(active, "活跃玩家 5 条不同消息不应被误判为高频刷屏")
+
+    def test_chat_flood_repeat_content_detected(self):
+        """同一玩家 5 分钟内发送 >=3 条相同/相似消息应识别为重复刷屏（repeat_content）。
+
+        PR10 v2: 刷屏=同一ID短时间集中发送大量重复/相似信息。
+        """
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        records = []
+        # Spammer 在 3 分钟内发 3 条相同消息
+        for i in range(3):
+            records.append(self._make_record(
+                "[Async Chat Thread/INFO]: <Spammer> 来加群啊",
+                level="INFO",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Spammer", "chatMessage": "来加群啊"},
+                timestamp=base_ts + i * 60000,  # 每 60 秒一条
+            ))
+        report = builder.build(records, 60, "survival")
+        flood_players = report["chat_topics"].get("flood_players") or []
+        spammer = next((p for p in flood_players if p["player"] == "Spammer"), None)
+        self.assertIsNotNone(spammer, "Spammer 应在刷屏玩家列表中")
+        self.assertIn("repeat_content", spammer["flood_types"])
+
+    def test_chat_flood_not_triggered_for_normal_chat(self):
+        """正常聊天（低频、内容不重复）不应被误判为刷屏。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Async Chat Thread/INFO]: <Steve> hello world",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Steve", "chatMessage": "hello world"},
+                timestamp=base_ts,
+            ),
+            self._make_record(
+                "[Async Chat Thread/INFO]: <Steve> how are you",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Steve", "chatMessage": "how are you"},
+                timestamp=base_ts + 120000,  # 2 分钟后
+            ),
+        ]
+        report = builder.build(records, 60, "survival")
+        flood_players = report["chat_topics"].get("flood_players") or []
+        self.assertEqual(flood_players, [], "正常聊天不应被误判为刷屏")
 
     def test_chat_summary_disabled_returns_empty_dict(self):
         """chat_summary_enabled=false 时 chat_topics 段返回空字典。"""
@@ -2410,11 +2501,12 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertEqual(obs["context"].get("chatPlayer"), "Steve")
         self.assertEqual(obs["context"].get("chatMessage"), "hello")
 
-    def test_chat_spam_repeat_char_detected(self):
-        """单字符连续重复 >=8 次的聊天应被识别为 chat_spam（repeat_char）。
+    def test_chat_meaningless_repeat_char_tagged(self):
+        """单字符连续重复 >=8 次的聊天应被打 chat_meaningless 子标签。
 
+        PR10 v2: 单条消息不再直接判定为刷屏（刷屏是玩家级时间窗口聚合行为），
+        仅标记 meaningless 子标签供聚合阶段使用。
         真实日志样本：[生存区] LilyFairy_uwu >> qqqqqqqqqqqqqqqqqqqqqqqwq
-        含 22 个连续 q，必须打 chat_spam 标签并记录 spam_type=repeat_char。
         """
         from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
         runtime_config = MineSentinelRuntimeLogConfig()
@@ -2423,24 +2515,20 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
             runtime_config,
         )
         self.assertIn("chat_message", obs["tags"])
-        self.assertIn("chat_spam", obs["tags"])
-        self.assertEqual(obs["context"].get("chatSpamType"), "repeat_char")
+        self.assertIn("chat_meaningless", obs["tags"])
 
-    def test_chat_spam_long_run_detected(self):
-        """超长无意义消息（>=40 字符、>80% 字母数字、无空格）应识别为 long_run。"""
+    def test_chat_meaningless_pure_symbols_tagged(self):
+        """纯符号/标点消息（无字母数字汉字）应被打 chat_meaningless 子标签。"""
         from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
         runtime_config = MineSentinelRuntimeLogConfig()
-        # 40+ 字符的随机字母数字串，无空格
-        long_message = "asdfghjkl1234567890qwertyuiopzxcvbnm1234567890"
         obs = self._build(
-            f"[17:00:00] [Async Chat Thread/INFO]: <Spammer> {long_message}",
+            "[17:00:00] [Async Chat Thread/INFO]: <Spammer> !!!???",
             runtime_config,
         )
-        self.assertIn("chat_spam", obs["tags"])
-        self.assertEqual(obs["context"].get("chatSpamType"), "long_run")
+        self.assertIn("chat_meaningless", obs["tags"])
 
-    def test_chat_normal_message_not_spam(self):
-        """普通聊天消息不应被误判为 chat_spam。"""
+    def test_chat_normal_message_not_meaningless(self):
+        """普通聊天消息不应被打 chat_meaningless 子标签。"""
         from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
         runtime_config = MineSentinelRuntimeLogConfig()
         for content in (
@@ -2450,13 +2538,15 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
             "[17:00:00] [Server thread/INFO]: Player already connected to this proxy",  # 真实日志误判样本
         ):
             obs = self._build(content, runtime_config)
-            # dadada/already connected 不应被 chat_spam 误判
+            # 普通聊天不应被标记为 meaningless
             if "chat_message" in obs["tags"]:
                 self.assertNotIn(
-                    "chat_spam",
+                    "chat_meaningless",
                     obs["tags"],
-                    f"普通聊天不应被误判为 chat_spam: {content}",
+                    f"普通聊天不应被标记为 meaningless: {content}",
                 )
+
+
 
 
 class MineSentinelHourlySummaryTests(unittest.IsolatedAsyncioTestCase):
@@ -5071,45 +5161,27 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
                 f"'私聊' 聊天不应被误判为 chat_review: {record.content[:80]}",
             )
 
-    def test_real_chat_spam_qqq_detected_and_classified_as_chat_review(self):
-        """真实日志 'qqqqqqqqqqqqqqqqqqqqqqqwq' 应被识别为 chat_spam 并归入 chat_review。
+    def test_real_chat_flood_detected_and_classified_as_chat_review(self):
+        """真实日志中存在刷屏玩家（同一ID短时间大量消息），应被检测并归入 chat_review。
 
-        PR10 修复前：刷屏消息无关键词命中，被分类为 daily 漏审。
-        真实日志样本：[生存区] LilyFairy_uwu >> qqqqqqqqqqqqqqqqqqqqqqqwq（22 个连续 q）
+        PR10 v2: 刷屏=同一ID短时间集中发送大量重复/相似信息。
+        真实日志样本：LilyFairy_uwu 在窗口内发了 546 条消息，应被检测为高频刷屏。
+        build() 阶段检测刷屏，给参与刷屏的记录打 chat_flood 标签，classify() 强制归入 chat_review。
         """
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
-        spam_records = [
-            r for r in self.records
-            if "chat_message" in r.tags
-            and "qqqqqqqq" in r.context.get("chatMessage", "")
-        ]
-        self.assertGreater(len(spam_records), 0, "应存在 qqq... 刷屏聊天记录")
-        for record in spam_records:
-            # 1. 应被打 chat_spam 标签
-            self.assertIn(
-                "chat_spam",
-                record.tags,
-                f"qqq 刷屏应被打 chat_spam 标签: {record.content[:80]}",
-            )
-            # 2. 应记录 spam_type
-            self.assertEqual(
-                record.context.get("chatSpamType"),
-                "repeat_char",
-                f"qqq 刷屏 spam_type 应为 repeat_char: {record.content[:80]}",
-            )
-            # 3. 应被强制分类为 chat_review
-            category = builder.classify(record)
-            self.assertEqual(
-                category,
-                "chat_review",
-                f"chat_spam 记录应归入 chat_review: {record.content[:80]}",
-            )
+        # 注意：必须用 build() 跑，刷屏检测在 build() 阶段做
+        report = builder.build(self.records, 120, "survival")
+        flood_players = report["chat_topics"].get("flood_players") or []
+        # 真实日志中 LilyFairy_uwu 发了 546 条消息，应被检测为高频刷屏
+        self.assertTrue(flood_players, "应检测到刷屏玩家")
+        lily = next((p for p in flood_players if p["player"] == "LilyFairy_uwu"), None)
+        self.assertIsNotNone(lily, "LilyFairy_uwu 应在刷屏玩家列表中")
+        self.assertGreater(lily["total_messages"], 0)
 
-    def test_real_chat_spam_triggers_alert(self):
-        """真实日志 chat_spam 记录应触发告警（避免审核漏报）。
+    def test_real_chat_flood_triggers_alert(self):
+        """真实日志刷屏记录应触发告警（避免审核漏报）。
 
-        PR10 修复前：chat_review 默认不告警，刷屏被漏报。
-        修复后：chat_spam 标签的记录强制告警，确保审核可见。
+        PR10 v2: chat_flood 标签的记录强制告警，确保审核可见。
         """
         config = MineSentinelConfig.from_dict(
             {"alert": {"enabled": True, "min_severity": "high", "min_evidence_count": 5}}
@@ -5119,46 +5191,42 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
         chat_issues = [
             issue for issue in report["issues"] if issue["category"] == "chat_review"
         ]
-        # 应存在由 chat_spam 形成的 chat_review issue
+        # 应存在由 chat_flood 形成的 chat_review issue
         self.assertTrue(chat_issues, "应存在 chat_review issue")
-        # 至少一个 chat_review issue 应触发告警（chat_spam 强制告警）
+        # 至少一个 chat_review issue 应触发告警（chat_flood 强制告警）
         alert_issues = [issue for issue in chat_issues if issue.get("should_alert")]
         self.assertTrue(
             alert_issues,
-            "chat_spam 形成的 chat_review issue 应触发告警",
+            "chat_flood 形成的 chat_review issue 应触发告警",
         )
 
-    def test_real_chat_topics_review_evidence_includes_spam(self):
-        """真实日志 chat_topics.review_evidence 应包含 chat_spam 的聊天原文。
+    def test_real_chat_topics_flood_players_includes_samples(self):
+        """真实日志 chat_topics.flood_players 应包含刷屏玩家+时间窗口+样本原文。
 
-        PR10: LLM 需要 chat_summary 字段贴出聊天原文上下文，便于管理员复核。
-        review_evidence 结构化呈现 player/message/spam_type/time_text。
+        PR10 v2: LLM 需要 chat_summary 字段贴出刷屏玩家、刷屏类型、时间窗口、消息数和样本原文。
         """
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         report = builder.build(self.records, 120, "survival")
-        review_evidence = report["chat_topics"].get("review_evidence") or []
-        # 应有 chat_spam 证据（LilyFairy_uwu 的 qqq... 和 RivetenGaming 的 hhh...）
-        spam_evidence = [ev for ev in review_evidence if ev.get("reason") == "spam"]
-        self.assertGreater(len(spam_evidence), 0, "应存在 chat_spam 审查证据")
-        # 验证结构化字段完整
-        for ev in spam_evidence:
-            self.assertIn("player", ev)
-            self.assertIn("message", ev)
-            self.assertIn("spam_type", ev)
-            self.assertIn("time_text", ev)
-            self.assertTrue(ev["player"], "玩家名非空")
-            self.assertTrue(ev["message"], "消息原文非空")
-        # 应包含 LilyFairy_uwu 的 qqq 刷屏
-        messages = " ".join(ev["message"] for ev in spam_evidence)
-        self.assertIn("qqqqqqqq", messages, "应贴出 qqq 刷屏原文")
+        flood_players = report["chat_topics"].get("flood_players") or []
+        self.assertGreater(len(flood_players), 0, "应存在刷屏玩家")
+        for fp in flood_players:
+            self.assertIn("player", fp)
+            self.assertIn("flood_types", fp)
+            self.assertIn("total_messages", fp)
+            self.assertIn("time_range", fp)
+            self.assertIn("samples", fp)
+            self.assertTrue(fp["player"], "玩家名非空")
+            self.assertTrue(fp["samples"], "样本原文非空")
 
     def test_real_chat_audit_no_false_positive_for_normal_chats(self):
         """真实日志中的普通聊天（无 URL/交易/辱骂/刷屏信号）不应形成 chat_review issue。
 
-        验证整体审计精度：扫遍所有聊天记录，无 chat_spam 标签且不含 chat_review
+        验证整体审计精度：扫遍所有聊天记录，无 chat_flood 标签且不含 chat_review
         关键词的普通聊天，不应被分类为 chat_review。
         """
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        # 先跑 build() 让刷屏检测给记录打 chat_flood 标签
+        builder.build(self.records, 120, "survival")
         # chat_review 关键词列表（与 rules.py CATEGORY_KEYS["chat_review"] 对齐）
         chat_review_signals = (
             "swear", "profanity", "insult", "abuse", "harassment", "threat", "toxic",
@@ -5172,12 +5240,10 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
         for record in self.records:
             if "chat_message" not in record.tags:
                 continue
-            if "chat_spam" in record.tags:
+            if "chat_flood" in record.tags:
                 continue  # 刷屏应进 chat_review，跳过
             category = builder.classify(record)
             if category == "chat_review":
-                # 进一步验证：full content（classify 实际匹配的文本）确实
-                # 命中了 chat_review 关键词（URL/交易/辱骂等），而非误判
                 content_lower = (record.content or "").lower()
                 has_signal = any(signal in content_lower for signal in chat_review_signals)
                 if not has_signal:

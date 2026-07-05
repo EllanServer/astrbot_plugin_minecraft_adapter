@@ -477,6 +477,11 @@ class HeuristicReportBuilder:
         categories: dict[str, list[str]] = {key: [] for key in CATEGORY_KEYS}
         buckets: dict[tuple[str, str], list[ObservationRecord]] = defaultdict(list)
 
+        # PR10 v2: 玩家级刷屏检测——在分类前跑，给参与刷屏的记录打 chat_flood 标签，
+        # 这样 classify() 能把它们强制归入 chat_review。
+        # 刷屏是聚合行为（同一ID短时间大量重复/相似消息），不能靠单条形态识别。
+        flood_events = self._detect_and_tag_floods(log_records)
+
         for record in log_records:
             category = self.classify(record)
             tag = self.tag(record)
@@ -549,7 +554,7 @@ class HeuristicReportBuilder:
         ops_notes, counters = self._ops_notes(log_records, issues, max_severity, any_alert)
 
         # PR10: 聊天热点总结 + Vulcan 反作弊结构化告警
-        chat_topics = self._build_chat_topics(log_records)
+        chat_topics = self._build_chat_topics(log_records, flood_events)
         vulcan_alerts = self._build_vulcan_alerts(log_records)
 
         return {
@@ -579,10 +584,11 @@ class HeuristicReportBuilder:
         # 等被 moderation/network 关键词误判为异常事件。
         if "daily_noise" in record.tags:
             return "daily"
-        # PR10: chat_spam 标签强制归入 chat_review（若该分类开启），
-        # 真实日志验证：qqqqqqqqqqqqqqqqqqqqqqqwq 等刷屏无关键词命中，
-        # 必须靠形态标签兜底，否则会被分类为 daily 而漏审。
-        if "chat_spam" in record.tags and "chat_review" in self._active_priority:
+        # PR10 v2: chat_flood 标签强制归入 chat_review（若该分类开启）。
+        # 刷屏是玩家级时间窗口聚合行为，由 _build_chat_topics 检测后回填标签。
+        # 真实日志验证：单条形态检测无法识别真正的刷屏（重复发送），
+        # 必须在聚合阶段检测，然后把参与刷屏的记录打 chat_flood 标签。
+        if "chat_flood" in record.tags and "chat_review" in self._active_priority:
             return "chat_review"
         text = self._record_text(record)
         is_chat = "chat_message" in record.tags
@@ -747,13 +753,13 @@ class HeuristicReportBuilder:
         if multi_scope and severity in {"medium", "high"}:
             return True
         # chat_review 特殊规则：默认不告警，除非 severity>=high / evidence_count>=5 / 命中敏感词
-        # / 命中 chat_spam 标签（刷屏形态已强制 chat_review，需单独触发告警，否则审核漏报）
+        # / 命中 chat_flood 标签（玩家级刷屏已强制 chat_review，需单独触发告警，否则审核漏报）
         if category == "chat_review":
             if severity in {"high", "critical"}:
                 return True
             if any(marker in text for marker in CHAT_SENSITIVE_MARKERS):
                 return True
-            if any("chat_spam" in record.tags for record in group):
+            if any("chat_flood" in record.tags for record in group):
                 return True
             return evidence_count >= 5
         # player_feedback 通常不告警
@@ -966,9 +972,62 @@ class HeuristicReportBuilder:
             "suggestion": categories.get("suggestion", []),
         }
 
+    # --- 玩家级刷屏检测（PR10 v2）-----------------------------------------
+    def _detect_and_tag_floods(
+        self, records: list[ObservationRecord]
+    ) -> list[dict[str, Any]]:
+        """检测玩家级刷屏行为，给参与刷屏的记录打 chat_flood 标签。
+
+        刷屏定义（百度百科+社区规则）：
+        同一ID短时间集中发送大量重复或高度相似的信息。
+        - 连续 5 条以上重复/相似 = 轻微刷屏
+        - 连续 10 条以上 = 恶意刷屏
+
+        三类刷屏：
+        1. high_frequency: 60 秒内同一玩家发送 >=5 条消息
+        2. repeat_content: 5 分钟内同一玩家发送 >=3 条相同/高度相似消息
+        3. meaningless: 5 分钟内同一玩家发送 >=5 条无意义符号消息
+
+        返回 flood_events 列表（用于 chat_topics.flood_players 呈现给 LLM）。
+        """
+        # 延迟导入避免循环依赖
+        from ..runtime_log import _detect_chat_flood
+
+        chat_records = [r for r in records if "chat_message" in r.tags]
+        if not chat_records:
+            return []
+        floods_by_player = _detect_chat_flood(chat_records)
+        if not floods_by_player:
+            return []
+
+        # 收集所有参与刷屏的记录 eventId，给它们打 chat_flood 标签
+        flood_event_ids: set[str] = set()
+        flood_events: list[dict[str, Any]] = []
+        for player, events in floods_by_player.items():
+            for event in events:
+                flood_events.append(event)
+        # 重新扫描记录，给参与刷屏窗口的记录打标签
+        # 通过 player + 时间窗口匹配
+        for record in chat_records:
+            ctx = record.context or {}
+            player = str(ctx.get("chatPlayer") or "").strip()
+            if not player or player not in floods_by_player:
+                continue
+            ts = record.timestamp or 0
+            for event in floods_by_player[player]:
+                if (event["window_start_ms"] <= ts <= event["window_end_ms"]
+                    and "chat_flood" not in record.tags):
+                    record.tags.append("chat_flood")
+                    # 记录刷屏类型到 context 供 LLM 呈现
+                    ctx.setdefault("floodTypes", [])
+                    if event["flood_type"] not in ctx["floodTypes"]:
+                        ctx["floodTypes"].append(event["flood_type"])
+                    break
+        return flood_events
+
     # --- 聊天热点总结（PR10）---------------------------------------------
     def _build_chat_topics(
-        self, records: list[ObservationRecord]
+        self, records: list[ObservationRecord], flood_events: list[dict[str, Any]] | None = None
     ) -> dict[str, Any]:
         """从 chat_message 标签记录中聚合聊天热点。
 
@@ -978,6 +1037,8 @@ class HeuristicReportBuilder:
         - top_players: 按消息数排序的活跃玩家，含样本消息
         - top_keywords: 高频关键词（去除停用词后）
         - sample_messages: 时间序样本消息
+        - flood_players: 刷屏玩家列表（PR10 v2，玩家级时间窗口聚合检测）
+        - review_evidence: 需审查的聊天证据（刷屏样本 + 关键词命中）
 
         chat_summary_enabled=false 时返回空字典。
         """
@@ -993,6 +1054,7 @@ class HeuristicReportBuilder:
                 "top_players": [],
                 "top_keywords": [],
                 "sample_messages": [],
+                "flood_players": [],
                 "review_evidence": [],
             }
         max_topics = max(1, self.config.runtime_log.chat_summary_max_topics)
@@ -1045,10 +1107,10 @@ class HeuristicReportBuilder:
             if len(sample_messages) >= max_samples:
                 break
 
-        # PR10: 聊天审查证据——把 chat_spam 和 chat_review 命中的聊天记录
-        # 结构化（player/message/spam_type/time_text），让 LLM 在 chat_summary
-        # 里能贴出聊天原文上下文，便于管理员复核。否则 LLM 只看到统计数字，
-        # 无法输出具体违规内容。
+        # PR10 v2: 刷屏玩家结构化呈现——把 flood_events 转成 LLM 友好格式
+        flood_players = self._format_flood_players(flood_events or [])
+
+        # PR10 v2: 聊天审查证据——刷屏样本 + 关键词命中
         review_evidence = self._build_chat_review_evidence(chat_records, max_samples=10)
 
         return {
@@ -1057,33 +1119,99 @@ class HeuristicReportBuilder:
             "top_players": top_players,
             "top_keywords": top_keywords,
             "sample_messages": sample_messages,
+            "flood_players": flood_players,
             "review_evidence": review_evidence,
         }
+
+    def _format_flood_players(
+        self, flood_events: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """把 flood_events 转成 LLM 友好的 flood_players 列表。
+
+        每个玩家一个条目，聚合该玩家的所有刷屏事件：
+        - player: 玩家名
+        - flood_types: 刷屏类型列表（high_frequency/repeat_content/meaningless）
+        - total_messages: 窗口内消息总数
+        - time_range: 时间范围 HH:MM:SS-HH:MM:SS
+        - events: 各刷屏事件详情（type/window/message_count/samples）
+        """
+        if not flood_events:
+            return []
+        # 按玩家聚合
+        by_player: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for event in flood_events:
+            by_player[event["player"]].append(event)
+        result: list[dict[str, Any]] = []
+        for player, events in by_player.items():
+            all_ts = []
+            for e in events:
+                all_ts.append(e["window_start_ms"])
+                all_ts.append(e["window_end_ms"])
+            time_range = ""
+            if all_ts:
+                start = _format_timestamp(min(all_ts))
+                end = _format_timestamp(max(all_ts))
+                time_range = f"{start}-{end}"
+            flood_types = sorted({e["flood_type"] for e in events})
+            total_msgs = sum(e["message_count"] for e in events)
+            # 收集样本（去重，最多 5 条）
+            samples: list[str] = []
+            seen: set[str] = set()
+            for e in sorted(events, key=lambda x: x["window_start_ms"]):
+                for s in e.get("samples", []):
+                    if s not in seen:
+                        samples.append(s)
+                        seen.add(s)
+                    if len(samples) >= 5:
+                        break
+                if len(samples) >= 5:
+                    break
+            result.append({
+                "player": player,
+                "flood_types": flood_types,
+                "total_messages": total_msgs,
+                "time_range": time_range,
+                "events": [
+                    {
+                        "type": e["flood_type"],
+                        "message_count": e["message_count"],
+                        "time_range": (
+                            f"{_format_timestamp(e['window_start_ms'])}-"
+                            f"{_format_timestamp(e['window_end_ms'])}"
+                        ),
+                        "samples": e.get("samples", [])[:3],
+                    }
+                    for e in sorted(events, key=lambda x: x["window_start_ms"])
+                ],
+                "samples": samples,
+            })
+        # 按消息数降序
+        result.sort(key=lambda x: x["total_messages"], reverse=True)
+        return result
 
     def _build_chat_review_evidence(
         self, chat_records: list[ObservationRecord], max_samples: int = 10
     ) -> list[dict[str, Any]]:
-        """从聊天记录中提取需要审查的证据样本（chat_spam + chat_review 命中）。
+        """从聊天记录中提取需要审查的证据样本（刷屏 + 关键词命中）。
 
         返回结构化列表，每条含：
         - player: 玩家名
         - message: 聊天原文
-        - spam_type: 刷屏类型（repeat_char/long_run），非刷屏为空
-        - reason: 命中原因（spam/keyword），keyword 时列出命中的关键词
+        - flood_types: 刷屏类型列表（参与刷屏时），非刷屏为空
+        - reason: 命中原因（flood/keyword），keyword 时列出命中的关键词
         - time_text: HH:MM:SS 时间
         """
         evidence: list[dict[str, Any]] = []
         for record in chat_records:
             ctx = record.context or {}
             tags = record.tags or []
-            is_spam = "chat_spam" in tags
-            # 非 spam 记录只保留命中 chat_review 关键词的（避免把所有聊天都贴给 LLM）
+            is_flood = "chat_flood" in tags
+            # 非 flood 记录只保留命中 chat_review 关键词的（避免把所有聊天都贴给 LLM）
             hit_keys: list[str] = []
-            if not is_spam:
+            if not is_flood:
                 content_lower = (record.content or "").lower()
                 for key in CHAT_REVIEW_GENERAL_MARKERS:
                     if _is_word_key(key):
-                        # 短词用词边界
                         if _word_boundary_regex((key,)) and _word_boundary_regex((key,)).search(content_lower):
                             hit_keys.append(key)
                     elif key in content_lower:
@@ -1096,14 +1224,14 @@ class HeuristicReportBuilder:
                     continue
             player = str(ctx.get("chatPlayer") or "").strip() or "(unknown)"
             message = str(ctx.get("chatMessage") or record.content).strip()
-            spam_type = str(ctx.get("chatSpamType") or "").strip()
+            flood_types = list(ctx.get("floodTypes") or [])
             time_text = _format_timestamp(record.timestamp) if record.timestamp else ""
             evidence.append(
                 {
                     "player": player,
                     "message": message[:200],
-                    "spam_type": spam_type,
-                    "reason": "spam" if is_spam else "keyword",
+                    "flood_types": flood_types,
+                    "reason": "flood" if is_flood else "keyword",
                     "hit_keys": hit_keys[:5],
                     "time_text": time_text,
                 }

@@ -1239,32 +1239,259 @@ def _detect_chat_message(content: str) -> tuple[str, str] | None:
 
 
 # 刷屏检测阈值
-_CHAT_SPAM_REPEAT_CHAR_MIN = 8  # 同一字符连续重复 >=8 次视为刷屏（如 qqqqqqqq）
-_CHAT_SPAM_REPEAT_CHAR_RE = re.compile(r"(.)\1{" + str(_CHAT_SPAM_REPEAT_CHAR_MIN - 1) + r",}")
+# PR10 v2: 刷屏的准确定义是"同一ID短时间集中发送大量重复或高度相似的信息"，
+# 不是单条消息的字符形态。单条形态检测只保留作为"无意义符号消息"子判断，
+# 真正的刷屏检测在 _detect_chat_flood（玩家级时间窗口聚合）里做。
+# 参考定义：百度百科"同一ID短时间集中发送大量内容重复或高度相似的信息"；
+# 社区规则"连续发送5条及以上重复信息=轻微刷屏，10条及以上=恶意刷屏"。
+_CHAT_MEANINGLESS_REPEAT_CHAR_MIN = 8  # 单条消息同一字符连续重复 >=8 次视为无意义符号
+_CHAT_MEANINGLESS_REPEAT_CHAR_RE = re.compile(
+    r"(.)\1{" + str(_CHAT_MEANINGLESS_REPEAT_CHAR_MIN - 1) + r",}"
+)
 
 
-def _detect_chat_spam(message: str) -> str | None:
-    """检测聊天刷屏形态，返回刷屏类型字符串，非刷屏返回 None。
+def _detect_meaningless_message(message: str) -> bool:
+    """检测单条消息是否为无意义符号消息（刷屏的子判断，非刷屏本身）。
 
-    识别两种刷屏：
-    1. ``repeat_char``: 单字符连续重复 >=8 次（如 qqqqqqqq、wwwwwwww）
-    2. ``long_run``: 超长无意义消息 >=40 字符且字母/数字占比 >80%
-       （如随机键盘乱敲 asdfghjkl1234567890...）
+    判定标准：
+    1. 单字符连续重复 >=8 次（如 qqqqqqqq、wwwwwwww）
+    2. 纯符号/标点消息（无字母数字汉字）
 
-    真实日志验证：[生存区] LilyFairy_uwu >> qqqqqqqqqqqqqqqqqqqqqqqwq
-    含 22 个连续 q，应识别为 repeat_char。
+    注意：单条无意义消息不等于刷屏，需要结合玩家级时间窗口聚合
+    （同一玩家短时间多条无意义消息）才构成刷屏。
     """
     if not message:
-        return None
-    # 1. 单字符连续重复
-    if _CHAT_SPAM_REPEAT_CHAR_RE.search(message):
-        return "repeat_char"
-    # 2. 超长无意义消息（字母/数字占比高且无空格分词）
-    if len(message) >= 40:
-        alnum_count = sum(1 for c in message if c.isalnum())
-        if alnum_count / len(message) > 0.8 and " " not in message:
-            return "long_run"
-    return None
+        return False
+    if _CHAT_MEANINGLESS_REPEAT_CHAR_RE.search(message):
+        return True
+    # 纯符号/标点（无字母数字汉字）
+    has_content = any(c.isalnum() or "\u4e00" <= c <= "\u9fff" for c in message)
+    if not has_content and len(message) >= 3:
+        return True
+    return False
+
+
+# --- 刷屏（玩家级时间窗口聚合）阈值 ---
+# 参考社区规则：连续 5 条重复=轻微刷屏，10 条=恶意刷屏。
+# 注意：刷屏的核心是"重复/相似信息"或"无意义符号"，不是单纯的"消息多"。
+# 活跃玩家正常聊天也可能 60 秒内发 5 条不同内容，不应判为刷屏。
+# 因此 high_frequency 阈值设高（30 秒内 >=8 条，接近轰炸级别），
+# repeat_content/meaningless 阈值按社区规则（5 条重复/3 条无意义）。
+_CHAT_FLOOD_HIGH_FREQ_WINDOW_MS = 30 * 1000  # 30 秒窗口（高频刷屏）
+_CHAT_FLOOD_HIGH_FREQ_COUNT = 8  # 30 秒内 >=8 条消息视为高频刷屏（轰炸级别）
+_CHAT_FLOOD_REPEAT_WINDOW_MS = 5 * 60 * 1000  # 5 分钟窗口（重复内容）
+_CHAT_FLOOD_REPEAT_COUNT = 3  # 5 分钟内 >=3 条相同/高度相似消息视为重复刷屏
+_CHAT_FLOOD_MEANINGLESS_COUNT = 3  # 5 分钟内 >=3 条无意义符号消息视为无意义刷屏
+
+
+def _normalize_message(message: str) -> str:
+    """归一化消息用于重复度比较：去空白、转小写、去标点。
+
+    "Hello World!" 和 "hello world" 视为相同消息。
+    """
+    if not message:
+        return ""
+    # 去空白和标点，转小写
+    cleaned = re.sub(r"\s+", "", message).lower()
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff]", "", cleaned)
+    return cleaned
+
+
+def _detect_chat_flood(
+    chat_records: list["ObservationRecord"],
+) -> dict[str, list[dict[str, Any]]]:
+    """检测玩家级刷屏行为，返回 {player: [flood_event, ...]}。
+
+    每个 flood_event 含：
+    - player: 玩家名
+    - flood_type: high_frequency / repeat_content / meaningless
+    - window_start_ms / window_end_ms: 时间窗口
+    - message_count: 窗口内消息数
+    - samples: 最多 5 条样本消息原文
+
+    三类刷屏（参考百度百科+社区规则定义）：
+    1. high_frequency: 60 秒内同一玩家发送 >=5 条消息（高频刷屏）
+    2. repeat_content: 5 分钟内同一玩家发送 >=3 条相同/高度相似消息（重复刷屏）
+    3. meaningless: 5 分钟内同一玩家发送 >=5 条无意义符号消息（无意义刷屏）
+    """
+    from .models import ObservationRecord as _OR  # 类型提示用
+
+    # 按玩家聚合聊天记录
+    player_records: dict[str, list[_OR]] = {}
+    for record in chat_records:
+        ctx = record.context or {}
+        player = str(ctx.get("chatPlayer") or "").strip()
+        if not player:
+            continue
+        player_records.setdefault(player, []).append(record)
+
+    floods: dict[str, list[dict[str, Any]]] = {}
+    for player, records in player_records.items():
+        # 按时间排序
+        records_sorted = sorted(records, key=lambda r: r.timestamp or 0)
+        player_floods = _detect_player_floods(player, records_sorted)
+        if player_floods:
+            floods[player] = player_floods
+    return floods
+
+
+def _detect_player_floods(
+    player: str, records: list["ObservationRecord"]
+) -> list[dict[str, Any]]:
+    """检测单个玩家的刷屏事件。"""
+    floods: list[dict[str, Any]] = []
+    seen_windows: set[tuple[str, int, int]] = set()  # 避免重复事件
+
+    # 1. 高频刷屏：30 秒滑窗内 >=8 条消息（轰炸级别，避免误判活跃玩家）
+    for i, start_record in enumerate(records):
+        window_start = start_record.timestamp or 0
+        window_end = window_start + _CHAT_FLOOD_HIGH_FREQ_WINDOW_MS
+        window_records = [
+            r for r in records[i:]
+            if (r.timestamp or 0) >= window_start and (r.timestamp or 0) <= window_end
+        ]
+        if len(window_records) >= _CHAT_FLOOD_HIGH_FREQ_COUNT:
+            key = ("high_frequency", window_start, window_end)
+            if key in seen_windows:
+                continue
+            seen_windows.add(key)
+            floods.append(_make_flood_event(
+                player, "high_frequency", window_start,
+                window_records[-1].timestamp or window_end,
+                window_records,
+            ))
+            # 跳过这个窗口内的记录，避免重叠
+            break
+
+    # 2. 重复刷屏：5 分钟窗口内 >=3 条相同/高度相似消息
+    normalized_list = [
+        (r, _normalize_message(str((r.context or {}).get("chatMessage") or "")))
+        for r in records
+    ]
+    for i, (start_record, start_norm) in enumerate(normalized_list):
+        if not start_norm:
+            continue
+        window_start = start_record.timestamp or 0
+        window_end = window_start + _CHAT_FLOOD_REPEAT_WINDOW_MS
+        similar = [
+            r for r, norm in normalized_list[i:]
+            if (r.timestamp or 0) >= window_start
+            and (r.timestamp or 0) <= window_end
+            and norm
+            and (norm == start_norm or _is_similar(norm, start_norm))
+        ]
+        if len(similar) >= _CHAT_FLOOD_REPEAT_COUNT:
+            key = ("repeat_content", window_start, window_end)
+            if key in seen_windows:
+                continue
+            seen_windows.add(key)
+            floods.append(_make_flood_event(
+                player, "repeat_content", window_start,
+                similar[-1].timestamp or window_end,
+                similar,
+            ))
+            break
+
+    # 3. 无意义刷屏：5 分钟窗口内 >=5 条无意义符号消息
+    meaningless_records = [
+        r for r in records
+        if _detect_meaningless_message(str((r.context or {}).get("chatMessage") or ""))
+    ]
+    for i, start_record in enumerate(meaningless_records):
+        window_start = start_record.timestamp or 0
+        window_end = window_start + _CHAT_FLOOD_REPEAT_WINDOW_MS
+        window_records = [
+            r for r in meaningless_records[i:]
+            if (r.timestamp or 0) >= window_start and (r.timestamp or 0) <= window_end
+        ]
+        if len(window_records) >= _CHAT_FLOOD_MEANINGLESS_COUNT:
+            key = ("meaningless", window_start, window_end)
+            if key in seen_windows:
+                continue
+            seen_windows.add(key)
+            floods.append(_make_flood_event(
+                player, "meaningless", window_start,
+                window_records[-1].timestamp or window_end,
+                window_records,
+            ))
+            break
+
+    return floods
+
+
+def _is_similar(norm_a: str, norm_b: str) -> bool:
+    """判断两条归一化后的消息是否高度相似（构成重复刷屏）。
+
+    刷屏的"重复"要求内容几乎相同，不是话题相关。
+    判定标准（满足任一）：
+    1. 归一化后完全相同
+    2. 子串关系：短的是长的子串（如 "加群" vs "加群啊"）
+    3. 中等长度消息（3-8 字符）编辑距离 <=1（处理 "好的呀" vs "好的" 等个别字符差异）
+
+    长度 1-2 的单字/双字消息要求完全相同——"对" vs "绷" 编辑距离只有 1，
+    但它们是不同内容，不是重复刷屏。
+    长消息（>8 字符）不用编辑距离——"message 0" 和 "message 1" 编辑距离只有 1，
+    但它们是不同内容。
+    """
+    if not norm_a or not norm_b:
+        return False
+    # 1. 完全相同
+    if norm_a == norm_b:
+        return True
+    # 2. 长度差太大不算相似
+    if abs(len(norm_a) - len(norm_b)) > 2:
+        return False
+    # 3. 子串关系（短的是长的子串）
+    if len(norm_a) <= len(norm_b):
+        if norm_a in norm_b:
+            return True
+    else:
+        if norm_b in norm_a:
+            return True
+    # 4. 仅对中等长度消息（3-8 字符）用编辑距离，处理个别字符差异
+    max_len = max(len(norm_a), len(norm_b))
+    if 3 <= max_len <= 8 and _edit_distance(norm_a, norm_b) <= 1:
+        return True
+    return False
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """计算两个字符串的编辑距离（Levenshtein）。"""
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            cost = 0 if ca == cb else 1
+            curr.append(min(curr[-1] + 1, prev[j + 1] + 1, prev[j] + cost))
+        prev = curr
+    return prev[-1]
+
+
+def _make_flood_event(
+    player: str,
+    flood_type: str,
+    window_start: int,
+    window_end: int,
+    records: list["ObservationRecord"],
+) -> dict[str, Any]:
+    """构造一个刷屏事件。"""
+    samples = []
+    for r in records[:5]:
+        msg = str((r.context or {}).get("chatMessage") or r.content).strip()
+        if msg:
+            samples.append(msg[:150])
+    return {
+        "player": player,
+        "flood_type": flood_type,
+        "window_start_ms": window_start,
+        "window_end_ms": window_end,
+        "message_count": len(records),
+        "samples": samples,
+    }
 
 
 def _detect_vulcan_alert(content: str) -> dict[str, str] | None:
@@ -1393,15 +1620,15 @@ def _build_observation(
                 if patterns and _match_noise_patterns(content, _compile_noise_patterns(patterns)):
                     tags.append("daily_noise")
                     daily_noise_hit = True
-        chat_spam_type: str | None = None
         if runtime_config.chat_summary_enabled:
             chat_info = _detect_chat_message(content)
             if chat_info is not None:
                 tags.append("chat_message")
-                # PR10: 聊天刷屏形态检测（独立于关键词，按消息形态识别）
-                chat_spam_type = _detect_chat_spam(chat_info[1])
-                if chat_spam_type is not None:
-                    tags.append("chat_spam")
+                # PR10 v2: 单条消息不再打 chat_spam 标签——刷屏是玩家级时间窗口
+                # 聚合行为（同一ID短时间大量重复/相似消息），不是单条形态。
+                # 仅标记 meaningless 子标签供聚合阶段使用。
+                if _detect_meaningless_message(chat_info[1]):
+                    tags.append("chat_meaningless")
         if runtime_config.vulcan_detect_enabled:
             vulcan_info = _detect_vulcan_alert(content)
             if vulcan_info is not None:
@@ -1454,9 +1681,6 @@ def _build_observation(
         context["chatMessage"] = message
         context["otel"]["attributes"]["chat.player"] = player
         context["otel"]["attributes"]["chat.message"] = message
-        if chat_spam_type is not None:
-            context["chatSpamType"] = chat_spam_type
-            context["otel"]["attributes"]["chat.spam_type"] = chat_spam_type
     if vulcan_info is not None:
         context["vulcanPlayer"] = vulcan_info.get("player", "")
         context["vulcanCheck"] = vulcan_info.get("check", "")
