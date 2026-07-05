@@ -16,7 +16,11 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .models import MineSentinelLogSourceConfig, MineSentinelRuntimeLogConfig
+from .models import (
+    DEFAULT_DAILY_NOISE_PATTERNS,
+    MineSentinelLogSourceConfig,
+    MineSentinelRuntimeLogConfig,
+)
 from .template_miner import ParsedTemplate, get_template_miner
 from .anomaly_detector import AnomalyResult, TemplateStat, get_anomaly_detector
 
@@ -73,6 +77,32 @@ _ERROR_WORDS = (
     "失败",
     "超时",
     "警告",
+)
+
+# 聊天行检测：Minecraft 原生 [Async Chat Thread] 线程标签或 <player> 前缀。
+# 用于 chat_summary 热点总结，提取玩家名和消息内容。
+_CHAT_THREAD_RE = re.compile(r"\[Async Chat Thread[^\]]*\]\s*:?\s*", re.IGNORECASE)
+# 原生聊天：<player> message
+_CHAT_PLAYER_PREFIX_RE = re.compile(r"<(?P<player>[^>\s]{1,40})>\s*(?P<message>.*)$")
+# 聊天插件（CarbonChat 等）：[Not Secure] [频道] player >> message
+# 兼容 [Not Secure] 可选、频道名可含中文/数字、>> 分隔符。
+_CHAT_PLUGIN_RE = re.compile(
+    r"(?:\[Not Secure\]\s*)?"  # 可选的 [Not Secure] 标记
+    r"(?:\[[^\]]{1,30}\]\s*)*"  # 0 或多个 [频道] 标记
+    r"(?P<player>[A-Za-z0-9_]{1,16})\s*>>\s*(?P<message>.+)$"
+)
+# Vulcan 反作弊插件告警检测。Vulcan 告警的标准格式：
+#   [Vulcan] PlayerName failed CheckName (VL: 5)
+#   [Vulcan] PlayerName failed CheckName (Type X) (N/M)   ← 真实 mclo.gs 格式
+# 注意：[Vulcan] 前缀也会出现在插件生命周期日志（Loading/Enabling/Starting/hook），
+# 因此必须用 "failed" 关键词区分告警和生命周期日志，避免误判。
+# check 名捕获完整子类型：如 "Invalid (Type E)" 而非只 "Invalid"。
+_VULCAN_PLAYER_RE = re.compile(
+    r"\[Vulcan\][\]:>\s]*"  # [Vulcan] 前缀
+    r"(?P<player>[A-Za-z0-9_]{1,16})\s+"
+    r"failed\s+"
+    r"(?P<check>[A-Za-z]+(?:\s*\([^)]+\))?)",  # CheckName 或 CheckName (Type X)
+    re.IGNORECASE,
 )
 
 # PR9: interesting-only 模式下，普通 INFO 命中这些关键词才进 template/anomaly。
@@ -1145,6 +1175,344 @@ def _skip_parsed_template(content: str, fingerprint: str) -> ParsedTemplate:
     )
 
 
+# daily_noise_patterns 编译缓存：key=tuple(patterns) → list[re.Pattern]。
+# 避免每条日志都重新编译正则；config 不变时直接复用。
+_NOISE_PATTERN_CACHE: dict[tuple[str, ...], list["re.Pattern[str]"]] = {}
+
+
+def _compile_noise_patterns(patterns: list[str]) -> list["re.Pattern[str]"]:
+    """编译 daily_noise_patterns，缓存结果。无效正则会被忽略并记日志。"""
+    key = tuple(patterns)
+    cached = _NOISE_PATTERN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    compiled: list["re.Pattern[str]"] = []
+    for raw in patterns:
+        try:
+            compiled.append(re.compile(raw, re.IGNORECASE))
+        except re.error as exc:
+            logger.warning(
+                f"[MineSentinel] daily_noise_patterns 正则 {raw!r} 编译失败：{exc}，已忽略。"
+            )
+    _NOISE_PATTERN_CACHE[key] = compiled
+    return compiled
+
+
+def _match_noise_patterns(content: str, compiled: list["re.Pattern[str]"]) -> bool:
+    """检查 content 是否命中任一编译后的噪声正则。"""
+    return any(pattern.search(content) for pattern in compiled)
+
+
+def _detect_chat_message(content: str) -> tuple[str, str] | None:
+    """检测聊天行并返回 (player, message)，非聊天行返回 None。
+
+    识别三种 Minecraft 聊天格式：
+    1. ``[Async Chat Thread/INFO]: <player> message`` — 原生聊天线程
+    2. ``[Async Chat Thread/INFO]: [Not Secure] [频道] player >> message``
+       — CarbonChat 等聊天插件格式（真实 mclo.gs 日志验证）
+    3. ``<player> message`` — 直接前缀（控制台回放）
+
+    玩家名最长 16 字符（Minecraft 限制），消息保留原样。
+    """
+    # 优先匹配聊天插件格式（>> 分隔），需要先剥掉 [Async Chat Thread] 等线程前缀
+    stripped = content
+    if _CHAT_THREAD_RE.search(content):
+        stripped = _CHAT_THREAD_RE.sub("", content).strip()
+    plugin_match = _CHAT_PLUGIN_RE.search(stripped)
+    if plugin_match:
+        player = plugin_match.group("player").strip()
+        message = plugin_match.group("message").strip()
+        if player and message:
+            return player, message
+    # 原生 <player> 前缀格式
+    match = _CHAT_PLAYER_PREFIX_RE.search(stripped)
+    if match:
+        player = match.group("player").strip()
+        message = match.group("message").strip()
+        if player and message:
+            return player, message
+    # 仅当行包含 Async Chat Thread 线程标签但无法解析玩家时，视为无玩家聊天
+    if _CHAT_THREAD_RE.search(content):
+        if stripped:
+            return "", stripped
+    return None
+
+
+# 刷屏检测阈值
+# PR10 v2: 刷屏的准确定义是"同一ID短时间集中发送大量重复或高度相似的信息"，
+# 不是单条消息的字符形态。单条形态检测只保留作为"无意义符号消息"子判断，
+# 真正的刷屏检测在 _detect_chat_flood（玩家级时间窗口聚合）里做。
+# 参考定义：百度百科"同一ID短时间集中发送大量内容重复或高度相似的信息"；
+# 社区规则"连续发送5条及以上重复信息=轻微刷屏，10条及以上=恶意刷屏"。
+_CHAT_MEANINGLESS_REPEAT_CHAR_MIN = 8  # 单条消息同一字符连续重复 >=8 次视为无意义符号
+_CHAT_MEANINGLESS_REPEAT_CHAR_RE = re.compile(
+    r"(.)\1{" + str(_CHAT_MEANINGLESS_REPEAT_CHAR_MIN - 1) + r",}"
+)
+
+
+def _detect_meaningless_message(message: str) -> bool:
+    """检测单条消息是否为无意义符号消息（刷屏的子判断，非刷屏本身）。
+
+    判定标准：
+    1. 单字符连续重复 >=8 次（如 qqqqqqqq、wwwwwwww）
+    2. 纯符号/标点消息（无字母数字汉字）
+
+    注意：单条无意义消息不等于刷屏，需要结合玩家级时间窗口聚合
+    （同一玩家短时间多条无意义消息）才构成刷屏。
+    """
+    if not message:
+        return False
+    if _CHAT_MEANINGLESS_REPEAT_CHAR_RE.search(message):
+        return True
+    # 纯符号/标点（无字母数字汉字）
+    has_content = any(c.isalnum() or "\u4e00" <= c <= "\u9fff" for c in message)
+    if not has_content and len(message) >= 3:
+        return True
+    return False
+
+
+# --- 刷屏（玩家级时间窗口聚合）阈值 ---
+# 参考社区规则：连续 5 条重复=轻微刷屏，10 条=恶意刷屏。
+# 注意：刷屏的核心是"重复/相似信息"或"无意义符号"，不是单纯的"消息多"。
+# 活跃玩家正常聊天也可能 60 秒内发 5 条不同内容，不应判为刷屏。
+# 因此 high_frequency 阈值设高（30 秒内 >=8 条，接近轰炸级别），
+# repeat_content/meaningless 阈值按社区规则（5 条重复/3 条无意义）。
+_CHAT_FLOOD_HIGH_FREQ_WINDOW_MS = 30 * 1000  # 30 秒窗口（高频刷屏）
+_CHAT_FLOOD_HIGH_FREQ_COUNT = 8  # 30 秒内 >=8 条消息视为高频刷屏（轰炸级别）
+_CHAT_FLOOD_REPEAT_WINDOW_MS = 5 * 60 * 1000  # 5 分钟窗口（重复内容）
+_CHAT_FLOOD_REPEAT_COUNT = 3  # 5 分钟内 >=3 条相同/高度相似消息视为重复刷屏
+_CHAT_FLOOD_MEANINGLESS_COUNT = 3  # 5 分钟内 >=3 条无意义符号消息视为无意义刷屏
+
+
+def _normalize_message(message: str) -> str:
+    """归一化消息用于重复度比较：去空白、转小写、去标点。
+
+    "Hello World!" 和 "hello world" 视为相同消息。
+    """
+    if not message:
+        return ""
+    # 去空白和标点，转小写
+    cleaned = re.sub(r"\s+", "", message).lower()
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff]", "", cleaned)
+    return cleaned
+
+
+def _detect_chat_flood(
+    chat_records: list["ObservationRecord"],
+) -> dict[str, list[dict[str, Any]]]:
+    """检测玩家级刷屏行为，返回 {player: [flood_event, ...]}。
+
+    每个 flood_event 含：
+    - player: 玩家名
+    - flood_type: high_frequency / repeat_content / meaningless
+    - window_start_ms / window_end_ms: 时间窗口
+    - message_count: 窗口内消息数
+    - samples: 最多 5 条样本消息原文
+
+    三类刷屏（参考百度百科+社区规则定义）：
+    1. high_frequency: 60 秒内同一玩家发送 >=5 条消息（高频刷屏）
+    2. repeat_content: 5 分钟内同一玩家发送 >=3 条相同/高度相似消息（重复刷屏）
+    3. meaningless: 5 分钟内同一玩家发送 >=5 条无意义符号消息（无意义刷屏）
+    """
+    from .models import ObservationRecord as _OR  # 类型提示用
+
+    # 按玩家聚合聊天记录
+    player_records: dict[str, list[_OR]] = {}
+    for record in chat_records:
+        ctx = record.context or {}
+        player = str(ctx.get("chatPlayer") or "").strip()
+        if not player:
+            continue
+        player_records.setdefault(player, []).append(record)
+
+    floods: dict[str, list[dict[str, Any]]] = {}
+    for player, records in player_records.items():
+        # 按时间排序
+        records_sorted = sorted(records, key=lambda r: r.timestamp or 0)
+        player_floods = _detect_player_floods(player, records_sorted)
+        if player_floods:
+            floods[player] = player_floods
+    return floods
+
+
+def _detect_player_floods(
+    player: str, records: list["ObservationRecord"]
+) -> list[dict[str, Any]]:
+    """检测单个玩家的刷屏事件。"""
+    floods: list[dict[str, Any]] = []
+    seen_windows: set[tuple[str, int, int]] = set()  # 避免重复事件
+
+    # 1. 高频刷屏：30 秒滑窗内 >=8 条消息（轰炸级别，避免误判活跃玩家）
+    for i, start_record in enumerate(records):
+        window_start = start_record.timestamp or 0
+        window_end = window_start + _CHAT_FLOOD_HIGH_FREQ_WINDOW_MS
+        window_records = [
+            r for r in records[i:]
+            if (r.timestamp or 0) >= window_start and (r.timestamp or 0) <= window_end
+        ]
+        if len(window_records) >= _CHAT_FLOOD_HIGH_FREQ_COUNT:
+            key = ("high_frequency", window_start, window_end)
+            if key in seen_windows:
+                continue
+            seen_windows.add(key)
+            floods.append(_make_flood_event(
+                player, "high_frequency", window_start,
+                window_records[-1].timestamp or window_end,
+                window_records,
+            ))
+            # 跳过这个窗口内的记录，避免重叠
+            break
+
+    # 2. 重复刷屏：5 分钟窗口内 >=3 条相同/高度相似消息
+    normalized_list = [
+        (r, _normalize_message(str((r.context or {}).get("chatMessage") or "")))
+        for r in records
+    ]
+    for i, (start_record, start_norm) in enumerate(normalized_list):
+        if not start_norm:
+            continue
+        window_start = start_record.timestamp or 0
+        window_end = window_start + _CHAT_FLOOD_REPEAT_WINDOW_MS
+        similar = [
+            r for r, norm in normalized_list[i:]
+            if (r.timestamp or 0) >= window_start
+            and (r.timestamp or 0) <= window_end
+            and norm
+            and (norm == start_norm or _is_similar(norm, start_norm))
+        ]
+        if len(similar) >= _CHAT_FLOOD_REPEAT_COUNT:
+            key = ("repeat_content", window_start, window_end)
+            if key in seen_windows:
+                continue
+            seen_windows.add(key)
+            floods.append(_make_flood_event(
+                player, "repeat_content", window_start,
+                similar[-1].timestamp or window_end,
+                similar,
+            ))
+            break
+
+    # 3. 无意义刷屏：5 分钟窗口内 >=5 条无意义符号消息
+    meaningless_records = [
+        r for r in records
+        if _detect_meaningless_message(str((r.context or {}).get("chatMessage") or ""))
+    ]
+    for i, start_record in enumerate(meaningless_records):
+        window_start = start_record.timestamp or 0
+        window_end = window_start + _CHAT_FLOOD_REPEAT_WINDOW_MS
+        window_records = [
+            r for r in meaningless_records[i:]
+            if (r.timestamp or 0) >= window_start and (r.timestamp or 0) <= window_end
+        ]
+        if len(window_records) >= _CHAT_FLOOD_MEANINGLESS_COUNT:
+            key = ("meaningless", window_start, window_end)
+            if key in seen_windows:
+                continue
+            seen_windows.add(key)
+            floods.append(_make_flood_event(
+                player, "meaningless", window_start,
+                window_records[-1].timestamp or window_end,
+                window_records,
+            ))
+            break
+
+    return floods
+
+
+def _is_similar(norm_a: str, norm_b: str) -> bool:
+    """判断两条归一化后的消息是否高度相似（构成重复刷屏）。
+
+    刷屏的"重复"要求内容几乎相同，不是话题相关。
+    判定标准（满足任一）：
+    1. 归一化后完全相同
+    2. 子串关系：短的是长的子串（如 "加群" vs "加群啊"）
+    3. 中等长度消息（3-8 字符）编辑距离 <=1（处理 "好的呀" vs "好的" 等个别字符差异）
+
+    长度 1-2 的单字/双字消息要求完全相同——"对" vs "绷" 编辑距离只有 1，
+    但它们是不同内容，不是重复刷屏。
+    长消息（>8 字符）不用编辑距离——"message 0" 和 "message 1" 编辑距离只有 1，
+    但它们是不同内容。
+    """
+    if not norm_a or not norm_b:
+        return False
+    # 1. 完全相同
+    if norm_a == norm_b:
+        return True
+    # 2. 长度差太大不算相似
+    if abs(len(norm_a) - len(norm_b)) > 2:
+        return False
+    # 3. 子串关系（短的是长的子串）
+    if len(norm_a) <= len(norm_b):
+        if norm_a in norm_b:
+            return True
+    else:
+        if norm_b in norm_a:
+            return True
+    # 4. 仅对中等长度消息（3-8 字符）用编辑距离，处理个别字符差异
+    max_len = max(len(norm_a), len(norm_b))
+    if 3 <= max_len <= 8 and _edit_distance(norm_a, norm_b) <= 1:
+        return True
+    return False
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """计算两个字符串的编辑距离（Levenshtein）。"""
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            cost = 0 if ca == cb else 1
+            curr.append(min(curr[-1] + 1, prev[j + 1] + 1, prev[j] + cost))
+        prev = curr
+    return prev[-1]
+
+
+def _make_flood_event(
+    player: str,
+    flood_type: str,
+    window_start: int,
+    window_end: int,
+    records: list["ObservationRecord"],
+) -> dict[str, Any]:
+    """构造一个刷屏事件。"""
+    samples = []
+    for r in records[:5]:
+        msg = str((r.context or {}).get("chatMessage") or r.content).strip()
+        if msg:
+            samples.append(msg[:150])
+    return {
+        "player": player,
+        "flood_type": flood_type,
+        "window_start_ms": window_start,
+        "window_end_ms": window_end,
+        "message_count": len(records),
+        "samples": samples,
+    }
+
+
+def _detect_vulcan_alert(content: str) -> dict[str, str] | None:
+    """检测 Vulcan 反作弊告警并返回 {player, check}，非告警行返回 None。
+
+    只匹配 ``[Vulcan] PlayerName failed CheckName`` 格式的真实告警，
+    排除 ``[Vulcan] Loading/Enabling/Starting/hook`` 等插件生命周期日志
+    （这些日志也带 [Vulcan] 前缀但不是告警，真实 mclo.gs 日志验证）。
+
+    标准格式：``[Vulcan] PlayerName failed CheckName (VL: 5)``
+    或带前缀：``[Server thread/INFO]: [Vulcan] PlayerName failed ...``
+    """
+    match = _VULCAN_PLAYER_RE.search(content)
+    if match:
+        return {
+            "player": match.group("player").strip(),
+            "check": match.group("check").strip(" :,."),
+        }
+    return None
+
+
 def _skip_anomaly_result(
     server_id: str,
     template_id: str,
@@ -1231,6 +1599,40 @@ def _build_observation(
     if not run_template:
         # 标记降采样记录，便于后续报告/调试识别
         tags.append("info_downsampled")
+    # PR10: daily_noise / chat_message / anticheat_vulcan 检测。
+    # 这些标签独立于上面的级别/异常标签，由专用配置开关控制。
+    daily_noise_hit = False
+    chat_info: dict[str, Any] | None = None
+    vulcan_info: dict[str, str] | None = None
+    if runtime_config is not None:
+        if runtime_config.daily_noise_filter_enabled:
+            # PR10 hotfix: daily_noise 只过滤 INFO 级别，WARN/ERROR/FATAL 永远不过滤。
+            # 真实日志验证：luckperms-worker-N/WARN: Failed to validate connection
+            # 是 HikariCP 连接池异常，必须告警；如果用 'luckperms-worker-N/' pattern
+            # 一刀切过滤会把真实异常也吞掉。INFO 级别的 luckperms 常规日志才过滤。
+            if level == "INFO":
+                # 用户配置为空时使用 DEFAULT_DAILY_NOISE_PATTERNS；非空则只用用户的。
+                patterns = (
+                    runtime_config.daily_noise_patterns
+                    if runtime_config.daily_noise_patterns
+                    else list(DEFAULT_DAILY_NOISE_PATTERNS)
+                )
+                if patterns and _match_noise_patterns(content, _compile_noise_patterns(patterns)):
+                    tags.append("daily_noise")
+                    daily_noise_hit = True
+        if runtime_config.chat_summary_enabled:
+            chat_info = _detect_chat_message(content)
+            if chat_info is not None:
+                tags.append("chat_message")
+                # PR10 v2: 单条消息不再打 chat_spam 标签——刷屏是玩家级时间窗口
+                # 聚合行为（同一ID短时间大量重复/相似消息），不是单条形态。
+                # 仅标记 meaningless 子标签供聚合阶段使用。
+                if _detect_meaningless_message(chat_info[1]):
+                    tags.append("chat_meaningless")
+        if runtime_config.vulcan_detect_enabled:
+            vulcan_info = _detect_vulcan_alert(content)
+            if vulcan_info is not None:
+                tags.append("anticheat_vulcan")
     observed_ms = int(time.time() * 1000)
     server_name = source.server_name or source.server_id or "Minecraft"
     context = {
@@ -1270,6 +1672,20 @@ def _build_observation(
             },
         ),
     }
+    if daily_noise_hit:
+        context["dailyNoise"] = True
+        context["otel"]["attributes"]["daily.noise"] = True
+    if chat_info is not None:
+        player, message = chat_info
+        context["chatPlayer"] = player
+        context["chatMessage"] = message
+        context["otel"]["attributes"]["chat.player"] = player
+        context["otel"]["attributes"]["chat.message"] = message
+    if vulcan_info is not None:
+        context["vulcanPlayer"] = vulcan_info.get("player", "")
+        context["vulcanCheck"] = vulcan_info.get("check", "")
+        context["otel"]["attributes"]["vulcan.player"] = vulcan_info.get("player", "")
+        context["otel"]["attributes"]["vulcan.check"] = vulcan_info.get("check", "")
     if parsed.params:
         context["templateParams"] = parsed.params[:8]
         context["otel"]["attributes"]["template.params"] = parsed.params[:8]

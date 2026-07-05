@@ -229,6 +229,50 @@ community > chat_review > player_feedback > community_ops
 
 **告警策略**：critical 直告；high 默认 `evidence_count >= 3` 告警；medium 仅在影响多服务器/多后端或证据数较多时告警；low 不告警。`chat_review` 默认不告警，除非 severity≥high、evidence_count≥5 或命中威胁/隐私敏感词；`player_feedback` 通常不告警，仅进入运营待办；`community_ops` 仅 high/critical 才告警。
 
+**检查项目开关与过滤**：12 类检查项目可以在 `mine_sentinel.runtime_log` 下按需开关或过滤：
+
+- `category_enabled`（dict[str, bool]）：单分类开关。把某个分类设为 `false` 即关闭该检查项目，被关闭的分类不再参与匹配，记录会落到下一优先级分类或 `daily`。例：`{"chat_review": false, "player_feedback": false}`。
+- `category_whitelist`（list[str]）：白名单模式。非空时仅白名单内分类参与检查，其余全部关闭。例：`["bug", "plugin", "network"]` 表示只检查这三类。
+- `disabled_categories`（list[str]）：已弃用别名，等价于把这些分类在 `category_enabled` 中设为 `false`。
+
+两者可同时使用：先用 `category_whitelist` 选出关注集合，再用 `category_enabled` 在白名单内做二次细关。`daily` 是兜底分类，强制开启（写 `false` 也会被忽略），保证无关键词日志仍能被归类。配置示例：
+
+```yaml
+mine_sentinel:
+  runtime_log:
+    # 关闭聊天审查和玩家建议检查
+    category_enabled:
+      chat_review: false
+      player_feedback: false
+    # 或者只检查 bug/plugin/network 三类（其他全部关闭）
+    # category_whitelist: ["bug", "plugin", "network"]
+```
+
+**正常日志噪声过滤**：Minecraft 服务器的"玩家正常断开/登录/UUID 分配/LuckPerms 常规日志"原本会因命中 `lost connection`/`logged in`/`uuid`/`permission` 等关键词而被归入 `network`/`moderation` 分类，并在 5 分钟窗口内聚合成"事件#1 服务器集中出现多类运行日志异常"或"事件#2 权限/登录相关运行日志异常"，造成误报。`daily_noise_filter` 通过正则把这些正常日志强制归入 `daily+low`，不参与事件聚合：
+
+- `daily_noise_filter_enabled`（bool，默认 true）：总开关。
+- `daily_noise_patterns`（list[str]）：正则列表，命中任一即标记为 `daily_noise`。为空时使用内置默认集（覆盖 `lost connection: Disconnected` / `logged in with entity id` / `UUID of player X is` / `[LP] LOG` / `luckperms-worker-N` / `joined the game` / `left the game`）。非空时只用用户列表，覆盖默认集。
+
+```yaml
+mine_sentinel:
+  runtime_log:
+    daily_noise_filter_enabled: true
+    # 追加自定义噪声（如某插件的常规心跳日志）
+    daily_noise_patterns:
+      - "lost connection:\\s*Disconnected"
+      - "\\[MyPlugin\\] heartbeat"
+```
+
+**聊天内容热点总结**：识别 `[Async Chat Thread]/<player>` 聊天行并提取玩家名和消息内容，在报告中生成 `chat_topics` 段（活跃玩家 + 高频关键词 + 样本消息），并交给 AI 归纳为 `chat_summary` 字段。关键词提取支持中英文（英文按空格分词，中文按 2-gram 滑窗），不依赖外部 NLP 库。
+
+- `chat_summary_enabled`（bool，默认 true）：开关。
+- `chat_summary_max_topics`（int，默认 5）：最多保留的活跃玩家数和关键词数。
+- `chat_summary_max_samples`（int，默认 3）：最多保留的样本消息数。
+
+**Vulcan 反作弊插件识别**：检测 `[Vulcan]` 前缀日志，提取玩家名和检查类型（如 Reach/Fly），打 `anticheat_vulcan` 标签，归入 `community` 分类，并在报告中以 `vulcan_alerts` 段结构化呈现"时间 + 涉及玩家 ID + 检查类型"，便于管理员快速定位作弊嫌疑玩家。Vulcan 告警不参与 incident 聚合，单独走结构化呈现。
+
+- `vulcan_detect_enabled`（bool，默认 true）：开关。
+
 **推荐动作**按分类细化：plugin 查依赖和版本、network 查代理连通性和转发配置、community 交社区管理流程复核、chat_review 优先处理威胁/隐私、critical 查 latest.log 和崩溃报告并评估回滚。详细规则见 [services/mine_sentinel/reporting/rules.py](services/mine_sentinel/reporting/rules.py)。
 
 ## 部署提示词

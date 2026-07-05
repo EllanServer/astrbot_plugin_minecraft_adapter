@@ -149,6 +149,7 @@ CATEGORY_KEYS = {
         "cheat",
         "cheating",
         "anticheat",
+        "anti-cheat",
         "xray",
         "fly",
         "speed",
@@ -157,6 +158,8 @@ CATEGORY_KEYS = {
         "killaura",
         "violation",
         "vl",
+        # PR10: Vulcan 反作弊插件专用关键词，使 [Vulcan] 日志归入 community
+        "vulcan",
         "封禁",
         "禁言",
         "踢出",
@@ -164,9 +167,11 @@ CATEGORY_KEYS = {
         "外挂",
     ),
     "chat_review": (
-        # 仅保留违规信号词；generic chat/message/said/tell/msg/whisper/pm
+        # 仅保留高置信度违规信号词；generic chat/message/said/tell/msg/whisper/pm
         # 会命中所有 [Async Chat Thread] 日志，导致 player_feedback 永远不可达，
         # 且与"辱骂/广告/骚扰/刷屏归 chat_review"的设计意图不符。
+        # 真实日志验证：'ad' 子串会误判 dadada/already，'link'/'url' 误判正常技术讨论，
+        # '私聊' 是正常常用词——均已移除。
         "swear",
         "profanity",
         "insult",
@@ -175,18 +180,31 @@ CATEGORY_KEYS = {
         "threat",
         "toxic",
         "advertising",
-        "ad",
-        "link",
-        "url",
+        # URL/外链信号（高置信度广告/引流指标）
         "discord.gg",
+        "discord.com/invite",
+        "http://",
+        "https://",
+        "www.",
+        ".com/",
+        ".cn/",
+        # 中文辱骂/骚扰/广告信号
         "辱骂",
         "骂人",
         "脏话",
         "骚扰",
         "威胁",
-        "广告",
+        "开盒",
+        "人肉",
         "刷屏",
-        "私聊",
+        "代练",
+        "代打",
+        "出售账号",
+        "卖号",
+        "买号",
+        "加群",
+        "加微信",
+        "加qq",
         "举报聊天",
     ),
     "player_feedback": (
@@ -323,6 +341,23 @@ COMMUNITY_MARKERS = CATEGORY_KEYS["community"]
 CHAT_REVIEW_MARKERS = CATEGORY_KEYS["chat_review"]
 PLAYER_FEEDBACK_MARKERS = CATEGORY_KEYS["player_feedback"]
 COMMUNITY_OPS_MARKERS = CATEGORY_KEYS["community_ops"]
+# URL/外链信号仅在 chat_message 标签的记录上触发 chat_review。
+# 真实日志验证：QuickShop-Hikari 等插件的更新检查日志
+# （[QuickShop-Hikari] Update here: https://modrinth.com/...）
+# 会被 https:// 信号误判为 chat_review；插件更新日志不是聊天内容。
+# 辱骂/代练/交易等中文信号对任何记录都适用（罕见误判）。
+CHAT_REVIEW_URL_MARKERS = (
+    "discord.gg",
+    "discord.com/invite",
+    "http://",
+    "https://",
+    "www.",
+    ".com/",
+    ".cn/",
+)
+CHAT_REVIEW_GENERAL_MARKERS = tuple(
+    k for k in CHAT_REVIEW_MARKERS if k not in CHAT_REVIEW_URL_MARKERS
+)
 CRITICAL_MARKERS = (
     "fatal",
     "severe",
@@ -386,11 +421,42 @@ def _keys_match(text: str, keys: tuple[str, ...]) -> bool:
     return any(key in text for key in keys if not _is_word_key(key))
 
 
+def _format_timestamp(ts_ms: int) -> str:
+    """把毫秒时间戳格式化为 HH:MM:SS（本地时间），用于 Vulcan 告警呈现。"""
+    if not ts_ms:
+        return ""
+    import time as _time
+
+    return _time.strftime("%H:%M:%S", _time.localtime(ts_ms / 1000))
+
+
 class HeuristicReportBuilder:
     """Build deterministic fallback facts from SERVER_LOG records."""
 
     def __init__(self, config: MineSentinelConfig):
         self.config = config
+        # 预计算当前生效的分类优先级列表（应用 category_enabled / category_whitelist）。
+        # daily 始终兜底，永远保留在末尾。
+        self._active_priority: tuple[str, ...] = self._compute_active_priority()
+
+    def _compute_active_priority(self) -> tuple[str, ...]:
+        """根据 runtime_log.category_enabled / category_whitelist 计算生效分类。"""
+        runtime = self.config.runtime_log
+        whitelist = set(runtime.category_whitelist or ())
+        disabled = set(
+            cat for cat, enabled in (runtime.category_enabled or {}).items()
+            if enabled is False
+        )
+        active = [
+            cat
+            for cat in CLASSIFY_PRIORITY
+            if cat != "daily"
+            and cat not in disabled
+            and (not whitelist or cat in whitelist)
+        ]
+        # daily 永远兜底
+        active.append("daily")
+        return tuple(active)
 
     def build(
         self,
@@ -410,6 +476,15 @@ class HeuristicReportBuilder:
         proxy_ids = sorted({record.proxy_id for record in log_records if record.proxy_id})
         categories: dict[str, list[str]] = {key: [] for key in CATEGORY_KEYS}
         buckets: dict[tuple[str, str], list[ObservationRecord]] = defaultdict(list)
+
+        # PR10 v2: 玩家级刷屏检测——在分类前跑，给参与刷屏的记录打 chat_flood 标签，
+        # 这样 classify() 能把它们强制归入 chat_review。
+        # 刷屏是聚合行为（同一ID短时间大量重复/相似消息），不能靠单条形态识别。
+        flood_events = self._detect_and_tag_floods(log_records)
+        # PR10 v3: 玩家级重复违规检测——同一玩家在窗口内多次命中同类 chat_review
+        # 关键词（如反复发链接、反复发代练广告）视为"行为"，打 chat_abuse 标签。
+        # 单次命中只是"线索"，不强制 chat_review；重复命中才是"行为"。
+        abuse_events = self._detect_and_tag_abuse(log_records)
 
         for record in log_records:
             category = self.classify(record)
@@ -482,6 +557,10 @@ class HeuristicReportBuilder:
         any_alert = any(issue["should_alert"] for issue in issues)
         ops_notes, counters = self._ops_notes(log_records, issues, max_severity, any_alert)
 
+        # PR10: 聊天热点总结 + Vulcan 反作弊结构化告警
+        chat_topics = self._build_chat_topics(log_records, flood_events, abuse_events)
+        vulcan_alerts = self._build_vulcan_alerts(log_records)
+
         return {
             "summary": (
                 f"最近 {window_minutes} 分钟收到 {len(log_records)} 条 "
@@ -499,15 +578,34 @@ class HeuristicReportBuilder:
             "max_severity": max_severity,
             "any_alert": any_alert,
             "counters": counters,
+            "chat_topics": chat_topics,
+            "vulcan_alerts": vulcan_alerts,
         }
 
     # --- 分类 -------------------------------------------------------------
     def classify(self, record: ObservationRecord) -> str:
+        # PR10: daily_noise 标签优先级最高，强制归入 daily，避免正常 login/disconnect
+        # 等被 moderation/network 关键词误判为异常事件。
+        if "daily_noise" in record.tags:
+            return "daily"
+        # PR10 v3: 行为标签强制归入 chat_review（若该分类开启）。
+        # 行为=刷屏(chat_flood) 或 重复违规(chat_abuse)，均由 build() 阶段
+        # 基于玩家上下文检测后回填标签。单条关键词命中不强制归入 chat_review——
+        # 单次命中只是"线索"，需要结合玩家上下文（同玩家是否重复发送同类内容）
+        # 才能判定为"行为"。
+        if "chat_review" in self._active_priority:
+            if "chat_flood" in record.tags or "chat_abuse" in record.tags:
+                return "chat_review"
         text = self._record_text(record)
-        # 按 CLASSIFY_PRIORITY 顺序匹配，daily 兜底
-        for category in CLASSIFY_PRIORITY:
+        # 按当前生效的优先级列表匹配（已应用 category_enabled / category_whitelist），
+        # daily 兜底。被关闭的分类直接跳过，记录会落到下一优先级或 daily。
+        # 注意：chat_review 不再靠单条关键词命中触发——避免"玩家偶尔发一条链接"
+        # 被误判为聊天审查违规。关键词命中只在 review_evidence 里作为"线索"呈现。
+        for category in self._active_priority:
             if category == "daily":
                 continue
+            if category == "chat_review":
+                continue  # 行为标签已在上面处理；单条关键词不再触发
             keys = CATEGORY_KEYS.get(category, ())
             if _keys_match(text, keys):
                 return category
@@ -519,6 +617,9 @@ class HeuristicReportBuilder:
         level = str((record.context or {}).get("level") or "").lower()
         if "loop_suppressed" in record.tags:
             return f"server_log_loop_{level or 'warn'}"
+        # PR10: Vulcan 反作弊告警单独打 tag，便于报告里按反作弊维度聚合呈现
+        if "anticheat_vulcan" in record.tags:
+            return "server_log_anticheat_vulcan"
         # 按分类优先级给 tag
         category = self.classify(record)
         tag_map = {
@@ -552,6 +653,10 @@ class HeuristicReportBuilder:
 
     # --- 严重级别 ---------------------------------------------------------
     def _severity(self, group: list[ObservationRecord]) -> str:
+        # PR10: 全员 daily_noise 的 group 强制 low，避免被 EWMA 突增/网络关键词
+        # 提级，保证正常 login/disconnect/UUID 等绝不形成事件。
+        if group and all("daily_noise" in record.tags for record in group):
+            return "low"
         text = " ".join(self._record_text(record) for record in group)
         n = len(group)
         # 异常分数提级：模板计数突增（EWMA + 分位数）达到高分直接提级
@@ -647,10 +752,14 @@ class HeuristicReportBuilder:
         if multi_scope and severity in {"medium", "high"}:
             return True
         # chat_review 特殊规则：默认不告警，除非 severity>=high / evidence_count>=5 / 命中敏感词
+        # / 命中 chat_flood 标签（玩家级刷屏已强制 chat_review，需单独触发告警，否则审核漏报）
         if category == "chat_review":
             if severity in {"high", "critical"}:
                 return True
             if any(marker in text for marker in CHAT_SENSITIVE_MARKERS):
+                return True
+            # 行为标签（刷屏/重复违规）强制告警——这些是基于玩家上下文判定的真行为
+            if any("chat_flood" in record.tags or "chat_abuse" in record.tags for record in group):
                 return True
             return evidence_count >= 5
         # player_feedback 通常不告警
@@ -861,6 +970,634 @@ class HeuristicReportBuilder:
             "moderation": categories.get("moderation", []),
             "cross_server": categories.get("cross_server", []),
             "suggestion": categories.get("suggestion", []),
+        }
+
+    # --- 玩家级刷屏检测（PR10 v2）-----------------------------------------
+    def _detect_and_tag_floods(
+        self, records: list[ObservationRecord]
+    ) -> list[dict[str, Any]]:
+        """检测玩家级刷屏行为，给参与刷屏的记录打 chat_flood 标签。
+
+        刷屏定义（百度百科+社区规则）：
+        同一ID短时间集中发送大量重复或高度相似的信息。
+        - 连续 5 条以上重复/相似 = 轻微刷屏
+        - 连续 10 条以上 = 恶意刷屏
+
+        三类刷屏：
+        1. high_frequency: 60 秒内同一玩家发送 >=5 条消息
+        2. repeat_content: 5 分钟内同一玩家发送 >=3 条相同/高度相似消息
+        3. meaningless: 5 分钟内同一玩家发送 >=5 条无意义符号消息
+
+        返回 flood_events 列表（用于 chat_topics.flood_players 呈现给 LLM）。
+        """
+        # 延迟导入避免循环依赖
+        from ..runtime_log import _detect_chat_flood
+
+        chat_records = [r for r in records if "chat_message" in r.tags]
+        if not chat_records:
+            return []
+        floods_by_player = _detect_chat_flood(chat_records)
+        if not floods_by_player:
+            return []
+
+        # 收集所有参与刷屏的记录 eventId，给它们打 chat_flood 标签
+        flood_event_ids: set[str] = set()
+        flood_events: list[dict[str, Any]] = []
+        for player, events in floods_by_player.items():
+            for event in events:
+                flood_events.append(event)
+        # 重新扫描记录，给参与刷屏窗口的记录打标签
+        # 通过 player + 时间窗口匹配
+        for record in chat_records:
+            ctx = record.context or {}
+            player = str(ctx.get("chatPlayer") or "").strip()
+            if not player or player not in floods_by_player:
+                continue
+            ts = record.timestamp or 0
+            for event in floods_by_player[player]:
+                if (event["window_start_ms"] <= ts <= event["window_end_ms"]
+                    and "chat_flood" not in record.tags):
+                    record.tags.append("chat_flood")
+                    # 记录刷屏类型到 context 供 LLM 呈现
+                    ctx.setdefault("floodTypes", [])
+                    if event["flood_type"] not in ctx["floodTypes"]:
+                        ctx["floodTypes"].append(event["flood_type"])
+                    break
+        return flood_events
+
+    # --- 玩家级重复违规检测（PR10 v3）-------------------------------------
+    def _detect_and_tag_abuse(
+        self, records: list[ObservationRecord]
+    ) -> list[dict[str, Any]]:
+        """检测玩家级重复违规行为，给重复命中的记录打 chat_abuse 标签。
+
+        PR10 v3: 行为判断必须有上下文。单条关键词命中只是"线索"，
+        同一玩家在窗口内多次命中"同类"关键词才构成"行为"：
+        - 同玩家 >=2 条命中 URL 类（discord.gg/http/https） → 链接广告行为
+        - 同玩家 >=2 条命中 交易广告类（代练/卖号/加群） → 交易广告行为
+        - 同玩家 >=2 条命中 辱骂类 → 辱骂行为
+        - 同玩家 >=1 条命中 敏感词（威胁/开盒/人肉） → 直接敏感行为
+
+        返回 abuse_events 列表（用于 review_evidence 上下文呈现）。
+        """
+        chat_records = [r for r in records if "chat_message" in r.tags]
+        if not chat_records:
+            return []
+        # 按玩家聚合
+        player_records: dict[str, list[ObservationRecord]] = defaultdict(list)
+        for record in chat_records:
+            ctx = record.context or {}
+            player = str(ctx.get("chatPlayer") or "").strip()
+            if player:
+                player_records[player].append(record)
+
+        abuse_events: list[dict[str, Any]] = []
+        abuse_record_ids: set[str] = set()
+        for player, records_sorted in player_records.items():
+            # 按类别统计命中
+            hits_by_category: dict[str, list[tuple[ObservationRecord, list[str]]]] = defaultdict(list)
+            for record in records_sorted:
+                hit_keys = self._detect_chat_review_hits(record)
+                if hit_keys:
+                    category = self._classify_hit_keys(hit_keys)
+                    hits_by_category[category].append((record, hit_keys))
+
+            for category, hits in hits_by_category.items():
+                # 敏感词：1 条即行为；其他类：>=2 条为行为
+                is_behavior = (category == "sensitive") or (len(hits) >= 2)
+                if not is_behavior:
+                    continue
+                # 给这些记录打 chat_abuse 标签
+                for record, hit_keys in hits:
+                    if "chat_abuse" not in (record.tags or []):
+                        record.tags.append("chat_abuse")
+                    ctx = record.context or {}
+                    ctx.setdefault("abuseCategories", [])
+                    if category not in ctx["abuseCategories"]:
+                        ctx["abuseCategories"].append(category)
+                    abuse_record_ids.add(record.event_id)
+                abuse_events.append({
+                    "player": player,
+                    "category": category,
+                    "hit_count": len(hits),
+                    "samples": [
+                        str((r.context or {}).get("chatMessage") or r.content).strip()[:150]
+                        for r, _ in hits[:3]
+                    ],
+                })
+        return abuse_events
+
+    # --- 聊天热点总结（PR10）---------------------------------------------
+    def _build_chat_topics(
+        self,
+        records: list[ObservationRecord],
+        flood_events: list[dict[str, Any]] | None = None,
+        abuse_events: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """从 chat_message 标签记录中聚合聊天热点。
+
+        返回结构：
+        - total_messages: 聊天消息总数
+        - unique_players: 不同玩家数
+        - top_players: 按消息数排序的活跃玩家，含样本消息
+        - top_keywords: 高频关键词（去除停用词后）
+        - sample_messages: 时间序样本消息
+        - flood_players: 刷屏玩家列表（PR10 v2，玩家级时间窗口聚合检测）
+        - abuse_players: 重复违规玩家列表（PR10 v3，基于玩家上下文的行为判断）
+        - review_evidence: 需审查的聊天证据（行为 + 线索，含玩家上下文）
+
+        chat_summary_enabled=false 时返回空字典。
+        """
+        if not self.config.runtime_log.chat_summary_enabled:
+            return {}
+        chat_records = [
+            record for record in records if "chat_message" in record.tags
+        ]
+        if not chat_records:
+            return {
+                "total_messages": 0,
+                "unique_players": 0,
+                "top_players": [],
+                "top_keywords": [],
+                "sample_messages": [],
+                "flood_players": [],
+                "abuse_players": [],
+                "review_evidence": [],
+            }
+        max_topics = max(1, self.config.runtime_log.chat_summary_max_topics)
+        max_samples = max(1, self.config.runtime_log.chat_summary_max_samples)
+
+        # 按玩家聚合
+        player_messages: dict[str, list[ObservationRecord]] = defaultdict(list)
+        all_messages: list[str] = []
+        for record in chat_records:
+            ctx = record.context or {}
+            player = str(ctx.get("chatPlayer") or "").strip()
+            message = str(ctx.get("chatMessage") or record.content).strip()
+            player_messages[player].append(record)
+            if message:
+                all_messages.append(message)
+
+        top_players_sorted = sorted(
+            player_messages.items(),
+            key=lambda item: len(item[1]),
+            reverse=True,
+        )[:max_topics]
+        top_players = []
+        for player, group in top_players_sorted:
+            samples = [
+                str((r.context or {}).get("chatMessage") or r.content).strip()
+                for r in group[:max_samples]
+            ]
+            top_players.append(
+                {
+                    "player": player or "(unknown)",
+                    "message_count": len(group),
+                    "samples": [s for s in samples if s],
+                }
+            )
+
+        # 高频关键词（简单分词 + 停用词过滤，不依赖外部 NLP 库）
+        top_keywords = self._extract_top_keywords(all_messages, max_topics)
+
+        # 时间序样本消息（覆盖整个窗口）
+        sample_messages = []
+        step = max(1, len(chat_records) // max_samples)
+        for index in range(0, len(chat_records), step):
+            record = chat_records[index]
+            ctx = record.context or {}
+            player = str(ctx.get("chatPlayer") or "").strip()
+            message = str(ctx.get("chatMessage") or record.content).strip()
+            if message:
+                prefix = f"<{player}> " if player else ""
+                sample_messages.append(prefix + message)
+            if len(sample_messages) >= max_samples:
+                break
+
+        # PR10 v2: 刷屏玩家结构化呈现——把 flood_events 转成 LLM 友好格式
+        flood_players = self._format_flood_players(flood_events or [])
+        # PR10 v3: 重复违规玩家结构化呈现——同一玩家多次命中同类关键词
+        abuse_players = self._format_abuse_players(abuse_events or [])
+
+        # PR10 v3: 聊天审查证据——基于玩家上下文（行为 + 线索）
+        review_evidence = self._build_chat_review_evidence(chat_records, max_samples=10)
+
+        return {
+            "total_messages": len(chat_records),
+            "unique_players": len(player_messages),
+            "top_players": top_players,
+            "top_keywords": top_keywords,
+            "sample_messages": sample_messages,
+            "flood_players": flood_players,
+            "abuse_players": abuse_players,
+            "review_evidence": review_evidence,
+        }
+
+    def _format_flood_players(
+        self, flood_events: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """把 flood_events 转成 LLM 友好的 flood_players 列表。
+
+        每个玩家一个条目，聚合该玩家的所有刷屏事件：
+        - player: 玩家名
+        - flood_types: 刷屏类型列表（high_frequency/repeat_content/meaningless）
+        - total_messages: 窗口内消息总数
+        - time_range: 时间范围 HH:MM:SS-HH:MM:SS
+        - events: 各刷屏事件详情（type/window/message_count/samples）
+        """
+        if not flood_events:
+            return []
+        # 按玩家聚合
+        by_player: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for event in flood_events:
+            by_player[event["player"]].append(event)
+        result: list[dict[str, Any]] = []
+        for player, events in by_player.items():
+            all_ts = []
+            for e in events:
+                all_ts.append(e["window_start_ms"])
+                all_ts.append(e["window_end_ms"])
+            time_range = ""
+            if all_ts:
+                start = _format_timestamp(min(all_ts))
+                end = _format_timestamp(max(all_ts))
+                time_range = f"{start}-{end}"
+            flood_types = sorted({e["flood_type"] for e in events})
+            total_msgs = sum(e["message_count"] for e in events)
+            # 收集样本（去重，最多 5 条）
+            samples: list[str] = []
+            seen: set[str] = set()
+            for e in sorted(events, key=lambda x: x["window_start_ms"]):
+                for s in e.get("samples", []):
+                    if s not in seen:
+                        samples.append(s)
+                        seen.add(s)
+                    if len(samples) >= 5:
+                        break
+                if len(samples) >= 5:
+                    break
+            result.append({
+                "player": player,
+                "flood_types": flood_types,
+                "total_messages": total_msgs,
+                "time_range": time_range,
+                "events": [
+                    {
+                        "type": e["flood_type"],
+                        "message_count": e["message_count"],
+                        "time_range": (
+                            f"{_format_timestamp(e['window_start_ms'])}-"
+                            f"{_format_timestamp(e['window_end_ms'])}"
+                        ),
+                        "samples": e.get("samples", [])[:3],
+                    }
+                    for e in sorted(events, key=lambda x: x["window_start_ms"])
+                ],
+                "samples": samples,
+            })
+        # 按消息数降序
+        result.sort(key=lambda x: x["total_messages"], reverse=True)
+        return result
+
+    def _format_abuse_players(
+        self, abuse_events: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """把 abuse_events 转成 LLM 友好的 abuse_players 列表。
+
+        每个玩家一个条目，聚合该玩家的所有重复违规事件：
+        - player: 玩家名
+        - abuse_categories: 违规类别列表（url/abuse_language/trade_ad/sensitive）
+        - total_hits: 命中总次数
+        - events: 各违规事件详情（category/hit_count/samples）
+        - samples: 样本原文（最多 5 条）
+        """
+        if not abuse_events:
+            return []
+        by_player: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for event in abuse_events:
+            by_player[event["player"]].append(event)
+        result: list[dict[str, Any]] = []
+        for player, events in by_player.items():
+            categories = sorted({e["category"] for e in events})
+            total_hits = sum(e["hit_count"] for e in events)
+            samples: list[str] = []
+            seen: set[str] = set()
+            for e in events:
+                for s in e.get("samples", []):
+                    if s not in seen:
+                        samples.append(s)
+                        seen.add(s)
+                    if len(samples) >= 5:
+                        break
+                if len(samples) >= 5:
+                    break
+            result.append({
+                "player": player,
+                "abuse_categories": categories,
+                "total_hits": total_hits,
+                "events": [
+                    {
+                        "category": e["category"],
+                        "hit_count": e["hit_count"],
+                        "samples": e.get("samples", [])[:3],
+                    }
+                    for e in events
+                ],
+                "samples": samples,
+            })
+        result.sort(key=lambda x: x["total_hits"], reverse=True)
+        return result
+
+    def _build_chat_review_evidence(
+        self, chat_records: list[ObservationRecord], max_samples: int = 10
+    ) -> list[dict[str, Any]]:
+        """从聊天记录中提取需要审查的证据样本，基于玩家级行为上下文判断。
+
+        PR10 v3: 行为判断必须有上下文。不再单条命中关键词就进证据，
+        而是按玩家聚合，统计同一玩家在窗口内的：
+        - 总消息数
+        - 命中关键词的次数
+        - 命中的关键词类型（URL/辱骂/代练/交易等）
+        - 是否重复发送同类内容
+
+        单次命中：作为"线索"呈现（reason=hint），不强制 chat_review
+        重复命中：作为"行为"呈现（reason=abuse），强制 chat_review
+        刷屏命中：作为"行为"呈现（reason=flood），强制 chat_review
+
+        返回结构化列表，每条含：
+        - player: 玩家名
+        - player_total_messages: 该玩家窗口内总消息数（上下文）
+        - player_hit_count: 该玩家命中关键词的消息数
+        - message: 聊天原文（样本）
+        - flood_types: 刷屏类型列表（参与刷屏时）
+        - reason: 命中原因（flood/abuse/hint）
+          flood=刷屏行为，abuse=重复关键词命中（行为），hint=单次命中（线索）
+        - hit_keys: 命中的关键词
+        - hit_category: 命中类别（url/abuse_language/trade_ad/sensitive）
+        - time_text: HH:MM:SS 时间
+        """
+        # 第一步：按玩家聚合聊天记录，统计每个玩家的行为上下文
+        player_records: dict[str, list[ObservationRecord]] = defaultdict(list)
+        for record in chat_records:
+            ctx = record.context or {}
+            player = str(ctx.get("chatPlayer") or "").strip()
+            if player:
+                player_records[player].append(record)
+
+        # 第二步：对每个玩家，找出命中关键词的记录并分类
+        # 命中类别分组（用于判断是"单次线索"还是"重复行为"）
+        evidence: list[dict[str, Any]] = []
+        for player, records in player_records.items():
+            records_sorted = sorted(records, key=lambda r: r.timestamp or 0)
+            player_total = len(records_sorted)
+            # 收集该玩家所有命中记录，按类别分组
+            hit_records_by_category: dict[str, list[tuple[ObservationRecord, list[str]]]] = defaultdict(list)
+            for record in records_sorted:
+                ctx = record.context or {}
+                tags = record.tags or []
+                is_flood = "chat_flood" in tags
+                if is_flood:
+                    # 刷屏记录直接归入 flood 类别
+                    hit_records_by_category["flood"].append((record, []))
+                    continue
+                # 检测关键词命中
+                hit_keys = self._detect_chat_review_hits(record)
+                if hit_keys:
+                    category = self._classify_hit_keys(hit_keys)
+                    hit_records_by_category[category].append((record, hit_keys))
+
+            # 第三步：根据每个类别的命中次数判断是"行为"还是"线索"
+            for category, hits in hit_records_by_category.items():
+                hit_count = len(hits)
+                # 行为判定阈值：同类命中 >=2 次视为"重复行为"（abuse）
+                # 单次命中视为"线索"（hint），刷屏永远是"行为"（flood）
+                if category == "flood":
+                    reason = "flood"
+                elif hit_count >= 2:
+                    reason = "abuse"
+                else:
+                    reason = "hint"
+
+                # 只把"行为"(flood/abuse) 进证据；"线索"(hint) 也进，但标记为 hint，
+                # 让 LLM 能看到上下文区分严重性
+                for record, hit_keys in hits[:3]:  # 每个玩家每类最多 3 条样本
+                    ctx = record.context or {}
+                    message = str(ctx.get("chatMessage") or record.content).strip()
+                    flood_types = list(ctx.get("floodTypes") or [])
+                    time_text = _format_timestamp(record.timestamp) if record.timestamp else ""
+                    evidence.append({
+                        "player": player,
+                        "player_total_messages": player_total,
+                        "player_hit_count": hit_count,
+                        "message": message[:200],
+                        "flood_types": flood_types,
+                        "reason": reason,
+                        "hit_keys": hit_keys[:5],
+                        "hit_category": category if category != "flood" else "",
+                        "time_text": time_text,
+                    })
+                    if len(evidence) >= max_samples:
+                        return evidence
+        return evidence
+
+    @staticmethod
+    def _detect_chat_review_hits(record: ObservationRecord) -> list[str]:
+        """检测单条记录命中的 chat_review 关键词，返回命中的关键词列表。"""
+        if "chat_message" not in (record.tags or []):
+            return []
+        content_lower = (record.content or "").lower()
+        hits: list[str] = []
+        for key in CHAT_REVIEW_GENERAL_MARKERS:
+            if _is_word_key(key):
+                if _word_boundary_regex((key,)) and _word_boundary_regex((key,)).search(content_lower):
+                    hits.append(key)
+            elif key in content_lower:
+                hits.append(key)
+        for key in CHAT_REVIEW_URL_MARKERS:
+            if key in content_lower:
+                hits.append(key)
+        return hits
+
+    @staticmethod
+    def _classify_hit_keys(hit_keys: list[str]) -> str:
+        """把命中的关键词归类，用于判断是哪类违规行为。
+
+        返回类别：
+        - url: URL/外链信号（discord.gg/http/https/www 等）
+        - abuse_language: 辱骂/骚扰/威胁语言
+        - trade_ad: 交易/代练/加群广告
+        - sensitive: 敏感词（威胁/开盒/人肉/隐私）
+        - other: 其他
+        """
+        url_set = set(CHAT_REVIEW_URL_MARKERS)
+        sensitive_set = set(CHAT_SENSITIVE_MARKERS)
+        trade_ad_keys = {"代练", "代打", "出售账号", "卖号", "买号", "加群", "加微信", "加qq", "举报聊天"}
+        abuse_keys = {"swear", "profanity", "insult", "abuse", "harassment", "threat", "toxic",
+                      "advertising", "辱骂", "骂人", "脏话", "骚扰", "威胁", "刷屏"}
+        for key in hit_keys:
+            if key in sensitive_set:
+                return "sensitive"
+        for key in hit_keys:
+            if key in url_set:
+                return "url"
+        for key in hit_keys:
+            if key in trade_ad_keys:
+                return "trade_ad"
+        for key in hit_keys:
+            if key in abuse_keys:
+                return "abuse_language"
+        return "other"
+
+    @staticmethod
+    def _extract_top_keywords(
+        messages: list[str], limit: int
+    ) -> list[dict[str, Any]]:
+        """从聊天消息中提取高频关键词。
+
+        简单实现：英文按空格分词，过滤短词/停用词；中文按 2-3 字滑窗。
+        不依赖 jieba 等分词库，结果用于 AI 进一步归纳的线索。
+        """
+        if not messages:
+            return []
+        stop_words = {
+            "the", "a", "an", "and", "or", "but", "is", "are", "was", "were",
+            "to", "of", "in", "on", "at", "for", "with", "by", "this", "that",
+            "it", "as", "be", "have", "has", "do", "does", "i", "you", "he",
+            "she", "we", "they", "me", "him", "her", "us", "them",
+            "yes", "no", "ok", "okay", "lol", "haha", "ha", "le", "la", "de",
+            "的", "了", "是", "在", "我", "你", "他", "她", "们", "个", "这",
+            "那", "啊", "吧", "吗", "呢", "哦", "嗯", "呀",
+        }
+        counter: dict[str, int] = defaultdict(int)
+        for message in messages:
+            lowered = message.lower()
+            # 英文词
+            for word in re.findall(r"[a-z]{3,}", lowered):
+                if word in stop_words:
+                    continue
+                counter[word] += 1
+            # 中文 2-3 字滑窗
+            for match in re.finditer(r"[\u4e00-\u9fa5]{2,}", message):
+                segment = match.group(0)
+                # 2-gram
+                for i in range(len(segment) - 1):
+                    gram = segment[i : i + 2]
+                    if gram[0] in stop_words or gram[1] in stop_words:
+                        continue
+                    counter[gram] += 1
+        # 至少出现 2 次才算热点
+        hot = [(kw, count) for kw, count in counter.items() if count >= 2]
+        hot.sort(key=lambda item: item[1], reverse=True)
+        return [
+            {"keyword": kw, "count": count} for kw, count in hot[:limit] if count > 0
+        ]
+
+    # --- Vulcan 反作弊告警结构化（PR10）-----------------------------------
+    def _build_vulcan_alerts(
+        self, records: list[ObservationRecord]
+    ) -> dict[str, Any]:
+        """从 anticheat_vulcan 标签记录中提取结构化告警。
+
+        返回结构（应对海量告警，如真实日志 4202 条/2 玩家的场景）：
+        - total: 告警总数
+        - unique_players: 涉及不同玩家数
+        - unique_checks: 涉及不同检查类型数
+        - by_player: [{player, count, top_checks: [(check, count)]}] 按告警数降序
+        - by_check: [{check, count, players: [player]}] 按告警数降序
+        - time_range: {start, end} 最早/最晚告警时间文本
+        - samples: 最多 20 条原始告警（time_text + player + check），按时间序
+
+        Vulcan 检测关闭时返回空字典。
+        """
+        if not self.config.runtime_log.vulcan_detect_enabled:
+            return {}
+        vulcan_records = [
+            record for record in records if "anticheat_vulcan" in record.tags
+        ]
+        if not vulcan_records:
+            return {}
+        vulcan_records.sort(key=lambda r: r.timestamp)
+
+        # 按玩家聚合
+        player_alerts: dict[str, list[tuple[str, ObservationRecord]]] = defaultdict(list)
+        check_alerts: dict[str, list[tuple[str, ObservationRecord]]] = defaultdict(list)
+        for record in vulcan_records:
+            ctx = record.context or {}
+            player = str(ctx.get("vulcanPlayer") or "").strip() or "(unknown)"
+            check = str(ctx.get("vulcanCheck") or "").strip() or "(unknown)"
+            ts_text = _format_timestamp(int(record.timestamp or 0))
+            player_alerts[player].append((check, record))
+            check_alerts[check].append((player, record))
+
+        # by_player 排序
+        by_player = []
+        for player, items in sorted(
+            player_alerts.items(), key=lambda kv: len(kv[1]), reverse=True
+        ):
+            check_counter: dict[str, int] = defaultdict(int)
+            for check, _ in items:
+                check_counter[check] += 1
+            top_checks = sorted(
+                check_counter.items(), key=lambda kv: kv[1], reverse=True
+            )[:3]
+            by_player.append(
+                {
+                    "player": player,
+                    "count": len(items),
+                    "top_checks": [
+                        {"check": c, "count": n} for c, n in top_checks
+                    ],
+                }
+            )
+
+        # by_check 排序
+        by_check = []
+        for check, items in sorted(
+            check_alerts.items(), key=lambda kv: len(kv[1]), reverse=True
+        ):
+            players = sorted({p for p, _ in items})
+            by_check.append(
+                {
+                    "check": check,
+                    "count": len(items),
+                    "players": players,
+                }
+            )
+
+        # 时间范围
+        first_ts = int(vulcan_records[0].timestamp or 0)
+        last_ts = int(vulcan_records[-1].timestamp or 0)
+        time_range = {
+            "start": _format_timestamp(first_ts),
+            "end": _format_timestamp(last_ts),
+        }
+
+        # 样本（最多 20 条，覆盖整个时间范围）
+        sample_records = vulcan_records
+        max_samples = 20
+        if len(sample_records) > max_samples:
+            step = max(1, len(sample_records) // max_samples)
+            sample_records = [sample_records[i] for i in range(0, len(sample_records), step)][:max_samples]
+        samples = []
+        for record in sample_records:
+            ctx = record.context or {}
+            samples.append(
+                {
+                    "time_text": _format_timestamp(int(record.timestamp or 0)),
+                    "server_id": record.server_id or "",
+                    "player": str(ctx.get("vulcanPlayer") or "").strip(),
+                    "check": str(ctx.get("vulcanCheck") or "").strip(),
+                }
+            )
+
+        return {
+            "total": len(vulcan_records),
+            "unique_players": len(player_alerts),
+            "unique_checks": len(check_alerts),
+            "by_player": by_player,
+            "by_check": by_check,
+            "time_range": time_range,
+            "samples": samples,
         }
 
     @staticmethod
