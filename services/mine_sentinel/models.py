@@ -92,6 +92,26 @@ class MineSentinelAlertConfig:
 
 
 @dataclass
+class MineSentinelHourlySummaryConfig:
+    """Hourly summary mode: read logs once per hour, summarize, and integrate every N hours.
+
+    When enabled, the runtime log tailer's polling loop is skipped; instead a scheduled
+    job reads the logs of each past hour directly from the logs/ directory at the start
+    of every hour, builds an hourly summary, and after `hours_per_cycle` summaries
+    integrates them into a single cycle report for delivery.
+    """
+
+    enabled: bool = False
+    hours_per_cycle: int = 8
+    window_minutes: int = 60
+    poll_enabled: bool = False  # 是否同时启用实时轮询（默认关闭，纯按小时读取）
+    provider_id: str = ""
+    max_records_per_hour: int = 5000
+    max_log_lines_per_hour: int = 20000
+    retention_cycles: int = 2  # 磁盘上保留多少个历史周期的 hourly summary
+
+
+@dataclass
 class MineSentinelStorageConfig:
     enabled: bool = True
     retention_minutes: int = DEFAULT_REPORT_INTERVAL_MINUTES
@@ -145,6 +165,9 @@ class MineSentinelConfig:
     )
     report: MineSentinelReportConfig = field(default_factory=MineSentinelReportConfig)
     alert: MineSentinelAlertConfig = field(default_factory=MineSentinelAlertConfig)
+    hourly_summary: MineSentinelHourlySummaryConfig = field(
+        default_factory=MineSentinelHourlySummaryConfig
+    )
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "MineSentinelConfig":
@@ -153,6 +176,7 @@ class MineSentinelConfig:
         runtime_log_data = data.get("runtime_log", {}) or {}
         report_data = data.get("report", {}) or {}
         alert_data = data.get("alert", {}) or {}
+        hourly_data = data.get("hourly_summary", {}) or {}
         interval_minutes = _report_interval_minutes(report_data)
         default_window_minutes = _positive_int(
             report_data.get("default_window_minutes"),
@@ -276,6 +300,20 @@ class MineSentinelConfig:
                     0,
                     _as_int(alert_data.get("analysis_interval_seconds"), 60),
                 ),
+            ),
+            hourly_summary=MineSentinelHourlySummaryConfig(
+                enabled=_as_bool(hourly_data.get("enabled"), False),
+                hours_per_cycle=_positive_int(hourly_data.get("hours_per_cycle"), 8),
+                window_minutes=_positive_int(hourly_data.get("window_minutes"), 60),
+                poll_enabled=_as_bool(hourly_data.get("poll_enabled"), False),
+                provider_id=str(hourly_data.get("provider_id") or ""),
+                max_records_per_hour=_positive_int(
+                    hourly_data.get("max_records_per_hour"), 5000
+                ),
+                max_log_lines_per_hour=_positive_int(
+                    hourly_data.get("max_log_lines_per_hour"), 20000
+                ),
+                retention_cycles=_positive_int(hourly_data.get("retention_cycles"), 2),
             ),
         )
 

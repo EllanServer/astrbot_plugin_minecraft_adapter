@@ -14,14 +14,20 @@ from .alerts import MineSentinelAlertEngine
 from .delivery import MineSentinelDelivery
 from .dispatch import MineSentinelReportDispatcher
 from .formatter import format_report
-from .jobs import PeriodicReportJob
+from .hourly_summary import (
+    HourlySummary,
+    HourlySummaryStore,
+    HourlySummarizer,
+    format_cycle_report,
+)
+from .jobs import HourlySummaryJob, PeriodicReportJob
 from .models import MineSentinelConfig, ObservationRecord
 from .report_artifacts import MineSentinelReportArtifacts
 from .reporting import MineSentinelReporter
 from .reporting.image_renderer import MineSentinelReportImageRenderer
 from .reporting.report_result import MineSentinelRenderedReport
 from .routing import MineSentinelTargetRouter
-from .runtime_log import MineSentinelRuntimeLogTailer
+from .runtime_log import MineSentinelRuntimeLogTailer, build_hour_observations
 from .storage import DiskObservationStore, RecentObservationWindow
 
 
@@ -78,23 +84,69 @@ class MineSentinelService:
             self._run_periodic_report_once,
             lambda: self.last_report_time,
         )
+        self.hourly_summarizer = HourlySummarizer(self.config, context)
+        self.hourly_store = HourlySummaryStore(storage_path) if storage_dir else None
+        # Per-server in-memory cycle buffer of recent HourlySummary objects.
+        self._hourly_cycle_buffers: dict[str, list[HourlySummary]] = {}
+        self._hourly_cycle_starts: dict[str, int] = {}
+        self._hourly_job = HourlySummaryJob(
+            self.config,
+            self._run_hourly_for_source,
+        )
 
     def start(self):
         if not self.config.enabled:
             logger.info("[MineSentinel] 已禁用")
             return
-        if self.config.report.enabled:
+        hourly_enabled = self.config.hourly_summary.enabled
+        poll_enabled = (
+            self.config.runtime_log.enabled
+            and (not hourly_enabled or self.config.hourly_summary.poll_enabled)
+        )
+        if self.config.report.enabled and not hourly_enabled:
             self._periodic_report_job.start()
             logger.info(
                 "[MineSentinel] 定时 AI 报告已启用，"
                 f"间隔 {self.config.report.interval_minutes} 分钟"
             )
-        self.runtime_log_tailer.start()
+        if hourly_enabled:
+            self._hourly_job.start()
+            cycle = self.config.hourly_summary.hours_per_cycle
+            logger.info(
+                "[MineSentinel] hourly 模式已启用：每整点读取上一小时日志并总结，"
+                f"每 {cycle} 小时整合一次发送；启动时立即补读当前小时已过部分。"
+            )
+            sources = self._hourly_job._enabled_sources()
+            if not sources:
+                logger.warning(
+                    "[MineSentinel] hourly 模式已启用但未配置任何日志源，"
+                    "请在 mine_sentinel.runtime_log.sources 中至少添加一个服务器。"
+                )
+            else:
+                logger.info(
+                    "[MineSentinel] hourly 日志源："
+                    + ", ".join(
+                        f"{s.server_id}({s.server_type})" for s in sources
+                    )
+                )
+            if self.config.hourly_summary.poll_enabled:
+                logger.info(
+                    "[MineSentinel] 同时启用实时轮询（poll_enabled=true）；"
+                    "如不需要实时告警可关闭以进一步降低 IO。"
+                )
+        if poll_enabled:
+            self.runtime_log_tailer.start()
+        elif self.config.runtime_log.enabled and hourly_enabled:
+            logger.info(
+                "[MineSentinel] 已禁用实时轮询，仅按小时读取日志；"
+                "MC 服务端 mspt/tps 不会受影响。"
+            )
         logger.info("[MineSentinel] 服务已启动")
 
     async def stop(self):
         await self.runtime_log_tailer.stop()
         await self._periodic_report_job.stop()
+        await self._hourly_job.stop()
 
     async def handle_batch(self, server_id: str, payload: dict):
         if not self.config.enabled:
@@ -136,6 +188,19 @@ class MineSentinelService:
                 f"（{len(self.runtime_log_tailer.enabled_sources)} 个来源）"
             ),
         ]
+        if self.config.hourly_summary.enabled:
+            cycle = self.config.hourly_summary.hours_per_cycle
+            lines.append(
+                "hourly 模式：启用"
+                f"（每 {cycle} 小时整合一次，poll_enabled="
+                f"{self.config.hourly_summary.poll_enabled}）"
+            )
+            for sid, buf in self._hourly_cycle_buffers.items():
+                lines.append(
+                    f"  - {sid}: 周期进度 {len(buf)}/{cycle}"
+                )
+        else:
+            lines.append("hourly 模式：禁用")
         if self.disk_store:
             lines.extend(
                 [
@@ -280,6 +345,155 @@ class MineSentinelService:
                 records,
                 include_server_targets=self.config.report.send_to_target_sessions,
             )
+
+    async def _run_hourly_for_source(
+        self, hour_start_ms: int, hour_end_ms: int, server_id: str
+    ):
+        """Process one hour for one source: read logs, summarize, maybe deliver cycle report."""
+        source = self._find_source(server_id)
+        if source is None:
+            logger.warning(
+                f"[MineSentinel] hourly 找不到 server_id={server_id} 的日志源"
+            )
+            return
+
+        # Read the hour's logs in a worker thread to avoid blocking the event loop.
+        max_lines = self.config.hourly_summary.max_log_lines_per_hour
+        max_records = self.config.hourly_summary.max_records_per_hour
+        observations = await self.io_runner(
+            build_hour_observations,
+            source,
+            hour_start_ms,
+            hour_end_ms,
+            max_lines,
+            max_records,
+        )
+        records = [ObservationRecord.from_dict(o) for o in observations]
+        if not records:
+            logger.info(
+                f"[MineSentinel] hourly {server_id} "
+                f"({self._format_ts(hour_start_ms/1000)}~{self._format_ts(hour_end_ms/1000)}) "
+                f"无日志记录，跳过总结"
+            )
+            return
+
+        # Build the hourly summary via AI (or heuristic fallback).
+        hourly = await self.hourly_summarizer.build_hourly_summary(
+            records,
+            source,
+            hour_start_ms,
+            hour_end_ms,
+            umo=None,
+        )
+        if self.hourly_store:
+            try:
+                await self.io_runner(self.hourly_store.save, hourly)
+            except Exception as exc:
+                logger.warning(f"[MineSentinel] hourly 保存磁盘失败: {exc}")
+        # Keep in-memory cycle buffer for the integration step.
+        cycle_start = self._ensure_cycle_start(server_id, hour_start_ms)
+        buf = self._hourly_cycle_buffers.setdefault(server_id, [])
+        # Drop any summaries that fall outside the current cycle window.
+        buf[:] = [h for h in buf if h.hour_start_ms >= cycle_start]
+        buf.append(hourly)
+        logger.info(
+            f"[MineSentinel] hourly {server_id} 完成 "
+            f"({hourly.hour_label}): records={hourly.records_count} "
+            f"err={hourly.error_count} warn={hourly.warning_count} "
+            f"source={hourly.source} 周期进度={len(buf)}/{self.config.hourly_summary.hours_per_cycle}"
+        )
+
+        # Check whether the cycle is complete.
+        hours_per_cycle = self.config.hourly_summary.hours_per_cycle
+        if len(buf) >= hours_per_cycle:
+            await self._finalize_hourly_cycle(server_id, buf, cycle_start)
+            # Reset the cycle for the next window.
+            self._hourly_cycle_buffers[server_id] = []
+            self._hourly_cycle_starts[server_id] = 0
+            # Cleanup old persisted summaries beyond retention.
+            if self.hourly_store:
+                try:
+                    await self.io_runner(
+                        self.hourly_store.cleanup_old_summaries,
+                        server_id,
+                        self.config.hourly_summary.retention_cycles,
+                        hours_per_cycle,
+                    )
+                except Exception as exc:
+                    logger.debug(f"[MineSentinel] hourly 清理旧文件失败: {exc}")
+
+    async def _finalize_hourly_cycle(
+        self,
+        server_id: str,
+        summaries: list[HourlySummary],
+        cycle_start_ms: int,
+    ):
+        if not summaries:
+            return
+        # Prefer reloading from disk to survive restarts.
+        cycle_end_ms = summaries[-1].hour_end_ms
+        if self.hourly_store:
+            try:
+                persisted = await self.io_runner(
+                    self.hourly_store.list_cycle_summaries,
+                    server_id,
+                    cycle_start_ms,
+                    cycle_end_ms,
+                )
+                if len(persisted) >= len(summaries):
+                    summaries = persisted
+            except Exception as exc:
+                logger.warning(
+                    f"[MineSentinel] hourly 从磁盘重载周期总结失败: {exc}"
+                )
+
+        source = self._find_source(server_id)
+        server_name = source.server_name if source else server_id
+        report = await self.hourly_summarizer.build_cycle_report(
+            summaries, server_id, umo=None
+        )
+        text = format_cycle_report(report, summaries, server_name)
+        # Try to load persisted summaries again to ensure we have the latest.
+        if not self._has_report_delivery_targets():
+            logger.warning(
+                f"[MineSentinel] hourly 周期 {server_id} 完成但未配置投递目标，"
+                "报告仅记录到日志，请配置 mine_sentinel.report.delivery_targets"
+            )
+            logger.info(f"[MineSentinel] hourly 周期报告预览:\n{text}")
+            self.last_report_time = time.time()
+            return
+        # Build an empty records list for dispatcher compatibility (the full
+        # content already lives in the cycle report text).
+        sent = await self.dispatcher.send_to_target_sessions(
+            text,
+            [],
+            include_server_targets=self.config.report.send_to_target_sessions,
+        )
+        if sent:
+            self.last_report_time = time.time()
+            logger.info(
+                f"[MineSentinel] hourly 周期报告已发送 server={server_id} "
+                f"hours={len(summaries)}"
+            )
+        else:
+            logger.warning(
+                f"[MineSentinel] hourly 周期报告发送失败 server={server_id}"
+            )
+
+    def _ensure_cycle_start(self, server_id: str, hour_start_ms: int) -> int:
+        """Return the cycle start timestamp, initializing it if needed."""
+        current = self._hourly_cycle_starts.get(server_id, 0)
+        if current == 0:
+            # Start a fresh cycle: anchor at the first hour we see.
+            current = hour_start_ms
+            self._hourly_cycle_starts[server_id] = current
+        return current
+
+    def _find_source(self, server_id: str):
+        for source in self.config.runtime_log.sources:
+            if source.server_id == server_id:
+                return source
+        return None
 
     def _report_window_minutes(self, window_minutes: int | None = None) -> int:
         return max(1, window_minutes or self.config.report.default_window_minutes)

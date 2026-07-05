@@ -516,6 +516,93 @@ def _read_backfill_lines(
     return rows
 
 
+def read_hour_log_lines(
+    source: MineSentinelLogSourceConfig,
+    hour_start_ms: int,
+    hour_end_ms: int,
+    max_lines: int = 20000,
+    max_line_length: int = 4000,
+) -> list[tuple[str, int, str]]:
+    """Read log lines whose timestamp falls in [hour_start_ms, hour_end_ms).
+
+    Directly scans the logs/ directory (latest.log + archives) without any
+    long-lived polling loop, so it has zero impact on Minecraft server mspt/tps.
+    Returns a list of (line, timestamp_ms, file_path) tuples.
+    """
+    if hour_end_ms <= hour_start_ms:
+        return []
+    # Start scanning a bit before the hour so lines without a date prefix but
+    # carrying only HH:MM:SS can still be attributed correctly via fallback walk.
+    scan_cutoff_ms = hour_start_ms - 60 * 60 * 1000
+    # Reuse the backfill candidate selection so .log.gz archives are included.
+    dummy_config = MineSentinelRuntimeLogConfig(
+        backfill_on_start=True,
+        backfill_window_minutes=max(
+            120, int((hour_end_ms - scan_cutoff_ms) / 60000) + 60
+        ),
+        max_backfill_files=20,
+        max_backfill_lines=max_lines,
+    )
+    rows: list[tuple[str, int, str]] = []
+    for path in _backfill_candidates(source, dummy_config, scan_cutoff_ms):
+        base_date = _infer_file_date(path)
+        last_ts = 0
+        for raw_line in _iter_log_file(path):
+            line = _truncate(raw_line.rstrip("\r\n"), max_line_length)
+            if not line.strip():
+                continue
+            timestamp_ms = _parse_log_timestamp(line, base_date, last_ts)
+            last_ts = timestamp_ms
+            if timestamp_ms < hour_start_ms:
+                continue
+            if timestamp_ms >= hour_end_ms:
+                continue
+            rows.append((line, timestamp_ms, str(path)))
+            if len(rows) >= max_lines:
+                return rows
+    return rows
+
+
+def build_hour_observations(
+    source: MineSentinelLogSourceConfig,
+    hour_start_ms: int,
+    hour_end_ms: int,
+    max_lines: int = 20000,
+    max_records: int = 5000,
+) -> list[dict]:
+    """Read an hour of logs and turn them into observation dicts (in-memory only).
+
+    Does not write to disk; the caller decides what to do with the result.
+    """
+    rows = read_hour_log_lines(
+        source, hour_start_ms, hour_end_ms, max_lines=max_lines
+    )
+    if not rows:
+        return []
+    observations: list[dict] = []
+    log_file = _resolve_log_file(source)
+    log_file_str = str(log_file) if log_file else ""
+    for line, timestamp_ms, source_file in rows:
+        level = _detect_level(line)
+        # Reuse _build_observation so the schema stays consistent with the polling path.
+        observation = _build_observation(
+            source,
+            Path(source_file),
+            line,
+            timestamp_ms,
+            hour_start_ms,
+        )
+        # Override the logFile context to point at the actual source file,
+        # and drop the compressed flag (it was inferred from the original latest.log).
+        if isinstance(observation.get("context"), dict):
+            observation["context"]["logFile"] = source_file
+            observation["context"]["source"] = "astrbot_hourly_read"
+        observations.append(observation)
+        if len(observations) >= max_records:
+            break
+    return observations
+
+
 def _backfill_candidates(
     source: MineSentinelLogSourceConfig,
     config: MineSentinelRuntimeLogConfig,

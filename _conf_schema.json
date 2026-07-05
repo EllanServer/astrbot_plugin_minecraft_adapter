@@ -259,6 +259,53 @@
             "default": 60
           }
         }
+      },
+      "hourly_summary": {
+        "type": "object",
+        "description": "按小时总结模式（不轮询 latest.log，每整点读取上一小时日志并 AI 总结，每 N 小时整合发送）",
+        "hint": "启用后会禁用实时轮询，改为每整点从 logs 目录直接读取上一小时日志（含 .log.gz 归档），调用 AI 生成小时总结；累积 hours_per_cycle 份后调用 AI 整合为周期报告并发送。MC 服务端 mspt/tps 不会受影响。未配置 LLM provider 时自动降级为规则启发式总结。",
+        "items": {
+          "enabled": {
+            "type": "bool",
+            "description": "启用按小时总结模式",
+            "default": false
+          },
+          "hours_per_cycle": {
+            "type": "int",
+            "description": "每多少小时整合一次并发送周期报告",
+            "default": 8
+          },
+          "window_minutes": {
+            "type": "int",
+            "description": "单次小时总结读取的日志窗口分钟数（一般无需修改）",
+            "default": 60
+          },
+          "poll_enabled": {
+            "type": "bool",
+            "description": "是否同时启用实时轮询（默认关闭，纯按小时读取）",
+            "default": false
+          },
+          "provider_id": {
+            "type": "string",
+            "description": "指定 AstrBot 模型 Provider ID，留空复用 report.provider_id 或默认 provider",
+            "default": ""
+          },
+          "max_records_per_hour": {
+            "type": "int",
+            "description": "每小时最多保留的 observation 数",
+            "default": 5000
+          },
+          "max_log_lines_per_hour": {
+            "type": "int",
+            "description": "每小时最多读取的日志行数",
+            "default": 20000
+          },
+          "retention_cycles": {
+            "type": "int",
+            "description": "磁盘上保留多少个历史周期的 hourly summary 文件",
+            "default": 2
+          }
+        }
       }
     }
   }
