@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,32 @@ from typing import Any
 
 DEFAULT_REPORT_INTERVAL_HOURS = 8
 DEFAULT_REPORT_INTERVAL_MINUTES = DEFAULT_REPORT_INTERVAL_HOURS * 60
+
+_logger = logging.getLogger(__name__)
+
+
+_VALID_TEMPLATE_PARSE_MODES = ("all", "warn_error", "interesting")
+_VALID_EXPORT_FORMATS = ("jsonl", "jsonl.gz")
+
+
+def _enum_choice(value: Any, valid: tuple[str, ...], default: str, field_name: str) -> str:
+    """Return ``value`` if it is one of ``valid`` (case-insensitive), else
+    log a warning and return ``default``.
+
+    Used for string config fields that accept a fixed set of values, so a
+    typo in the user's config doesn't silently fall through to the default
+    branch of an ``if/elif`` chain.
+    """
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in valid:
+        return text
+    _logger.warning(
+        f"[MineSentinel] 配置项 {field_name} 收到非法值 {value!r}，"
+        f"合法值为 {list(valid)}；回退到默认值 {default!r}。"
+    )
+    return default
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -295,9 +322,12 @@ class MineSentinelConfig:
                     runtime_log_data.get("anomaly_cleanup_interval"),
                     200,
                 ),
-                template_parse_mode=str(
-                    runtime_log_data.get("template_parse_mode", "all")
-                ).strip().lower(),
+                template_parse_mode=_enum_choice(
+                    runtime_log_data.get("template_parse_mode"),
+                    _VALID_TEMPLATE_PARSE_MODES,
+                    "all",
+                    "runtime_log.template_parse_mode",
+                ),
                 anomaly_track_info=_as_bool(
                     runtime_log_data.get("anomaly_track_info"),
                     True,
@@ -332,9 +362,12 @@ class MineSentinelConfig:
                 ),
                 send_full_log_file=bool(report_data.get("send_full_log_file", True)),
                 send_as_image=bool(report_data.get("send_as_image", True)),
-                export_format=str(
-                    report_data.get("export_format", "jsonl")
-                ).strip().lower(),
+                export_format=_enum_choice(
+                    report_data.get("export_format"),
+                    _VALID_EXPORT_FORMATS,
+                    "jsonl",
+                    "report.export_format",
+                ),
                 export_reuse_existing=bool(
                     report_data.get("export_reuse_existing", True)
                 ),

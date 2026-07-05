@@ -28,12 +28,19 @@ def export_path(
     The stem encodes (start_day, start_time, end_day, end_time, server_id),
     rounded to the minute. Two exports for the same window/server within
     the same minute produce the same path, enabling ``export_reuse_existing``.
+
+    PR9 hotfix: ``label`` 非空时**始终**加入文件名，不再依赖基础路径是否
+    已存在。之前的行为会导致同窗口内第一次带 label 的导出生成无 label
+    文件名，第二次才生成带 label 的，命名不稳定且 ``export_reuse_existing``
+    可能错误命中无 label 的文件。
     """
     timestamp = int(time.time()) if now is None else now
     stem = window_export_stem(window_minutes, timestamp, server_id)
-    path = export_dir / f"{stem}{suffix}"
-    if label and path.exists():
+    if label:
+        # 始终加入 label，使文件名对 (window, server, label) 确定。
         path = export_dir / f"{stem}_{safe_name(label)}{suffix}"
+    else:
+        path = export_dir / f"{stem}{suffix}"
     return path
 
 

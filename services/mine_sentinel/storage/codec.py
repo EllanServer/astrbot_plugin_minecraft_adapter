@@ -142,17 +142,26 @@ class ObservationRecordCodec:
     ):
         """Yield JSONL rows whose timestamp falls in [cutoff_ms, end_ms).
 
-        假设 JSONL 文件按 timestamp 单调递增写入（tailer 保证）。
-        ``end_ms`` 是右开边界：``ts == end_ms`` 的行不包含在窗口内，
-        与注释语义一致。
+        PR9 hotfix: 不再无条件假设 JSONL 文件按 timestamp 单调递增。
+        backfill 会从多个候选日志文件读入、MC 日志可能跨天补写、
+        ``_parse_log_timestamp`` 对无日期行依赖 base_date/fallback，
+        都可能导致同一 day JSONL 内出现"后写入但 timestamp 更早"的记录。
 
-        当传入 ``index`` 时，先通过索引二分查找 ``cutoff_ms`` 附近的
-        byte offset 再 ``seek``，避免从文件开头顺序扫描。索引是可选的：
-        无索引时退化为全量扫描，行为与原来一致。
+        行为：
+        - 当 ``index`` 标记文件为 monotonic 时（默认，向后兼容）：
+          先 seek 到 cutoff 附近，遇到 ``ts >= end_ms`` 时 early break。
+        - 当 ``index`` 标记文件为非 monotonic 时：
+          禁用 seek（从文件头扫）+ 禁用 early break，全量过滤。
+          性能退化为 O(当天日志量)，但保证不漏日志。
+        - 无 index 时退化为全量扫描 + early break（旧行为）。
         """
         start_offset = 0
+        # monotonic 默认 True，仅在 index 明确标记为非单调时才 False。
+        # 无 index 时保持旧行为（假设单调，可 early break）。
+        monotonic = True
         if index is not None:
             start_offset = index.seek_offset(cutoff_ms)
+            monotonic = index.is_monotonic
         try:
             # 用二进制模式打开，以便在 text mode 下也能 seek 到任意 byte offset。
             # 不带索引时 start_offset==0，等价于从头读。
@@ -177,8 +186,11 @@ class ObservationRecordCodec:
                         continue
                     if end_ms is not None and ts >= end_ms:
                         # 右开边界：ts == end_ms 不在窗口内。
-                        # 假设文件按 timestamp 单调递增，遇到首个越界行即可 break。
-                        break
+                        # 仅在文件被标记为 monotonic 时才 early break；
+                        # 非单调文件后面可能还有窗口内的记录，必须 continue。
+                        if monotonic:
+                            break
+                        continue
                     yield data
         except FileNotFoundError:
             return
