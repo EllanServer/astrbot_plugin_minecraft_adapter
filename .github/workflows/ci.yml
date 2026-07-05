@@ -10,7 +10,7 @@ on:
 
 jobs:
   validate:
-    name: Validate Python ${{ matrix.python-version }}
+    name: Validate Python ${{ matrix.python-version }} (no Rust)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -41,13 +41,76 @@ jobs:
       - name: Compile sources
         run: python -m compileall __init__.py handlers main.py services
 
+      - name: Import smoke test
+        run: |
+          # 验证关键模块能 import（CI 不装完整 AstrBot，复用测试文件的 stub 注入）
+          python -c "
+          import tests.test_mine_sentinel  # noqa: F401  注入 astrbot stubs
+          from services.mine_sentinel import MineSentinelService
+          from services.mine_sentinel.storage.codec import ObservationRecordCodec
+          from services.mine_sentinel.observation_priority import observation_priority_score
+          from services.mine_sentinel.template_miner import get_template_miner
+          from services.mine_sentinel.anomaly_detector import get_anomaly_detector
+          # 验证无 Rust 时 codec 可初始化且 uses_native=False
+          from services.mine_sentinel.models import MineSentinelConfig
+          cfg = MineSentinelConfig.from_dict({})
+          codec = ObservationRecordCodec(cfg)
+          assert codec.uses_native is False, '无 Rust 时 uses_native 应为 False'
+          print('Import smoke test OK (no Rust, uses_native=False)')
+          "
+
       - name: Run tests
+        run: python -m unittest discover -s tests
+
+  validate-with-rust:
+    name: Validate with Rust core (Python 3.12, linux-x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install maturin
+        run: python -m pip install maturin
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build and install Rust wheel
+        working-directory: rust
+        run: |
+          maturin build --release -i "$(which python)"
+          pip install --force-reinstall --no-deps target/wheels/*.whl
+
+      - name: Verify Rust core loaded
+        run: |
+          python -c "
+          import mine_sentinel_rs
+          from services.mine_sentinel.models import MineSentinelConfig
+          from services.mine_sentinel.storage.codec import ObservationRecordCodec
+          cfg = MineSentinelConfig.from_dict({})
+          codec = ObservationRecordCodec(cfg)
+          assert codec.uses_native is True, '装了 Rust wheel 后 uses_native 应为 True'
+          print('Rust core loaded, uses_native=True')
+          "
+
+      - name: Run tests (Rust path)
         run: python -m unittest discover -s tests
 
   package:
     name: Package plugin
     runs-on: ubuntu-latest
-    needs: validate
+    needs: [validate, validate-with-rust]
 
     steps:
       - name: Checkout

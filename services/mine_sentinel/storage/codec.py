@@ -138,7 +138,12 @@ class ObservationRecordCodec:
         cutoff_ms: int,
         end_ms: int | None = None,
     ):
-        """Yield JSONL rows whose timestamp falls in [cutoff_ms, end_ms)."""
+        """Yield JSONL rows whose timestamp falls in [cutoff_ms, end_ms).
+
+        假设 JSONL 文件按 timestamp 单调递增写入（tailer 保证）。
+        ``end_ms`` 是右开边界：``ts == end_ms`` 的行不包含在窗口内，
+        与注释语义一致。
+        """
         try:
             with path.open("r", encoding="utf-8") as handle:
                 for line in handle:
@@ -157,7 +162,9 @@ class ObservationRecordCodec:
                         continue
                     if ts < cutoff_ms:
                         continue
-                    if end_ms is not None and ts > end_ms:
+                    if end_ms is not None and ts >= end_ms:
+                        # 右开边界：ts == end_ms 不在窗口内。
+                        # 假设文件按 timestamp 单调递增，遇到首个越界行即可 break。
                         break
                     yield data
         except FileNotFoundError:
