@@ -481,6 +481,10 @@ class HeuristicReportBuilder:
         # 这样 classify() 能把它们强制归入 chat_review。
         # 刷屏是聚合行为（同一ID短时间大量重复/相似消息），不能靠单条形态识别。
         flood_events = self._detect_and_tag_floods(log_records)
+        # PR10 v3: 玩家级重复违规检测——同一玩家在窗口内多次命中同类 chat_review
+        # 关键词（如反复发链接、反复发代练广告）视为"行为"，打 chat_abuse 标签。
+        # 单次命中只是"线索"，不强制 chat_review；重复命中才是"行为"。
+        abuse_events = self._detect_and_tag_abuse(log_records)
 
         for record in log_records:
             category = self.classify(record)
@@ -554,7 +558,7 @@ class HeuristicReportBuilder:
         ops_notes, counters = self._ops_notes(log_records, issues, max_severity, any_alert)
 
         # PR10: 聊天热点总结 + Vulcan 反作弊结构化告警
-        chat_topics = self._build_chat_topics(log_records, flood_events)
+        chat_topics = self._build_chat_topics(log_records, flood_events, abuse_events)
         vulcan_alerts = self._build_vulcan_alerts(log_records)
 
         return {
@@ -584,29 +588,24 @@ class HeuristicReportBuilder:
         # 等被 moderation/network 关键词误判为异常事件。
         if "daily_noise" in record.tags:
             return "daily"
-        # PR10 v2: chat_flood 标签强制归入 chat_review（若该分类开启）。
-        # 刷屏是玩家级时间窗口聚合行为，由 _build_chat_topics 检测后回填标签。
-        # 真实日志验证：单条形态检测无法识别真正的刷屏（重复发送），
-        # 必须在聚合阶段检测，然后把参与刷屏的记录打 chat_flood 标签。
-        if "chat_flood" in record.tags and "chat_review" in self._active_priority:
-            return "chat_review"
+        # PR10 v3: 行为标签强制归入 chat_review（若该分类开启）。
+        # 行为=刷屏(chat_flood) 或 重复违规(chat_abuse)，均由 build() 阶段
+        # 基于玩家上下文检测后回填标签。单条关键词命中不强制归入 chat_review——
+        # 单次命中只是"线索"，需要结合玩家上下文（同玩家是否重复发送同类内容）
+        # 才能判定为"行为"。
+        if "chat_review" in self._active_priority:
+            if "chat_flood" in record.tags or "chat_abuse" in record.tags:
+                return "chat_review"
         text = self._record_text(record)
-        is_chat = "chat_message" in record.tags
         # 按当前生效的优先级列表匹配（已应用 category_enabled / category_whitelist），
         # daily 兜底。被关闭的分类直接跳过，记录会落到下一优先级或 daily。
+        # 注意：chat_review 不再靠单条关键词命中触发——避免"玩家偶尔发一条链接"
+        # 被误判为聊天审查违规。关键词命中只在 review_evidence 里作为"线索"呈现。
         for category in self._active_priority:
             if category == "daily":
                 continue
             if category == "chat_review":
-                # URL/外链信号仅对 chat_message 记录生效，避免插件更新日志
-                # （含 https://）被误判为聊天审查
-                if is_chat:
-                    if _keys_match(text, CHAT_REVIEW_MARKERS):
-                        return category
-                else:
-                    if _keys_match(text, CHAT_REVIEW_GENERAL_MARKERS):
-                        return category
-                continue
+                continue  # 行为标签已在上面处理；单条关键词不再触发
             keys = CATEGORY_KEYS.get(category, ())
             if _keys_match(text, keys):
                 return category
@@ -759,7 +758,8 @@ class HeuristicReportBuilder:
                 return True
             if any(marker in text for marker in CHAT_SENSITIVE_MARKERS):
                 return True
-            if any("chat_flood" in record.tags for record in group):
+            # 行为标签（刷屏/重复违规）强制告警——这些是基于玩家上下文判定的真行为
+            if any("chat_flood" in record.tags or "chat_abuse" in record.tags for record in group):
                 return True
             return evidence_count >= 5
         # player_feedback 通常不告警
@@ -1025,9 +1025,74 @@ class HeuristicReportBuilder:
                     break
         return flood_events
 
+    # --- 玩家级重复违规检测（PR10 v3）-------------------------------------
+    def _detect_and_tag_abuse(
+        self, records: list[ObservationRecord]
+    ) -> list[dict[str, Any]]:
+        """检测玩家级重复违规行为，给重复命中的记录打 chat_abuse 标签。
+
+        PR10 v3: 行为判断必须有上下文。单条关键词命中只是"线索"，
+        同一玩家在窗口内多次命中"同类"关键词才构成"行为"：
+        - 同玩家 >=2 条命中 URL 类（discord.gg/http/https） → 链接广告行为
+        - 同玩家 >=2 条命中 交易广告类（代练/卖号/加群） → 交易广告行为
+        - 同玩家 >=2 条命中 辱骂类 → 辱骂行为
+        - 同玩家 >=1 条命中 敏感词（威胁/开盒/人肉） → 直接敏感行为
+
+        返回 abuse_events 列表（用于 review_evidence 上下文呈现）。
+        """
+        chat_records = [r for r in records if "chat_message" in r.tags]
+        if not chat_records:
+            return []
+        # 按玩家聚合
+        player_records: dict[str, list[ObservationRecord]] = defaultdict(list)
+        for record in chat_records:
+            ctx = record.context or {}
+            player = str(ctx.get("chatPlayer") or "").strip()
+            if player:
+                player_records[player].append(record)
+
+        abuse_events: list[dict[str, Any]] = []
+        abuse_record_ids: set[str] = set()
+        for player, records_sorted in player_records.items():
+            # 按类别统计命中
+            hits_by_category: dict[str, list[tuple[ObservationRecord, list[str]]]] = defaultdict(list)
+            for record in records_sorted:
+                hit_keys = self._detect_chat_review_hits(record)
+                if hit_keys:
+                    category = self._classify_hit_keys(hit_keys)
+                    hits_by_category[category].append((record, hit_keys))
+
+            for category, hits in hits_by_category.items():
+                # 敏感词：1 条即行为；其他类：>=2 条为行为
+                is_behavior = (category == "sensitive") or (len(hits) >= 2)
+                if not is_behavior:
+                    continue
+                # 给这些记录打 chat_abuse 标签
+                for record, hit_keys in hits:
+                    if "chat_abuse" not in (record.tags or []):
+                        record.tags.append("chat_abuse")
+                    ctx = record.context or {}
+                    ctx.setdefault("abuseCategories", [])
+                    if category not in ctx["abuseCategories"]:
+                        ctx["abuseCategories"].append(category)
+                    abuse_record_ids.add(record.event_id)
+                abuse_events.append({
+                    "player": player,
+                    "category": category,
+                    "hit_count": len(hits),
+                    "samples": [
+                        str((r.context or {}).get("chatMessage") or r.content).strip()[:150]
+                        for r, _ in hits[:3]
+                    ],
+                })
+        return abuse_events
+
     # --- 聊天热点总结（PR10）---------------------------------------------
     def _build_chat_topics(
-        self, records: list[ObservationRecord], flood_events: list[dict[str, Any]] | None = None
+        self,
+        records: list[ObservationRecord],
+        flood_events: list[dict[str, Any]] | None = None,
+        abuse_events: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """从 chat_message 标签记录中聚合聊天热点。
 
@@ -1038,7 +1103,8 @@ class HeuristicReportBuilder:
         - top_keywords: 高频关键词（去除停用词后）
         - sample_messages: 时间序样本消息
         - flood_players: 刷屏玩家列表（PR10 v2，玩家级时间窗口聚合检测）
-        - review_evidence: 需审查的聊天证据（刷屏样本 + 关键词命中）
+        - abuse_players: 重复违规玩家列表（PR10 v3，基于玩家上下文的行为判断）
+        - review_evidence: 需审查的聊天证据（行为 + 线索，含玩家上下文）
 
         chat_summary_enabled=false 时返回空字典。
         """
@@ -1055,6 +1121,7 @@ class HeuristicReportBuilder:
                 "top_keywords": [],
                 "sample_messages": [],
                 "flood_players": [],
+                "abuse_players": [],
                 "review_evidence": [],
             }
         max_topics = max(1, self.config.runtime_log.chat_summary_max_topics)
@@ -1109,8 +1176,10 @@ class HeuristicReportBuilder:
 
         # PR10 v2: 刷屏玩家结构化呈现——把 flood_events 转成 LLM 友好格式
         flood_players = self._format_flood_players(flood_events or [])
+        # PR10 v3: 重复违规玩家结构化呈现——同一玩家多次命中同类关键词
+        abuse_players = self._format_abuse_players(abuse_events or [])
 
-        # PR10 v2: 聊天审查证据——刷屏样本 + 关键词命中
+        # PR10 v3: 聊天审查证据——基于玩家上下文（行为 + 线索）
         review_evidence = self._build_chat_review_evidence(chat_records, max_samples=10)
 
         return {
@@ -1120,6 +1189,7 @@ class HeuristicReportBuilder:
             "top_keywords": top_keywords,
             "sample_messages": sample_messages,
             "flood_players": flood_players,
+            "abuse_players": abuse_players,
             "review_evidence": review_evidence,
         }
 
@@ -1189,56 +1259,194 @@ class HeuristicReportBuilder:
         result.sort(key=lambda x: x["total_messages"], reverse=True)
         return result
 
+    def _format_abuse_players(
+        self, abuse_events: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """把 abuse_events 转成 LLM 友好的 abuse_players 列表。
+
+        每个玩家一个条目，聚合该玩家的所有重复违规事件：
+        - player: 玩家名
+        - abuse_categories: 违规类别列表（url/abuse_language/trade_ad/sensitive）
+        - total_hits: 命中总次数
+        - events: 各违规事件详情（category/hit_count/samples）
+        - samples: 样本原文（最多 5 条）
+        """
+        if not abuse_events:
+            return []
+        by_player: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for event in abuse_events:
+            by_player[event["player"]].append(event)
+        result: list[dict[str, Any]] = []
+        for player, events in by_player.items():
+            categories = sorted({e["category"] for e in events})
+            total_hits = sum(e["hit_count"] for e in events)
+            samples: list[str] = []
+            seen: set[str] = set()
+            for e in events:
+                for s in e.get("samples", []):
+                    if s not in seen:
+                        samples.append(s)
+                        seen.add(s)
+                    if len(samples) >= 5:
+                        break
+                if len(samples) >= 5:
+                    break
+            result.append({
+                "player": player,
+                "abuse_categories": categories,
+                "total_hits": total_hits,
+                "events": [
+                    {
+                        "category": e["category"],
+                        "hit_count": e["hit_count"],
+                        "samples": e.get("samples", [])[:3],
+                    }
+                    for e in events
+                ],
+                "samples": samples,
+            })
+        result.sort(key=lambda x: x["total_hits"], reverse=True)
+        return result
+
     def _build_chat_review_evidence(
         self, chat_records: list[ObservationRecord], max_samples: int = 10
     ) -> list[dict[str, Any]]:
-        """从聊天记录中提取需要审查的证据样本（刷屏 + 关键词命中）。
+        """从聊天记录中提取需要审查的证据样本，基于玩家级行为上下文判断。
+
+        PR10 v3: 行为判断必须有上下文。不再单条命中关键词就进证据，
+        而是按玩家聚合，统计同一玩家在窗口内的：
+        - 总消息数
+        - 命中关键词的次数
+        - 命中的关键词类型（URL/辱骂/代练/交易等）
+        - 是否重复发送同类内容
+
+        单次命中：作为"线索"呈现（reason=hint），不强制 chat_review
+        重复命中：作为"行为"呈现（reason=abuse），强制 chat_review
+        刷屏命中：作为"行为"呈现（reason=flood），强制 chat_review
 
         返回结构化列表，每条含：
         - player: 玩家名
-        - message: 聊天原文
-        - flood_types: 刷屏类型列表（参与刷屏时），非刷屏为空
-        - reason: 命中原因（flood/keyword），keyword 时列出命中的关键词
+        - player_total_messages: 该玩家窗口内总消息数（上下文）
+        - player_hit_count: 该玩家命中关键词的消息数
+        - message: 聊天原文（样本）
+        - flood_types: 刷屏类型列表（参与刷屏时）
+        - reason: 命中原因（flood/abuse/hint）
+          flood=刷屏行为，abuse=重复关键词命中（行为），hint=单次命中（线索）
+        - hit_keys: 命中的关键词
+        - hit_category: 命中类别（url/abuse_language/trade_ad/sensitive）
         - time_text: HH:MM:SS 时间
         """
-        evidence: list[dict[str, Any]] = []
+        # 第一步：按玩家聚合聊天记录，统计每个玩家的行为上下文
+        player_records: dict[str, list[ObservationRecord]] = defaultdict(list)
         for record in chat_records:
             ctx = record.context or {}
-            tags = record.tags or []
-            is_flood = "chat_flood" in tags
-            # 非 flood 记录只保留命中 chat_review 关键词的（避免把所有聊天都贴给 LLM）
-            hit_keys: list[str] = []
-            if not is_flood:
-                content_lower = (record.content or "").lower()
-                for key in CHAT_REVIEW_GENERAL_MARKERS:
-                    if _is_word_key(key):
-                        if _word_boundary_regex((key,)) and _word_boundary_regex((key,)).search(content_lower):
-                            hit_keys.append(key)
-                    elif key in content_lower:
-                        hit_keys.append(key)
-                # URL 信号对 chat_message 记录生效
-                for key in CHAT_REVIEW_URL_MARKERS:
-                    if key in content_lower:
-                        hit_keys.append(key)
-                if not hit_keys:
+            player = str(ctx.get("chatPlayer") or "").strip()
+            if player:
+                player_records[player].append(record)
+
+        # 第二步：对每个玩家，找出命中关键词的记录并分类
+        # 命中类别分组（用于判断是"单次线索"还是"重复行为"）
+        evidence: list[dict[str, Any]] = []
+        for player, records in player_records.items():
+            records_sorted = sorted(records, key=lambda r: r.timestamp or 0)
+            player_total = len(records_sorted)
+            # 收集该玩家所有命中记录，按类别分组
+            hit_records_by_category: dict[str, list[tuple[ObservationRecord, list[str]]]] = defaultdict(list)
+            for record in records_sorted:
+                ctx = record.context or {}
+                tags = record.tags or []
+                is_flood = "chat_flood" in tags
+                if is_flood:
+                    # 刷屏记录直接归入 flood 类别
+                    hit_records_by_category["flood"].append((record, []))
                     continue
-            player = str(ctx.get("chatPlayer") or "").strip() or "(unknown)"
-            message = str(ctx.get("chatMessage") or record.content).strip()
-            flood_types = list(ctx.get("floodTypes") or [])
-            time_text = _format_timestamp(record.timestamp) if record.timestamp else ""
-            evidence.append(
-                {
-                    "player": player,
-                    "message": message[:200],
-                    "flood_types": flood_types,
-                    "reason": "flood" if is_flood else "keyword",
-                    "hit_keys": hit_keys[:5],
-                    "time_text": time_text,
-                }
-            )
-            if len(evidence) >= max_samples:
-                break
+                # 检测关键词命中
+                hit_keys = self._detect_chat_review_hits(record)
+                if hit_keys:
+                    category = self._classify_hit_keys(hit_keys)
+                    hit_records_by_category[category].append((record, hit_keys))
+
+            # 第三步：根据每个类别的命中次数判断是"行为"还是"线索"
+            for category, hits in hit_records_by_category.items():
+                hit_count = len(hits)
+                # 行为判定阈值：同类命中 >=2 次视为"重复行为"（abuse）
+                # 单次命中视为"线索"（hint），刷屏永远是"行为"（flood）
+                if category == "flood":
+                    reason = "flood"
+                elif hit_count >= 2:
+                    reason = "abuse"
+                else:
+                    reason = "hint"
+
+                # 只把"行为"(flood/abuse) 进证据；"线索"(hint) 也进，但标记为 hint，
+                # 让 LLM 能看到上下文区分严重性
+                for record, hit_keys in hits[:3]:  # 每个玩家每类最多 3 条样本
+                    ctx = record.context or {}
+                    message = str(ctx.get("chatMessage") or record.content).strip()
+                    flood_types = list(ctx.get("floodTypes") or [])
+                    time_text = _format_timestamp(record.timestamp) if record.timestamp else ""
+                    evidence.append({
+                        "player": player,
+                        "player_total_messages": player_total,
+                        "player_hit_count": hit_count,
+                        "message": message[:200],
+                        "flood_types": flood_types,
+                        "reason": reason,
+                        "hit_keys": hit_keys[:5],
+                        "hit_category": category if category != "flood" else "",
+                        "time_text": time_text,
+                    })
+                    if len(evidence) >= max_samples:
+                        return evidence
         return evidence
+
+    @staticmethod
+    def _detect_chat_review_hits(record: ObservationRecord) -> list[str]:
+        """检测单条记录命中的 chat_review 关键词，返回命中的关键词列表。"""
+        if "chat_message" not in (record.tags or []):
+            return []
+        content_lower = (record.content or "").lower()
+        hits: list[str] = []
+        for key in CHAT_REVIEW_GENERAL_MARKERS:
+            if _is_word_key(key):
+                if _word_boundary_regex((key,)) and _word_boundary_regex((key,)).search(content_lower):
+                    hits.append(key)
+            elif key in content_lower:
+                hits.append(key)
+        for key in CHAT_REVIEW_URL_MARKERS:
+            if key in content_lower:
+                hits.append(key)
+        return hits
+
+    @staticmethod
+    def _classify_hit_keys(hit_keys: list[str]) -> str:
+        """把命中的关键词归类，用于判断是哪类违规行为。
+
+        返回类别：
+        - url: URL/外链信号（discord.gg/http/https/www 等）
+        - abuse_language: 辱骂/骚扰/威胁语言
+        - trade_ad: 交易/代练/加群广告
+        - sensitive: 敏感词（威胁/开盒/人肉/隐私）
+        - other: 其他
+        """
+        url_set = set(CHAT_REVIEW_URL_MARKERS)
+        sensitive_set = set(CHAT_SENSITIVE_MARKERS)
+        trade_ad_keys = {"代练", "代打", "出售账号", "卖号", "买号", "加群", "加微信", "加qq", "举报聊天"}
+        abuse_keys = {"swear", "profanity", "insult", "abuse", "harassment", "threat", "toxic",
+                      "advertising", "辱骂", "骂人", "脏话", "骚扰", "威胁", "刷屏"}
+        for key in hit_keys:
+            if key in sensitive_set:
+                return "sensitive"
+        for key in hit_keys:
+            if key in url_set:
+                return "url"
+        for key in hit_keys:
+            if key in trade_ad_keys:
+                return "trade_ad"
+        for key in hit_keys:
+            if key in abuse_keys:
+                return "abuse_language"
+        return "other"
 
     @staticmethod
     def _extract_top_keywords(

@@ -1446,22 +1446,25 @@ class MineSentinelRulesTests(unittest.TestCase):
         # 'ad' 已移除，不应归入 chat_review
         self.assertNotEqual(builder.classify(record), "chat_review")
 
-    def test_chat_review_url_signal_triggers_classification(self):
-        """URL/外链信号应触发 chat_review 分类（高置信度广告/引流指标）。
+    def test_chat_review_url_signal_single_hit_does_not_force_classification(self):
+        """单条 URL 命中不应强制 chat_review 分类（行为判断需要上下文）。
 
-        PR10 真实日志验证：URL 信号仅在 chat_message 记录上生效，
-        避免插件更新日志（含 https://）被误判为聊天审查。
+        PR10 v3: 单条关键词命中只是"线索"，需要同一玩家多次命中同类关键词
+        才构成"行为"。classify() 不再靠单条关键词命中触发 chat_review。
         """
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
-        # chat_message 记录含 URL 应触发 chat_review
+        # 单条 chat_message 记录含 URL 不应触发 chat_review（只是线索）
         record = self._make_record(
-            "[Async Chat Thread]: <Spammer> 加入我们的群 discord.gg/xxxxxxx",
+            "[Async Chat Thread]: <Sharer> 加入我们的群 discord.gg/xxxxxxx",
             level="INFO",
             tags=["server_log", "runtime_log", "chat_message"],
         )
-        self.assertEqual(builder.classify(record), "chat_review")
-        # 非 chat_message 记录含 URL 不应触发 chat_review
-        # （QuickShop-Hikari 更新检查日志，真实样本）
+        self.assertNotEqual(
+            builder.classify(record),
+            "chat_review",
+            "单条 URL 命中只是线索，不应强制 chat_review",
+        )
+        # 非 chat_message 记录含 URL 也不应触发 chat_review
         record2 = self._make_record(
             "[Craft Scheduler Thread - 16765 - QuickShop-Hikari/INFO]: "
             "[QuickShop-Hikari] Update here: https://modrinth.com/plugin/quickshop-hikari",
@@ -1473,23 +1476,71 @@ class MineSentinelRulesTests(unittest.TestCase):
             "插件更新日志含 URL 不应被误判为 chat_review",
         )
 
-    def test_chat_review_chinese_transaction_signals(self):
-        """中文交易/代练广告信号应触发 chat_review 分类。"""
-        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
-        for content in (
-            "[生存区] Spammer >> 代练等级 50元起",
-            "[生存区] Spammer >> 出售账号 联系加微信",
-            "[生存区] Spammer >> 卖号 100元",
-        ):
-            record = self._make_record(content, level="INFO")
-            self.assertEqual(
-                builder.classify(record),
-                "chat_review",
-                f"应识别交易广告: {content}",
-            )
+    def test_chat_review_repeated_url_hits_trigger_abuse_behavior(self):
+        """同一玩家多次命中 URL 类关键词应触发 chat_abuse 行为，强制 chat_review。
+
+        PR10 v3: 行为判断基于玩家上下文。同玩家 >=2 条命中 URL 类 → 链接广告行为。
+        """
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Async Chat Thread/INFO]: <AdBot> 加群 discord.gg/aaa",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "AdBot", "chatMessage": "加群 discord.gg/aaa"},
+                timestamp=base_ts,
+            ),
+            self._make_record(
+                "[Async Chat Thread/INFO]: <AdBot> 加群 discord.gg/bbb",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "AdBot", "chatMessage": "加群 discord.gg/bbb"},
+                timestamp=base_ts + 60000,
+            ),
+        ]
+        report = builder.build(records, 60, "survival")
+        # 应检测到 abuse 行为
+        abuse_players = report["chat_topics"].get("abuse_players") or []
+        adbot = next((p for p in abuse_players if p["player"] == "AdBot"), None)
+        self.assertIsNotNone(adbot, "AdBot 反复发链接应被检测为 abuse 行为")
+        self.assertIn("url", adbot["abuse_categories"])
+        # 记录应被打 chat_abuse 标签并归入 chat_review
+        chat_issues = [i for i in report["issues"] if i["category"] == "chat_review"]
+        self.assertTrue(chat_issues, "abuse 行为应形成 chat_review issue")
+
+    def test_chat_review_chinese_transaction_repeated_hits_trigger_abuse(self):
+        """同一玩家多次发送代练/交易广告应触发 chat_abuse 行为。
+
+        PR10 v3: 单条交易广告只是线索，同玩家 >=2 条同类命中才是行为。
+        """
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[生存区] Spammer >> 代练等级 50元起",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Spammer", "chatMessage": "代练等级 50元起"},
+                timestamp=base_ts,
+            ),
+            self._make_record(
+                "[生存区] Spammer >> 出售账号 联系加微信",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Spammer", "chatMessage": "出售账号 联系加微信"},
+                timestamp=base_ts + 60000,
+            ),
+        ]
+        report = builder.build(records, 60, "survival")
+        abuse_players = report["chat_topics"].get("abuse_players") or []
+        spammer = next((p for p in abuse_players if p["player"] == "Spammer"), None)
+        self.assertIsNotNone(spammer, "Spammer 反复发交易广告应被检测为 abuse 行为")
+        self.assertIn("trade_ad", spammer["abuse_categories"])
 
     def test_chat_review_threat_raises_to_high_and_alerts(self):
-        """chat_review 命中威胁敏感词应提级 high 并强制告警。"""
+        """chat_review 命中威胁敏感词应提级 high 并强制告警。
+
+        PR10 v3: 敏感词（threat/开盒/人肉）单条即构成行为（sensitive 类别 1 条即行为）。
+        """
         config = MineSentinelConfig.from_dict(
             {"alert": {"enabled": True, "min_severity": "high", "min_evidence_count": 5}}
         )
@@ -1497,6 +1548,8 @@ class MineSentinelRulesTests(unittest.TestCase):
         record = self._make_record(
             "[Async Chat Thread]: <BadActor> made a threat against another player",
             level="INFO",
+            tags=["server_log", "chat_message"],
+            context={"chatPlayer": "BadActor", "chatMessage": "made a threat against another player"},
         )
         report = builder.build([record], 60, "survival")
         chat_issues = [
