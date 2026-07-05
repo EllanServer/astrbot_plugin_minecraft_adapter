@@ -21,6 +21,8 @@ blake2 = "0.10"
 # the first N keys by insertion order.
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"
+sha1 = "0.10"
 
 [profile.release]
 opt-level = 3

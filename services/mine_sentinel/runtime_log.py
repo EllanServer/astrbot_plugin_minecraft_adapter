@@ -16,6 +16,14 @@ from typing import Any
 
 from astrbot.api import logger
 
+try:
+    from mine_sentinel_rs import runtime_log_hints as _rs_runtime_log_hints
+
+    _HAS_RUST_RUNTIME_HINTS = True
+except ImportError:  # pragma: no cover - optional native extension fallback
+    _rs_runtime_log_hints = None
+    _HAS_RUST_RUNTIME_HINTS = False
+
 from .models import (
     DEFAULT_DAILY_NOISE_PATTERNS,
     MineSentinelLogSourceConfig,
@@ -1514,6 +1522,37 @@ def _detect_vulcan_alert(content: str) -> dict[str, str] | None:
     return None
 
 
+def _python_runtime_log_hints(line: str, max_line_length: int) -> dict[str, Any]:
+    content = _sanitize_line(_truncate(line, max_line_length))
+    hints: dict[str, Any] = {
+        "content": content,
+        "level": _detect_level(content),
+        "fingerprint": _fingerprint(content),
+    }
+    chat_info = _detect_chat_message(content)
+    if chat_info is not None:
+        player, message = chat_info
+        hints["chatPlayer"] = player
+        hints["chatMessage"] = message
+        hints["chatMeaningless"] = _detect_meaningless_message(message)
+    vulcan_info = _detect_vulcan_alert(content)
+    if vulcan_info is not None:
+        hints["vulcanPlayer"] = vulcan_info.get("player", "")
+        hints["vulcanCheck"] = vulcan_info.get("check", "")
+    return hints
+
+
+def _runtime_log_hints(line: str, max_line_length: int) -> dict[str, Any]:
+    if _HAS_RUST_RUNTIME_HINTS and _rs_runtime_log_hints is not None:
+        try:
+            hints = _rs_runtime_log_hints(line, max_line_length)
+            if isinstance(hints, dict):
+                return hints
+        except Exception as exc:  # pragma: no cover - native fallback guard
+            logger.debug(f"[MineSentinel] Rust runtime_log_hints failed: {exc}")
+    return _python_runtime_log_hints(line, max_line_length)
+
+
 def _skip_anomaly_result(
     server_id: str,
     template_id: str,
@@ -1545,9 +1584,17 @@ def _build_observation(
     max_line_length: int,
     runtime_config: MineSentinelRuntimeLogConfig | None = None,
 ) -> dict[str, Any]:
-    content = _sanitize_line(_truncate(line, max_line_length))
-    level = _detect_level(content)
-    fingerprint = _fingerprint(content)
+    hints = _runtime_log_hints(line, max_line_length)
+    content_value = hints.get("content")
+    content = (
+        str(content_value)
+        if content_value is not None
+        else _sanitize_line(_truncate(line, max_line_length))
+    )
+    level = str(hints.get("level") or _detect_level(content)).upper()
+    if level == "WARNING":
+        level = "WARN"
+    fingerprint = str(hints.get("fingerprint") or _fingerprint(content))
     lowered = content.lower()
     server_id = source.server_id or "minecraft"
 
@@ -1603,7 +1650,7 @@ def _build_observation(
     # PR10: daily_noise / chat_message / anticheat_vulcan 检测。
     # 这些标签独立于上面的级别/异常标签，由专用配置开关控制。
     daily_noise_hit = False
-    chat_info: dict[str, Any] | None = None
+    chat_info: tuple[str, str] | None = None
     vulcan_info: dict[str, str] | None = None
     if runtime_config is not None:
         if runtime_config.daily_noise_filter_enabled:
@@ -1622,16 +1669,24 @@ def _build_observation(
                     tags.append("daily_noise")
                     daily_noise_hit = True
         if runtime_config.chat_summary_enabled:
-            chat_info = _detect_chat_message(content)
+            if "chatMessage" in hints:
+                chat_info = (
+                    str(hints.get("chatPlayer") or ""),
+                    str(hints.get("chatMessage") or ""),
+                )
             if chat_info is not None:
                 tags.append("chat_message")
                 # PR10 v2: 单条消息不再打 chat_spam 标签——刷屏是玩家级时间窗口
                 # 聚合行为（同一ID短时间大量重复/相似消息），不是单条形态。
                 # 仅标记 meaningless 子标签供聚合阶段使用。
-                if _detect_meaningless_message(chat_info[1]):
+                if bool(hints.get("chatMeaningless")):
                     tags.append("chat_meaningless")
         if runtime_config.vulcan_detect_enabled:
-            vulcan_info = _detect_vulcan_alert(content)
+            if "vulcanPlayer" in hints and "vulcanCheck" in hints:
+                vulcan_info = {
+                    "player": str(hints.get("vulcanPlayer") or ""),
+                    "check": str(hints.get("vulcanCheck") or ""),
+                }
             if vulcan_info is not None:
                 tags.append("anticheat_vulcan")
     observed_ms = int(time.time() * 1000)

@@ -3679,7 +3679,73 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
                     f"普通聊天不应被标记为 meaningless: {content}",
                 )
 
+    def test_runtime_log_hints_falls_back_when_native_fails(self):
+        from services.mine_sentinel import runtime_log as runtime_module
 
+        old_has = runtime_module._HAS_RUST_RUNTIME_HINTS
+        old_func = runtime_module._rs_runtime_log_hints
+
+        def failing_hints(line, max_line_length):
+            raise RuntimeError("native failed")
+
+        try:
+            runtime_module._HAS_RUST_RUNTIME_HINTS = True
+            runtime_module._rs_runtime_log_hints = failing_hints
+            hints = runtime_module._runtime_log_hints(
+                "[17:00:00] [Server thread/INFO]: [Vulcan] Steve failed Reach (VL: 5)",
+                2000,
+            )
+        finally:
+            runtime_module._HAS_RUST_RUNTIME_HINTS = old_has
+            runtime_module._rs_runtime_log_hints = old_func
+
+        self.assertEqual(hints.get("vulcanPlayer"), "Steve")
+        self.assertEqual(hints.get("vulcanCheck"), "Reach (VL: 5)")
+        self.assertIn("fingerprint", hints)
+
+    def test_build_observation_uses_native_runtime_hints(self):
+        from services.mine_sentinel import runtime_log as runtime_module
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+
+        old_has = runtime_module._HAS_RUST_RUNTIME_HINTS
+        old_func = runtime_module._rs_runtime_log_hints
+
+        def fake_hints(line, max_line_length):
+            self.assertEqual(line, "ignored by native")
+            self.assertEqual(max_line_length, 2000)
+            return {
+                "content": "[17:00:00] [Server thread/WARNING]: <NativePlayer> hhhhhhhh",
+                "level": "WARNING",
+                "fingerprint": "native-fingerprint",
+                "chatPlayer": "NativePlayer",
+                "chatMessage": "hhhhhhhh",
+                "chatMeaningless": True,
+                "vulcanPlayer": "Cheater",
+                "vulcanCheck": "Fly (Type A)",
+            }
+
+        try:
+            runtime_module._HAS_RUST_RUNTIME_HINTS = True
+            runtime_module._rs_runtime_log_hints = fake_hints
+            obs = self._build("ignored by native", MineSentinelRuntimeLogConfig())
+        finally:
+            runtime_module._HAS_RUST_RUNTIME_HINTS = old_has
+            runtime_module._rs_runtime_log_hints = old_func
+
+        self.assertEqual(
+            obs["content"],
+            "[17:00:00] [Server thread/WARNING]: <NativePlayer> hhhhhhhh",
+        )
+        self.assertEqual(obs["context"].get("level"), "WARN")
+        self.assertEqual(obs["context"].get("fingerprint"), "native-fingerprint")
+        self.assertIn("warning", obs["tags"])
+        self.assertIn("chat_message", obs["tags"])
+        self.assertIn("chat_meaningless", obs["tags"])
+        self.assertIn("anticheat_vulcan", obs["tags"])
+        self.assertEqual(obs["context"].get("chatPlayer"), "NativePlayer")
+        self.assertEqual(obs["context"].get("chatMessage"), "hhhhhhhh")
+        self.assertEqual(obs["context"].get("vulcanPlayer"), "Cheater")
+        self.assertEqual(obs["context"].get("vulcanCheck"), "Fly (Type A)")
 
 
 class MineSentinelHourlySummaryTests(unittest.IsolatedAsyncioTestCase):
