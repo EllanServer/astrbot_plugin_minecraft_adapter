@@ -596,6 +596,68 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
         # 未知级别默认 INFO
         self.assertEqual(_severity_number("UNKNOWN"), 9)
 
+    def test_ai_prompt_includes_anomaly_evidence(self):
+        """AI prompt 应当包含预计算的异常证据，而非让 LLM 重新检测。"""
+        from services.mine_sentinel.reporting.ai_prompt import AIReportPromptBuilder
+        from services.mine_sentinel.anomaly_detector import TemplateAnomalyDetector
+        import services.mine_sentinel.anomaly_detector as ad_module
+
+        # 临时替换全局检测器，注入已知异常
+        test_detector = TemplateAnomalyDetector(
+            bucket_seconds=1, ewma_alpha=0.3,
+            spike_threshold=2.0, min_baseline_count=2,
+        )
+        # 积累基线 + 突增
+        for i in range(3):
+            test_detector.observe("srv", "T_SPIKE",
+                                  template="<*> connection reset",
+                                  level="WARN", timestamp_ms=i * 1000)
+        for i in range(10):
+            test_detector.observe("srv", "T_SPIKE",
+                                  template="<*> connection reset",
+                                  level="WARN", timestamp_ms=5000 + i * 100)
+        old_global = ad_module._global_detector
+        ad_module._global_detector = test_detector
+        try:
+            config = MineSentinelConfig.from_dict({})
+            builder = AIReportPromptBuilder(config)
+            # 构造一条匹配 T_SPIKE 模板的记录
+            from services.mine_sentinel.models import ObservationRecord
+            record = ObservationRecord(
+                event_id="log-1", kind="SERVER_LOG", timestamp=1700000000000,
+                server_id="srv", server_name="Srv",
+                content="[14:00 WARN]: connection reset by peer",
+                tags=["server_log", "warn"],
+                context={"level": "WARN", "templateId": "T_SPIKE"},
+            )
+            fallback = HeuristicReportBuilder(config).build([record], 60)
+            prompt = builder.build([record], 60, fallback)
+            # prompt 应包含异常证据段
+            self.assertIn("异常证据:", prompt)
+            # 异常证据段应包含模板和分数
+            self.assertIn("T_SPIKE", prompt)
+            self.assertIn("ewma_spike", prompt)
+        finally:
+            ad_module._global_detector = old_global
+
+    def test_anomaly_evidence_returns_empty_without_anomalies(self):
+        """无异常时 anomaly_evidence 应返回空列表。"""
+        from services.mine_sentinel.reporting.ai_prompt import AIReportPromptBuilder
+        from services.mine_sentinel.anomaly_detector import TemplateAnomalyDetector
+        import services.mine_sentinel.anomaly_detector as ad_module
+
+        # 用全新检测器（无异常）
+        clean_detector = TemplateAnomalyDetector()
+        old_global = ad_module._global_detector
+        ad_module._global_detector = clean_detector
+        try:
+            config = MineSentinelConfig.from_dict({})
+            builder = AIReportPromptBuilder(config)
+            evidence = builder.anomaly_evidence([])
+            self.assertEqual(evidence, [])
+        finally:
+            ad_module._global_detector = old_global
+
     def test_loop_filter_dedupes_by_template_id(self):
         """loop_filter 应当按 templateId 合并同类日志，而不是只看 fingerprint。"""
         from services.mine_sentinel.models import MineSentinelRuntimeLogConfig

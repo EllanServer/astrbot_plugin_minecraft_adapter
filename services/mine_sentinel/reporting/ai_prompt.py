@@ -7,6 +7,7 @@ import math
 from collections import Counter
 from typing import Any
 
+from ..anomaly_detector import get_anomaly_detector
 from ..models import MineSentinelConfig, ObservationRecord
 from .sampling import even_sample, sample_records_for_ai
 
@@ -14,6 +15,8 @@ from .sampling import even_sample, sample_records_for_ai
 MAX_EVIDENCE_SAMPLE_CHARS = 520
 MAX_CONTEXT_LINE_CHARS = 180
 MAX_CONTEXT_LINES = 5
+MAX_ANOMALY_SAMPLES = 3
+MAX_ANOMALY_EVIDENCE = 10
 
 
 class AIReportPromptBuilder:
@@ -34,11 +37,13 @@ class AIReportPromptBuilder:
             self.compact_record(record)
             for record in self.sample_for_ai(records, fallback)
         ]
+        anomaly_evidence = self.anomaly_evidence(records)
         return self.fit_prompt(
             window_minutes,
             fallback_json,
             timeline,
             compact_records,
+            anomaly_evidence,
         )
 
     def fit_prompt(
@@ -47,15 +52,20 @@ class AIReportPromptBuilder:
         fallback_json: str,
         timeline_chunks: list[dict[str, Any]],
         compact_records: list[dict[str, Any]],
+        anomaly_evidence: list[dict[str, Any]],
     ) -> str:
         max_chars = self.config.report.max_ai_prompt_chars
         records = list(compact_records)
         chunks = [dict(chunk) for chunk in timeline_chunks]
+        evidence = [dict(item) for item in anomaly_evidence]
 
         while True:
-            prompt = self.prompt_text(window_minutes, fallback_json, chunks, records)
+            prompt = self.prompt_text(
+                window_minutes, fallback_json, chunks, records, evidence
+            )
             if len(prompt) <= max_chars:
                 return prompt
+            # 预算压缩优先级：先减抽样记录 → 减 chunk samples → 减 chunks → 减异常证据样本
             if records:
                 records = even_sample(records, max(0, len(records) * 3 // 4))
                 continue
@@ -63,6 +73,11 @@ class AIReportPromptBuilder:
                 continue
             if len(chunks) > 1:
                 chunks = even_sample(chunks, max(1, len(chunks) // 2))
+                continue
+            if self.trim_anomaly_samples(evidence):
+                continue
+            if len(evidence) > 3:
+                evidence = evidence[: max(3, len(evidence) * 3 // 4)]
                 continue
             return prompt[:max_chars]
 
@@ -72,6 +87,7 @@ class AIReportPromptBuilder:
         fallback_json: str,
         timeline_chunks: list[dict[str, Any]],
         compact_records: list[dict[str, Any]],
+        anomaly_evidence: list[dict[str, Any]],
     ) -> str:
         return (
             "你是 Minecraft 服务器只读旁路监控 MineSentinel 的报告代理。"
@@ -82,6 +98,13 @@ class AIReportPromptBuilder:
             "issues(category,tag,incident_index,severity,affected_locations,issue_terms,"
             "evidence_count,signal_count,suggested_action),"
             "ops_notes。"
+            "异常检测已由模板解析（Drain3）+ EWMA/分位数突增检测 + 关键词规则完成，"
+            "你的职责是解释异常证据、判断可能原因、给出排查建议，而不是重新检测异常。"
+            "输入里的'异常证据'是预计算的结构化异常列表，每条含 template_id、score、"
+            "reason（ewma_spike/percentile_spike/new_template）、baseline、current_count、"
+            "代表样本；score>=0.5 表示突增告警，>=0.8 表示极端突增。"
+            "应优先把高 score 异常归入对应 issue 并提级 severity，"
+            "在 suggested_action 中给出针对该模板的具体排查步骤。"
             "输入里的启发式初稿来自完整窗口记录；分段时间线也是完整窗口的压缩统计；"
             "当前输入只来自 AstrBot 直接读取的 Minecraft 运行日志 SERVER_LOG。"
             "issues.evidence_samples 若包含多行上下文，> 行是命中的证据日志，"
@@ -109,10 +132,75 @@ class AIReportPromptBuilder:
             "每个事故最多保留 2 到 4 条关键证据，避免在多个事件中重复粘贴同一批上下文；"
             "如果窗口内只有一个明显异常时间点，应说明其他时间段未发现明显持续异常。"
             f"时间窗口: 最近 {window_minutes} 分钟。\n"
+            f"异常证据: {json.dumps(anomaly_evidence, ensure_ascii=False)}\n"
             f"启发式初稿: {fallback_json}\n"
             f"分段时间线: {json.dumps(timeline_chunks, ensure_ascii=False)}\n"
             f"抽样观察: {json.dumps(compact_records, ensure_ascii=False)}"
         )
+
+    def anomaly_evidence(
+        self,
+        records: list[ObservationRecord],
+    ) -> list[dict[str, Any]]:
+        """从异常检测器提取结构化异常证据，附带代表样本。
+
+        LLM 不再从原始日志中检测异常，而是直接消费预计算的异常证据：
+        - template_id / template / level
+        - anomaly score / reason / baseline / current_count
+        - 该模板的代表日志样本（从 records 中按 templateId 匹配）
+        """
+        snapshot = get_anomaly_detector().snapshot()
+        anomalies = snapshot.get("anomalies") or []
+        if not anomalies:
+            return []
+        # 按 template_id 分组记录，便于取代表样本
+        records_by_template: dict[str, list[ObservationRecord]] = {}
+        for record in records:
+            ctx = record.context or {}
+            tid = str(ctx.get("templateId") or "")
+            if tid:
+                records_by_template.setdefault(tid, []).append(record)
+
+        evidence: list[dict[str, Any]] = []
+        for anomaly in anomalies[:MAX_ANOMALY_EVIDENCE]:
+            tid = anomaly.get("template_id") or ""
+            samples = records_by_template.get(tid, [])
+            # 取最近几条作为代表样本
+            sample_texts: list[str] = []
+            for record in samples[-MAX_ANOMALY_SAMPLES:]:
+                text = truncate(record.content, self.config.report.max_ai_content_length)
+                if text:
+                    sample_texts.append(text)
+            evidence.append(
+                {
+                    "template_id": tid,
+                    "template": truncate(str(anomaly.get("template") or ""), 200),
+                    "level": anomaly.get("level", "INFO"),
+                    "score": anomaly.get("current_score", 0.0),
+                    "reason": anomaly.get("reason", ""),
+                    "baseline": anomaly.get("ewma_count", 0.0),
+                    "total_count": anomaly.get("total_count", 0),
+                    "server_id": anomaly.get("server_id", ""),
+                    "first_seen_ms": anomaly.get("first_seen_ms", 0),
+                    "last_seen_ms": anomaly.get("last_seen_ms", 0),
+                    "samples": sample_texts,
+                }
+            )
+        return evidence
+
+    @staticmethod
+    def trim_anomaly_samples(evidence: list[dict[str, Any]]) -> bool:
+        """压缩异常证据的样本数，返回是否做了改动。"""
+        changed = False
+        for item in evidence:
+            samples = item.get("samples") or []
+            if len(samples) > 1:
+                item["samples"] = samples[:1]
+                changed = True
+            elif samples:
+                item["samples"] = []
+                changed = True
+        return changed
 
     def compact_fallback(self, fallback: dict[str, Any]) -> dict[str, Any]:
         categories = fallback.get("categories") or {}
