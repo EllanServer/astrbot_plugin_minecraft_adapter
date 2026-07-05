@@ -60,6 +60,11 @@ def window_export_stem(
         stem = f"mine_sentinel_{start_day}_{start_time}_{end_day}_{end_time}"
     if server_id:
         stem = f"{stem}_{safe_name(server_id)}"
+    # PR9 hotfix v3: 追加秒级 end_timestamp，避免同分钟内连续 /mc report now
+    # 复用旧附件。管理员一分钟内连发两次 report now 时，第二次的 window_end
+    # 更晚（即使只差几秒），文件名不同，不会错误复用第一次的旧 export。
+    # export_reuse_existing 仍对"完全相同窗口"（如 periodic report 重试）有效。
+    stem = f"{stem}_t{int(end_timestamp)}"
     return stem
 
 

@@ -3572,5 +3572,158 @@ class MineSentinelPr9HotfixV2Tests(unittest.TestCase):
         self.assertTrue(cfg2.storage.trust_legacy_index)
 
 
+class MineSentinelPr9HotfixV3Tests(unittest.TestCase):
+    """验证 PR9 hotfix v3 修复的边界风险。
+
+    1. P0: JSONL 写入改 binary append，offset 是真实 byte offset。
+    2. P1: AI anomaly evidence 按 (server_id, template_id) 匹配样本。
+    3. P1: export 文件名加秒级 end_timestamp，避免同分钟复用旧附件。
+    4. P2: flush_bucket 同步更新 EWMA。
+    """
+
+    def test_jsonl_write_uses_binary_append_and_offset_is_byte_accurate(self):
+        """写入 UTF-8 中文日志后，.idx offset 应精确指向行首 byte offset。
+
+        回归 P0：旧代码用文本模式 tell()，返回 TextIO cookie 而非
+        raw byte offset，中文日志 seek 会错位漏行。
+        """
+        _install_astrbot_stubs()
+        from services.mine_sentinel.storage.jsonl_store import DiskObservationStore
+        cfg = MineSentinelConfig.from_dict({"storage": {"enabled": True}})
+        now_ms = int(time.time() * 1000)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DiskObservationStore(cfg, Path(tmp_dir))
+            # 写入 260 行含中文的日志，触发默认 line_interval=256 的索引
+            observations = [
+                {"eventId": f"e{i}", "kind": "SERVER_LOG",
+                 "timestamp": now_ms + i * 1000,
+                 "serverId": "srv",
+                 "content": f"玩家{i}加入了游戏，服务器保存了世界",
+                 "tags": ["info"]}
+                for i in range(260)
+            ]
+            store.add_batch("srv", {
+                "serverId": "srv",
+                "serverName": "生存服",
+                "observations": observations,
+            })
+            # 找到当天 JSONL 和 .idx
+            jsonl_files = list(Path(tmp_dir).rglob("*.jsonl"))
+            self.assertEqual(len(jsonl_files), 1)
+            jsonl_path = jsonl_files[0]
+            idx_path = jsonl_path.with_suffix(".idx")
+            self.assertTrue(idx_path.exists())
+            # 读 raw bytes，验证 offset 指向行首
+            raw = jsonl_path.read_bytes()
+            idx = JsonlOffsetIndex(idx_path)
+            idx.load()
+            self.assertGreaterEqual(idx.entry_count, 1,
+                                    f"应有索引条目，实际 {idx.entry_count}")
+            # 对每个索引条目，seek 到 offset 后应能读到完整 JSON 行
+            for ts, off in zip(idx._timestamps, idx._offsets):
+                self.assertLessEqual(off, len(raw))
+                line_end = raw.find(b"\n", off)
+                if line_end == -1:
+                    line_end = len(raw)
+                line_bytes = raw[off:line_end]
+                # 应该是合法 JSON，能正确解码 UTF-8 中文
+                data = json.loads(line_bytes.decode("utf-8"))
+                self.assertEqual(data["timestamp"], ts)
+                self.assertIn("玩家", data["content"])
+
+    def test_anomaly_evidence_uses_server_template_key(self):
+        """AI 异常证据应按 (server_id, template_id) 匹配样本，不串 server。"""
+        _install_astrbot_stubs()
+        from services.mine_sentinel.reporting.ai_prompt import AIReportPromptBuilder
+        import services.mine_sentinel.anomaly_detector as ad_mod
+        from services.mine_sentinel.anomaly_detector import get_anomaly_detector
+        # 重置全局检测器
+        ad_mod._global_detector = None
+        detector = get_anomaly_detector(max_templates_per_server=100, inactive_template_ttl_hours=1, cleanup_interval=99999)
+        # 两个 server，相同的 template_id（Drain3 cluster id 从 1 开始）
+        # 模拟 observe：survival template_id=T1，creative template_id=T1
+        # 先制造足够多的计数触发 baseline
+        for _ in range(10):
+            detector.observe("survival", "T1", "survival error line", "ERROR")
+        for _ in range(10):
+            detector.observe("creative", "T1", "creative different error", "ERROR")
+        # 突增 survival T1
+        for _ in range(50):
+            detector.observe("survival", "T1", "survival error line", "ERROR")
+        # 构造 records：survival 和 creative 都有 templateId=T1
+        from services.mine_sentinel.models import ObservationRecord
+        survival_rec = ObservationRecord.from_dict({
+            "eventId": "s1", "kind": "SERVER_LOG", "timestamp": 1700000000000,
+            "serverId": "survival", "content": "survival error line",
+            "tags": ["error"],
+            "context": {"templateId": "T1", "level": "ERROR"},
+        })
+        creative_rec = ObservationRecord.from_dict({
+            "eventId": "c1", "kind": "SERVER_LOG", "timestamp": 1700000000000,
+            "serverId": "creative", "content": "creative different error",
+            "tags": ["error"],
+            "context": {"templateId": "T1", "level": "ERROR"},
+        })
+        cfg = MineSentinelConfig.from_dict({})
+        builder = AIReportPromptBuilder(cfg)
+        evidence = builder.anomaly_evidence([survival_rec, creative_rec])
+        # 找 survival 的异常证据
+        survival_ev = [e for e in evidence if e.get("server_id") == "survival"]
+        self.assertTrue(survival_ev, "应有 survival 异常证据")
+        # 样本应只含 survival 的内容，不含 creative
+        for sample in survival_ev[0].get("samples", []):
+            self.assertIn("survival", sample.lower())
+            self.assertNotIn("creative", sample.lower())
+        # 清理全局
+        import services.mine_sentinel.anomaly_detector as ad_mod
+        ad_mod._global_detector = None
+
+    def test_export_filename_includes_second_precision_end_timestamp(self):
+        """同分钟内两次 export 应生成不同文件名（end_timestamp 不同）。"""
+        from services.mine_sentinel.storage.paths import export_path
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            export_dir = Path(tmp_dir) / "exports"
+            export_dir.mkdir()
+            # 同一分钟内，相隔 5 秒
+            p1 = export_path(export_dir, 30, "srv", now=1700000000)
+            p2 = export_path(export_dir, 30, "srv", now=1700000005)
+            # 文件名应不同（_t{timestamp} 后缀不同）
+            self.assertNotEqual(p1.name, p2.name)
+            # 都应包含 _t 前缀的秒级 timestamp
+            self.assertIn("_t1700000000", p1.name)
+            self.assertIn("_t1700000005", p2.name)
+
+    def test_export_reuse_still_works_for_identical_window(self):
+        """完全相同窗口的 export 仍应复用（export_reuse_existing 有效）。"""
+        from services.mine_sentinel.storage.paths import export_path
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            export_dir = Path(tmp_dir) / "exports"
+            export_dir.mkdir()
+            # 完全相同的 now
+            p1 = export_path(export_dir, 30, "srv", now=1700000000)
+            p2 = export_path(export_dir, 30, "srv", now=1700000000)
+            self.assertEqual(p1.name, p2.name)
+
+    def test_flush_bucket_updates_ewma(self):
+        """flush_bucket 后 stat.ewma_count 应 > 0，与 window 一致。"""
+        from services.mine_sentinel.anomaly_detector import TemplateAnomalyDetector
+        detector = TemplateAnomalyDetector(
+            bucket_seconds=60, ewma_alpha=0.5, max_templates_per_server=100,
+            inactive_template_ttl_hours=1, cleanup_interval=99999,
+        )
+        # observe 几次，填充当前桶
+        now_ms = 1_700_000_000_000
+        for _ in range(10):
+            detector.observe("srv", "T1", "error line", "ERROR", timestamp_ms=now_ms)
+        # flush_bucket（强制把当前桶 flush 到 window + ewma）
+        detector.flush_bucket(server_id="srv", now_ms=now_ms + 120_000)
+        shard = detector._shard_for("srv")
+        with shard.lock:
+            stat = shard.stats.get("T1")
+            self.assertIsNotNone(stat)
+            self.assertGreater(stat.ewma_count, 0.0, "flush_bucket 后 ewma_count 应 > 0")
+            self.assertGreater(len(stat.window), 0, "window 应有计数")
+
+
 if __name__ == "__main__":
     unittest.main()

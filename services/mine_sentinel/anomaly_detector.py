@@ -381,6 +381,10 @@ class TemplateAnomalyDetector:
             if state[0] != bucket_index and state[1] > 0:
                 stat = shard.stats.get(template_id)
                 if stat:
+                    # PR9 hotfix v3: 同步更新 EWMA，与 observe() 桶切换路径
+                    # 保持一致。否则 flush_bucket 后 snapshot 的 window 和
+                    # ewma_count 会不一致，AI 报告 baseline 不准。
+                    self._update_ewma(stat, state[1])
                     stat.window.append(state[1])
                 shard.current_bucket[template_id] = (bucket_index, 0)
 
