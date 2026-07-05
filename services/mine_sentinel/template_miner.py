@@ -223,7 +223,7 @@ class LogTemplateMiner:
                 template=result.get_template(),
                 params=[],
                 is_new_template=False,
-                cluster_size=result.get_size(),
+                cluster_size=result.size,
                 fallback=False,
             )
 
@@ -242,7 +242,7 @@ class LogTemplateMiner:
                 for cluster_id, cluster in miner.drain.id_to_cluster.items():
                     clusters[str(cluster_id)] = {
                         "template": cluster.get_template(),
-                        "size": cluster.get_size(),
+                        "size": cluster.size,
                     }
                 namespaces[server_id] = clusters
             return {"available": True, "namespaces": namespaces}
@@ -267,11 +267,28 @@ _global_miner: LogTemplateMiner | None = None
 _global_lock = threading.Lock()
 
 
-def get_template_miner() -> LogTemplateMiner:
-    """获取全局 LogTemplateMiner 单例。"""
+def get_template_miner(
+    max_namespaces: int | None = None,
+) -> LogTemplateMiner:
+    """获取全局 LogTemplateMiner 单例。
+
+    首次调用可通过 ``max_namespaces`` 覆盖默认值（来自 config）；后续调用
+    的参数被忽略（单例已创建）。这样 service 层可在初始化时传入 config，
+    其他调用方（如 runtime_log）无参获取已创建的实例。
+    """
     global _global_miner
     if _global_miner is None:
         with _global_lock:
             if _global_miner is None:
-                _global_miner = LogTemplateMiner()
+                kwargs: dict[str, Any] = {}
+                if max_namespaces is not None:
+                    kwargs["max_namespaces"] = max_namespaces
+                _global_miner = LogTemplateMiner(**kwargs)
     return _global_miner
+
+
+def reset_template_miner() -> None:
+    """重置全局单例（仅供测试使用，避免跨测试污染）。"""
+    global _global_miner
+    with _global_lock:
+        _global_miner = None

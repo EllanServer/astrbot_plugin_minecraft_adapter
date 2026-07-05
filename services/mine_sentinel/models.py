@@ -150,6 +150,11 @@ class MineSentinelRuntimeLogConfig:
     loop_filter_enabled: bool = True
     loop_filter_window_seconds: int = 300
     loop_summary_interval_seconds: int = 300
+    # 模板/异常检测调参（PR7 暴露到 _conf_schema，便于运维调优）
+    template_max_namespaces: int = 16
+    anomaly_max_templates_per_server: int = 500
+    anomaly_inactive_template_ttl_hours: int = 24
+    anomaly_cleanup_interval: int = 200
 
 
 @dataclass(slots=True)
@@ -262,6 +267,22 @@ class MineSentinelConfig:
                 loop_summary_interval_seconds=_positive_int(
                     runtime_log_data.get("loop_summary_interval_seconds"),
                     300,
+                ),
+                template_max_namespaces=_positive_int(
+                    runtime_log_data.get("template_max_namespaces"),
+                    16,
+                ),
+                anomaly_max_templates_per_server=_positive_int(
+                    runtime_log_data.get("anomaly_max_templates_per_server"),
+                    500,
+                ),
+                anomaly_inactive_template_ttl_hours=_positive_int(
+                    runtime_log_data.get("anomaly_inactive_template_ttl_hours"),
+                    24,
+                ),
+                anomaly_cleanup_interval=_positive_int(
+                    runtime_log_data.get("anomaly_cleanup_interval"),
+                    200,
                 ),
             ),
             report=MineSentinelReportConfig(

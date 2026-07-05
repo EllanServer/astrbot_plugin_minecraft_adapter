@@ -359,7 +359,10 @@ class MineSentinelRuntimeLogTailer:
             )
             state.position = 0
             state.partial = ""
-        if size == state.position:
+        if size == state.position and not state.partial:
+            # 无新数据且无 backlog：本轮无事可做。
+            # 注意：如果 state.partial 非空（有 backlog 未处理），即使文件
+            # 没有新数据也必须继续，否则 backlog 会永久滞留（PR7 修复）。
             return
 
         lines, position, partial, dropped_count = await self.io_runner(

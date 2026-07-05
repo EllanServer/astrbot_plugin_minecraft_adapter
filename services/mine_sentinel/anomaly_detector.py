@@ -338,11 +338,33 @@ _global_detector: TemplateAnomalyDetector | None = None
 _global_lock = threading.Lock()
 
 
-def get_anomaly_detector() -> TemplateAnomalyDetector:
-    """获取全局异常检测器单例。"""
+def get_anomaly_detector(
+    max_templates_per_server: int | None = None,
+    inactive_template_ttl_hours: int | None = None,
+    cleanup_interval: int | None = None,
+) -> TemplateAnomalyDetector:
+    """获取全局异常检测器单例。
+
+    首次调用可通过参数覆盖默认值（来自 config）；后续调用的参数被忽略
+    （单例已创建）。service 层在初始化时传入 config，其他调用方无参获取。
+    """
     global _global_detector
     if _global_detector is None:
         with _global_lock:
             if _global_detector is None:
-                _global_detector = TemplateAnomalyDetector()
+                kwargs: dict[str, Any] = {}
+                if max_templates_per_server is not None:
+                    kwargs["max_templates_per_server"] = max_templates_per_server
+                if inactive_template_ttl_hours is not None:
+                    kwargs["inactive_template_ttl_hours"] = inactive_template_ttl_hours
+                if cleanup_interval is not None:
+                    kwargs["cleanup_interval"] = cleanup_interval
+                _global_detector = TemplateAnomalyDetector(**kwargs)
     return _global_detector
+
+
+def reset_anomaly_detector() -> None:
+    """重置全局单例（仅供测试使用，避免跨测试污染）。"""
+    global _global_detector
+    with _global_lock:
+        _global_detector = None

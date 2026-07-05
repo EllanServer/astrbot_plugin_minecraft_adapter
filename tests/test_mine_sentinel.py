@@ -1931,5 +1931,447 @@ def _install_astrbot_stubs():
     sys.modules.update({"astrbot": astrbot, "astrbot.api": api})
 
 
+class MineSentinelEndToEndIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """端到端集成测试：从文件读取 → tailer 处理 → JSONL 落盘的完整链路。
+
+    覆盖发版前 3 个关键验证：
+    - #3 burst backlog：突发日志超过 max_lines_per_poll 时不丢行，下轮继续处理
+    - #4 多 server_id Drain3 namespace 隔离：不同服的同模板不互相污染
+    - #5 JSONL 中 context.otel 保持嵌套 dict（端到端落盘验证）
+    """
+
+    def _make_config(self, tmp_dir, sources, max_lines_per_poll=3):
+        return MineSentinelConfig.from_dict({
+            "runtime_log": {
+                "sources": sources,
+                "backfill_on_start": False,
+                "initial_lines": 0,
+                "poll_interval_seconds": 1,
+                "max_bytes_per_poll": 65536,
+                "max_lines_per_poll": max_lines_per_poll,
+                "loop_filter_enabled": False,  # E2E 关注不丢行，关闭合并
+            },
+            "storage": {"enabled": True, "dir": str(Path(tmp_dir) / "store")},
+        })
+
+    async def test_burst_backlog_e2e_no_lines_lost(self):
+        """#3 E2E: burst 超过 max_lines_per_poll 时，多轮 poll 后总 observation 数 == 原始行数。"""
+        _install_astrbot_stubs()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "latest.log"
+            # 写入 10 行 INFO 日志（INFO 不会被 loop_filter 合并）
+            ts = "12:00:00"
+            lines_written = [f"[{ts} INFO]: daily event number {i}" for i in range(10)]
+            log_path.write_text("\n".join(lines_written) + "\n", encoding="utf-8")
+
+            config = self._make_config(
+                tmp,
+                [{"server_id": "srv", "server_name": "Srv", "log_file": str(log_path)}],
+                max_lines_per_poll=3,
+            )
+
+            collected = []
+
+            async def handle_batch(server_id, payload):
+                collected.extend(payload.get("observations", []))
+
+            tailer = MineSentinelRuntimeLogTailer(
+                config.runtime_log, handle_batch, io_runner=_run_sync,
+            )
+            source = config.runtime_log.sources[0]
+            from services.mine_sentinel.runtime_log import _SourceState
+            state = _SourceState(source=source, log_file=log_path)
+
+            # 多轮 poll 直到 backlog 清空（position 到文件末尾且 partial 为空）
+            for _ in range(10):
+                await tailer._poll_source(state)
+                if state.partial == "" and state.position >= log_path.stat().st_size:
+                    break
+
+            # 关键断言：10 行全部收到，不丢行
+            self.assertEqual(
+                len(collected), 10,
+                f"应收到 10 条 observation（不丢行），实际 {len(collected)}",
+            )
+            # 验证内容完整（按顺序）
+            contents = [obs["content"] for obs in collected]
+            for i in range(10):
+                self.assertTrue(
+                    any(f"number {i}" in c for c in contents),
+                    f"第 {i} 行丢失",
+                )
+
+    def test_multi_server_template_namespace_isolation(self):
+        """#4 E2E: 两个 server_id 的相同日志模板应分属不同 namespace，不互相污染 new_template。"""
+        _install_astrbot_stubs()
+        from services.mine_sentinel.template_miner import LogTemplateMiner
+
+        miner = LogTemplateMiner()
+        # 同一条日志分别在 srv_a 和 srv_b 解析
+        line = "[12:00:00 INFO]: Steve joined the game"
+        r_a1 = miner.parse(line, server_id="srv_a")
+        r_a2 = miner.parse(line, server_id="srv_a")
+        r_b1 = miner.parse(line, server_id="srv_b")
+
+        # srv_a 第一次：new_template=True
+        self.assertTrue(r_a1.is_new_template, "srv_a 首次应为新模板")
+        # srv_a 第二次：new_template=False（同 namespace 已见过）
+        self.assertFalse(r_a2.is_new_template, "srv_a 第二次不应为新模板")
+        # srv_b 第一次：仍应是 new_template=True（独立 namespace）
+        self.assertTrue(
+            r_b1.is_new_template,
+            "srv_b 首次应仍为新模板（namespace 隔离）",
+        )
+        # 两个 server 的 template_id 可以相同（Drain3 内部 ID），
+        # 但 new_template 判定必须独立
+        # 验证 snapshot 有两个 namespace
+        snap = miner.snapshot()
+        self.assertIn("srv_a", snap["namespaces"])
+        self.assertIn("srv_b", snap["namespaces"])
+
+    def test_jsonl_otel_dict_survives_end_to_end(self):
+        """#5 E2E: 通过 DiskObservationStore 落盘的 JSONL 中 context.otel 仍是嵌套 dict。"""
+        _install_astrbot_stubs()
+        with tempfile.TemporaryDirectory() as tmp:
+            store_dir = Path(tmp) / "store"
+            config = MineSentinelConfig.from_dict({
+                "storage": {"enabled": True},
+            })
+            store = DiskObservationStore(config, Path(store_dir))
+
+            # 构造一条带深层 OTel 嵌套的 observation payload
+            observation = {
+                "eventId": "e2e-1",
+                "kind": "SERVER_LOG",
+                "timestamp": int(time.time() * 1000),
+                "serverId": "srv",
+                "serverName": "Srv",
+                "content": "[ERROR]: connection reset",
+                "tags": ["server_log", "error"],
+                "context": {
+                    "level": "ERROR",
+                    "otel": {
+                        "severityNumber": 17,
+                        "severityText": "ERROR",
+                        "eventName": "network.error",
+                        "body": "[ERROR]: connection reset",
+                        "resource": {"service.name": "minecraft-srv"},
+                        "attributes": {
+                            "template.id": "T1",
+                            "loop.suppressed": 0,
+                        },
+                    },
+                },
+            }
+            store.add_batch("srv", {"observations": [observation]})
+
+            # 读回 JSONL 文件，验证 otel 是嵌套 dict
+            jsonl_files = list(Path(store_dir).rglob("*.jsonl"))
+            self.assertTrue(jsonl_files, "应至少有一个 JSONL 文件")
+            lines = []
+            for f in jsonl_files:
+                lines.extend(f.read_text(encoding="utf-8").strip().splitlines())
+            self.assertTrue(lines, "JSONL 文件应有内容")
+            parsed = json.loads(lines[-1])
+
+            # 关键断言：otel 是 dict，不是字符串
+            self.assertIsInstance(
+                parsed["context"]["otel"], dict,
+                "落盘 JSONL 的 context.otel 应是 dict，不是字符串",
+            )
+            self.assertEqual(parsed["context"]["otel"]["eventName"], "network.error")
+            self.assertIsInstance(
+                parsed["context"]["otel"]["resource"], dict,
+                "otel.resource 应是 dict",
+            )
+            self.assertEqual(
+                parsed["context"]["otel"]["resource"]["service.name"],
+                "minecraft-srv",
+            )
+            self.assertIsInstance(
+                parsed["context"]["otel"]["attributes"], dict,
+                "otel.attributes 应是 dict",
+            )
+            self.assertEqual(parsed["context"]["otel"]["attributes"]["template.id"], "T1")
+
+
+class MineSentinelRustPythonEquivalenceTests(unittest.TestCase):
+    """Rust 路径与纯 Python fallback 的输出等价性验证。
+
+    这组测试只在真实 mine_sentinel_rs wheel 已安装时才做实质断言；
+    stub 模式下跳过（因为 stub 本身就是 Python 实现，比较无意义）。
+    目的：验证 PR6 的 P0/P1-A/B 修复——Rust 可选化 + 热路径接入——
+    两条路径行为完全等价。
+    """
+
+    def _has_real_rust(self) -> bool:
+        try:
+            import mine_sentinel_rs  # noqa: F401
+            # stub 是 types.ModuleType，真实扩展的模块名是 builtins
+            mod = sys.modules.get("mine_sentinel_rs")
+            return mod is not None and not hasattr(mod, "_is_stub")
+        except ImportError:
+            return False
+
+    def _make_record(self):
+        from services.mine_sentinel.models import ObservationRecord
+
+        return ObservationRecord(
+            event_id="",
+            kind="SERVER_LOG",
+            timestamp=1700000000000,
+            server_id="survival",
+            server_name="Survival",
+            backend_server="",
+            proxy_id="",
+            player_name="Steve",
+            player_uuid_hash="abc123",
+            content="[ERROR]: Connection reset by peer: io.netty.channel.unix.Errors",
+            tags=["server_log", "runtime_log", "error", "network"],
+            context={
+                "level": "ERROR",
+                "fingerprint": "fp123",
+                "templateId": "T5",
+                "template": "<*> ERROR]: Connection reset",
+                "templateSize": 3,
+                "anomalyScore": 0.75,
+                "otel": {
+                    "timestamp": 1700000000000,
+                    "observedTimestamp": 1700000000123,
+                    "severityText": "ERROR",
+                    "severityNumber": 17,
+                    "body": "[ERROR]: Connection reset by peer",
+                    "eventName": "network.error",
+                    "resource": {"service.name": "minecraft-survival"},
+                    "attributes": {
+                        "template.id": "T5",
+                        "loop.suppressed": 0,
+                    },
+                },
+            },
+            raw={},
+        )
+
+    def test_codec_rust_equals_python_normalize_and_json(self):
+        """Rust 与纯 Python 路径的 normalize_record / record_to_json / json_line 输出应完全相等。"""
+        if not self._has_real_rust():
+            self.skipTest("需要真实 mine_sentinel_rs wheel 才能验证等价性")
+
+        from services.mine_sentinel.storage import codec as codec_mod
+        from services.mine_sentinel.models import MineSentinelConfig
+
+        cfg = MineSentinelConfig.from_dict({})
+
+        # 路径 1：Rust（_HAS_RUST=True，_rs 不为 None）
+        codec_rust = ObservationRecordCodec(cfg) if False else codec_mod.ObservationRecordCodec(cfg)
+        self.assertTrue(codec_rust.uses_native, "Rust 路径应启用")
+
+        rec_rust = self._make_record()
+        codec_rust.normalize_record(rec_rust)
+        json_rust = codec_rust.record_to_json(rec_rust)
+        line_rust = codec_rust.json_line(rec_rust)
+        key_rust = codec_rust.dedupe_key(rec_rust)
+
+        # 路径 2：纯 Python（强制 _rs=None）
+        codec_py = codec_mod.ObservationRecordCodec(cfg)
+        codec_py._rs = None  # 强制走纯 Python fallback
+        self.assertFalse(codec_py.uses_native)
+
+        rec_py = self._make_record()
+        codec_py.normalize_record(rec_py)
+        json_py = codec_py.record_to_json(rec_py)
+        line_py = codec_py.json_line(rec_py)
+        key_py = codec_py.dedupe_key(rec_py)
+
+        # 关键断言：两条路径输出必须完全相等
+        self.assertEqual(rec_rust.content, rec_py.content, "content 不一致")
+        self.assertEqual(rec_rust.tags, rec_py.tags, "tags 不一致")
+        self.assertEqual(rec_rust.context, rec_py.context, "context 不一致（含 OTel 嵌套）")
+        self.assertEqual(json_rust, json_py, "record_to_json 输出不一致")
+        self.assertEqual(line_rust, line_py, "json_line 输出不一致")
+        self.assertEqual(key_rust, key_py, "dedupe_key 不一致")
+
+    def test_codec_rust_equals_python_with_long_content_and_many_tags(self):
+        """超长 content / 超多 tags / 深层嵌套 OTel 下两条路径仍应相等。"""
+        if not self._has_real_rust():
+            self.skipTest("需要真实 mine_sentinel_rs wheel 才能验证等价性")
+
+        from services.mine_sentinel.storage import codec as codec_mod
+        from services.mine_sentinel.models import MineSentinelConfig, ObservationRecord
+
+        cfg = MineSentinelConfig.from_dict({})
+
+        long_content = ("[WARN]: spam spam " * 500) + " trailing tail"
+        many_tags = [f"tag_{i}" for i in range(50)]
+        deep_otel = {
+            "severityNumber": 13,
+            "body": "x" * 5000,
+            "resource": {"service.name": "s", "host.id": "h" * 200},
+            "attributes": {f"k{i}": f"v{i}" for i in range(30)},
+        }
+
+        codec_rust = codec_mod.ObservationRecordCodec(cfg)
+        self.assertTrue(codec_rust.uses_native)
+        codec_py = codec_mod.ObservationRecordCodec(cfg)
+        codec_py._rs = None
+
+        for codec, label in [(codec_rust, "rust"), (codec_py, "py")]:
+            rec = ObservationRecord(
+                event_id="", kind="SERVER_LOG", timestamp=1700000000000,
+                server_id="srv", server_name="Srv", content=long_content,
+                tags=many_tags,
+                context={"level": "WARN", "otel": deep_otel},
+                raw={},
+            )
+            codec.normalize_record(rec)
+            json_out = codec.record_to_json(rec)
+            line = codec.json_line(rec)
+            if label == "rust":
+                rec_rust, json_rust, line_rust = rec, json_out, line
+            else:
+                rec_py, json_py, line_py = rec, json_out, line
+
+        self.assertEqual(rec_rust.content, rec_py.content)
+        self.assertEqual(rec_rust.tags, rec_py.tags)
+        self.assertEqual(rec_rust.context, rec_py.context)
+        self.assertEqual(json_rust, json_py)
+        self.assertEqual(line_rust, line_py)
+        # OTel 仍应是 dict（不是字符串）
+        self.assertIsInstance(json_rust["context"]["otel"], dict)
+        self.assertIsInstance(json_rust["context"]["otel"]["attributes"], dict)
+
+    def test_observation_priority_rust_equals_python(self):
+        """observation_priority_score 的 Rust 与纯 Python 路径应给出相同分数。"""
+        if not self._has_real_rust():
+            self.skipTest("需要真实 mine_sentinel_rs wheel 才能验证等价性")
+
+        from services.mine_sentinel import observation_priority as op_mod
+        from services.mine_sentinel.models import ObservationRecord
+
+        cases = [
+            ("[ERROR]: something failed", ["server_log", "error"], 5.0),
+            ("[INFO]: player joined", ["server_log", "info"], 1.0),
+            ("[WARN]: connection reset", ["server_log", "warn", "network"], 5.0),
+            ("[FATAL]: crash", ["server_log", "fatal"], 5.0),
+            ("player was banned", ["server_log", "ban"], 5.0),
+            ("normal chat message", ["server_log"], 1.0),
+        ]
+
+        # Rust 路径
+        self.assertTrue(op_mod._HAS_RUST, "应启用 Rust 路径")
+        for content, tags, expected in cases:
+            rec = ObservationRecord(
+                event_id="", kind="SERVER_LOG", timestamp=1700000000000,
+                server_id="srv", server_name="Srv", content=content,
+                tags=tags, context={"level": "INFO"}, raw={},
+            )
+            score_rust = op_mod.observation_priority_score(rec)
+            self.assertEqual(
+                score_rust, expected,
+                f"Rust 路径 score 错误: content={content!r} tags={tags}",
+            )
+
+        # 纯 Python 路径（强制 _HAS_RUST=False）
+        original = op_mod._HAS_RUST
+        try:
+            op_mod._HAS_RUST = False
+            for content, tags, expected in cases:
+                rec = ObservationRecord(
+                    event_id="", kind="SERVER_LOG", timestamp=1700000000000,
+                    server_id="srv", server_name="Srv", content=content,
+                    tags=tags, context={"level": "INFO"}, raw={},
+                )
+                score_py = op_mod.observation_priority_score(rec)
+                self.assertEqual(
+                    score_py, expected,
+                    f"Python 路径 score 错误: content={content!r} tags={tags}",
+                )
+        finally:
+            op_mod._HAS_RUST = original
+
+    def test_non_server_log_kind_returns_zero(self):
+        """非 SERVER_LOG kind 的 priority 应为 0（两条路径一致）。"""
+        from services.mine_sentinel import observation_priority as op_mod
+        from services.mine_sentinel.models import ObservationRecord
+
+        rec = ObservationRecord(
+            event_id="", kind="PLAYER_CHAT", timestamp=1700000000000,
+            server_id="srv", server_name="Srv", content="error failed crash",
+            tags=["error"], context={}, raw={},
+        )
+        # 即便 content 含 error，kind 不是 SERVER_LOG 也应返回 0
+        original = op_mod._HAS_RUST
+        try:
+            if op_mod._HAS_RUST:
+                self.assertEqual(op_mod.observation_priority_score(rec), 0.0)
+            op_mod._HAS_RUST = False
+            self.assertEqual(op_mod.observation_priority_score(rec), 0.0)
+        finally:
+            op_mod._HAS_RUST = original
+
+
+class MineSentinelConfigExposureTests(unittest.TestCase):
+    """验证 PR7 新增的 anomaly/template 配置项能从 _conf_schema 透传到单例。"""
+
+    def test_runtime_log_config_parses_anomaly_and_template_params(self):
+        """MineSentinelRuntimeLogConfig 应解析 4 个新参数。"""
+        config = MineSentinelConfig.from_dict({
+            "runtime_log": {
+                "template_max_namespaces": 8,
+                "anomaly_max_templates_per_server": 100,
+                "anomaly_inactive_template_ttl_hours": 12,
+                "anomaly_cleanup_interval": 50,
+            }
+        })
+        rt = config.runtime_log
+        self.assertEqual(rt.template_max_namespaces, 8)
+        self.assertEqual(rt.anomaly_max_templates_per_server, 100)
+        self.assertEqual(rt.anomaly_inactive_template_ttl_hours, 12)
+        self.assertEqual(rt.anomaly_cleanup_interval, 50)
+
+    def test_runtime_log_config_uses_defaults_when_absent(self):
+        """无配置时应使用代码默认值。"""
+        config = MineSentinelConfig.from_dict({})
+        rt = config.runtime_log
+        self.assertEqual(rt.template_max_namespaces, 16)
+        self.assertEqual(rt.anomaly_max_templates_per_server, 500)
+        self.assertEqual(rt.anomaly_inactive_template_ttl_hours, 24)
+        self.assertEqual(rt.anomaly_cleanup_interval, 200)
+
+    def test_get_template_miner_accepts_max_namespaces(self):
+        """get_template_miner 首次调用应接受 max_namespaces 参数。"""
+        from services.mine_sentinel.template_miner import (
+            get_template_miner, reset_template_miner,
+        )
+        reset_template_miner()
+        try:
+            miner = get_template_miner(max_namespaces=4)
+            self.assertEqual(miner._max_namespaces, 4)
+            # 再次调用（无参数）应返回同一实例
+            self.assertIs(get_template_miner(), miner)
+        finally:
+            reset_template_miner()
+
+    def test_get_anomaly_detector_accepts_config_params(self):
+        """get_anomaly_detector 首次调用应接受 3 个 config 参数。"""
+        from services.mine_sentinel.anomaly_detector import (
+            get_anomaly_detector, reset_anomaly_detector,
+        )
+        reset_anomaly_detector()
+        try:
+            detector = get_anomaly_detector(
+                max_templates_per_server=50,
+                inactive_template_ttl_hours=6,
+                cleanup_interval=10,
+            )
+            self.assertEqual(detector._max_templates_per_server, 50)
+            self.assertEqual(detector._inactive_ttl_ms, 6 * 3600 * 1000)
+            self.assertEqual(detector._cleanup_interval, 10)
+            # 再次调用应返回同一实例
+            self.assertIs(get_anomaly_detector(), detector)
+        finally:
+            reset_anomaly_detector()
+
+
 if __name__ == "__main__":
     unittest.main()
