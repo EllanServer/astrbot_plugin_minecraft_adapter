@@ -341,6 +341,23 @@ COMMUNITY_MARKERS = CATEGORY_KEYS["community"]
 CHAT_REVIEW_MARKERS = CATEGORY_KEYS["chat_review"]
 PLAYER_FEEDBACK_MARKERS = CATEGORY_KEYS["player_feedback"]
 COMMUNITY_OPS_MARKERS = CATEGORY_KEYS["community_ops"]
+# URL/外链信号仅在 chat_message 标签的记录上触发 chat_review。
+# 真实日志验证：QuickShop-Hikari 等插件的更新检查日志
+# （[QuickShop-Hikari] Update here: https://modrinth.com/...）
+# 会被 https:// 信号误判为 chat_review；插件更新日志不是聊天内容。
+# 辱骂/代练/交易等中文信号对任何记录都适用（罕见误判）。
+CHAT_REVIEW_URL_MARKERS = (
+    "discord.gg",
+    "discord.com/invite",
+    "http://",
+    "https://",
+    "www.",
+    ".com/",
+    ".cn/",
+)
+CHAT_REVIEW_GENERAL_MARKERS = tuple(
+    k for k in CHAT_REVIEW_MARKERS if k not in CHAT_REVIEW_URL_MARKERS
+)
 CRITICAL_MARKERS = (
     "fatal",
     "severe",
@@ -568,10 +585,21 @@ class HeuristicReportBuilder:
         if "chat_spam" in record.tags and "chat_review" in self._active_priority:
             return "chat_review"
         text = self._record_text(record)
+        is_chat = "chat_message" in record.tags
         # 按当前生效的优先级列表匹配（已应用 category_enabled / category_whitelist），
         # daily 兜底。被关闭的分类直接跳过，记录会落到下一优先级或 daily。
         for category in self._active_priority:
             if category == "daily":
+                continue
+            if category == "chat_review":
+                # URL/外链信号仅对 chat_message 记录生效，避免插件更新日志
+                # （含 https://）被误判为聊天审查
+                if is_chat:
+                    if _keys_match(text, CHAT_REVIEW_MARKERS):
+                        return category
+                else:
+                    if _keys_match(text, CHAT_REVIEW_GENERAL_MARKERS):
+                        return category
                 continue
             keys = CATEGORY_KEYS.get(category, ())
             if _keys_match(text, keys):

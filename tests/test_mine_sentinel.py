@@ -1447,20 +1447,31 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertNotEqual(builder.classify(record), "chat_review")
 
     def test_chat_review_url_signal_triggers_classification(self):
-        """URL/外链信号应触发 chat_review 分类（高置信度广告/引流指标）。"""
+        """URL/外链信号应触发 chat_review 分类（高置信度广告/引流指标）。
+
+        PR10 真实日志验证：URL 信号仅在 chat_message 记录上生效，
+        避免插件更新日志（含 https://）被误判为聊天审查。
+        """
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
-        # discord.gg 链接
+        # chat_message 记录含 URL 应触发 chat_review
         record = self._make_record(
             "[Async Chat Thread]: <Spammer> 加入我们的群 discord.gg/xxxxxxx",
             level="INFO",
+            tags=["server_log", "runtime_log", "chat_message"],
         )
         self.assertEqual(builder.classify(record), "chat_review")
-        # http:// 链接
+        # 非 chat_message 记录含 URL 不应触发 chat_review
+        # （QuickShop-Hikari 更新检查日志，真实样本）
         record2 = self._make_record(
-            "[Async Chat Thread]: <Spammer> 访问 http://example.com 买金币",
+            "[Craft Scheduler Thread - 16765 - QuickShop-Hikari/INFO]: "
+            "[QuickShop-Hikari] Update here: https://modrinth.com/plugin/quickshop-hikari",
             level="INFO",
         )
-        self.assertEqual(builder.classify(record2), "chat_review")
+        self.assertNotEqual(
+            builder.classify(record2),
+            "chat_review",
+            "插件更新日志含 URL 不应被误判为 chat_review",
+        )
 
     def test_chat_review_chinese_transaction_signals(self):
         """中文交易/代练广告信号应触发 chat_review 分类。"""
