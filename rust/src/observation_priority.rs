@@ -13,8 +13,9 @@ use pyo3::prelude::*;
 pub fn observation_priority_score(
     _py: Python,
     record: &Bound<PyAny>,
-    _matcher: Option<Bound<PyAny>>,
+    matcher: Option<Bound<PyAny>>,
 ) -> PyResult<f64> {
+    let _ = matcher;
     let kind: String = record.getattr("kind")?.extract()?;
 
     match kind.as_str() {
