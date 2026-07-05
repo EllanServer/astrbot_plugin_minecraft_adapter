@@ -92,6 +92,26 @@
             "type": "int",
             "description": "重复报错循环摘要写入间隔秒数",
             "default": 300
+          },
+          "template_max_namespaces": {
+            "type": "int",
+            "description": "模板矿工最多维护多少个 per-server Drain3 parse tree（防异常 server_id 泛滥），默认 16",
+            "default": 16
+          },
+          "anomaly_max_templates_per_server": {
+            "type": "int",
+            "description": "每个服务器最多跟踪多少个模板，超过时淘汰最久未见的（防长期运行状态膨胀），默认 500",
+            "default": 500
+          },
+          "anomaly_inactive_template_ttl_hours": {
+            "type": "int",
+            "description": "超过此小时数未出现的模板被视为不活跃并清理，默认 24",
+            "default": 24
+          },
+          "anomaly_cleanup_interval": {
+            "type": "int",
+            "description": "每隔多少次 observe 触发一次不活跃模板清理，默认 200",
+            "default": 200
           }
         }
       },

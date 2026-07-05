@@ -29,6 +29,8 @@ from .reporting.report_result import MineSentinelRenderedReport
 from .routing import MineSentinelTargetRouter
 from .runtime_log import MineSentinelRuntimeLogTailer, build_hour_observations
 from .storage import DiskObservationStore, RecentObservationWindow
+from .template_miner import get_template_miner
+from .anomaly_detector import get_anomaly_detector
 
 
 class MineSentinelService:
@@ -74,6 +76,15 @@ class MineSentinelService:
             self._set_last_error,
         )
         self.alerts = MineSentinelAlertEngine(self.config)
+        # 初始化模板矿工和异常检测器单例（首次调用传入 config 参数），
+        # 后续 runtime_log / ai_prompt 无参获取已创建的实例。
+        rt_cfg = self.config.runtime_log
+        get_template_miner(max_namespaces=rt_cfg.template_max_namespaces)
+        get_anomaly_detector(
+            max_templates_per_server=rt_cfg.anomaly_max_templates_per_server,
+            inactive_template_ttl_hours=rt_cfg.anomaly_inactive_template_ttl_hours,
+            cleanup_interval=rt_cfg.anomaly_cleanup_interval,
+        )
         self.runtime_log_tailer = MineSentinelRuntimeLogTailer(
             self.config.runtime_log,
             self.handle_batch,
