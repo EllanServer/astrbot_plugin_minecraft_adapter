@@ -549,6 +549,53 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
         self.assertIn("template", ctx)
         self.assertIn("templateSize", ctx)
 
+    def test_build_observation_includes_otel_fields(self):
+        """_build_observation 应当在 context.otel 写入 OTel Logs Data Model 字段。"""
+        from services.mine_sentinel.models import MineSentinelLogSourceConfig
+
+        source = MineSentinelLogSourceConfig(
+            server_id="srv", server_name="Survival",
+            server_type="minecraft", root="/tmp",
+        )
+        obs = _build_observation(
+            source, Path("/tmp/logs/latest.log"),
+            "[14:02:11 ERROR]: Failed to tick plugin Example",
+            timestamp_ms=1700000000000, max_line_length=1000,
+        )
+        otel = obs["context"]["otel"]
+        # Timestamp / ObservedTimestamp / SeverityText / SeverityNumber / Body / EventName
+        self.assertEqual(otel["timestamp"], 1700000000000)
+        self.assertGreaterEqual(otel["observedTimestamp"], 1700000000000)
+        self.assertEqual(otel["severityText"], "ERROR")
+        self.assertEqual(otel["severityNumber"], 17)
+        self.assertIn("Failed to tick plugin", otel["body"])
+        self.assertTrue(otel["eventName"])
+        # Resource（来源属性）
+        self.assertEqual(otel["resource"]["service.name"], "srv")
+        self.assertEqual(otel["resource"]["service.namespace"], "minecraft")
+        self.assertEqual(otel["resource"]["host.name"], "Survival")
+        # Attributes（日志特有属性）
+        attrs = otel["attributes"]
+        self.assertEqual(attrs["log.file.name"], "latest.log")
+        self.assertIn("template.id", attrs)
+        self.assertIn("fingerprint", attrs)
+        self.assertIn("anomaly.score", attrs)
+
+    def test_severity_number_maps_otel_levels(self):
+        """_severity_number 应当把 MC 日志级别映射为 OTel SeverityNumber。"""
+        from services.mine_sentinel.runtime_log import _severity_number
+
+        self.assertEqual(_severity_number("TRACE"), 1)
+        self.assertEqual(_severity_number("DEBUG"), 5)
+        self.assertEqual(_severity_number("INFO"), 9)
+        self.assertEqual(_severity_number("WARN"), 13)
+        self.assertEqual(_severity_number("WARNING"), 13)
+        self.assertEqual(_severity_number("ERROR"), 17)
+        self.assertEqual(_severity_number("FATAL"), 21)
+        self.assertEqual(_severity_number("SEVERE"), 21)
+        # 未知级别默认 INFO
+        self.assertEqual(_severity_number("UNKNOWN"), 9)
+
     def test_loop_filter_dedupes_by_template_id(self):
         """loop_filter 应当按 templateId 合并同类日志，而不是只看 fingerprint。"""
         from services.mine_sentinel.models import MineSentinelRuntimeLogConfig

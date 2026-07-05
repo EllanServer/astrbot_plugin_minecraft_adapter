@@ -182,6 +182,7 @@ class RuntimeLogLoopFilter:
         digest = hashlib.sha1(
             f"{entry.server_id}:{entry.fingerprint}:{entry.last_emit_ts}".encode("utf-8")
         ).hexdigest()[:16]
+        observed_ms = int(time.time() * 1000)
         context = dict(entry.context)
         context.update(
             {
@@ -190,6 +191,22 @@ class RuntimeLogLoopFilter:
                 "loopLastTimestamp": entry.last_ts,
             }
         )
+        # 刷新 OTel 字段：summary 是新事件，timestamp 用最后一条的时间，
+        # observedTimestamp 用当前时间，body/eventName 保持原模板信息。
+        otel = dict(context.get("otel") or {})
+        otel["timestamp"] = entry.last_ts
+        otel["observedTimestamp"] = observed_ms
+        otel["body"] = (
+            f"同类服务器报错已合并：{suppressed} 条重复日志被过滤；"
+            f"首条样本：{_truncate(entry.sample, 320)}"
+        )
+        if "attributes" in otel:
+            attrs = dict(otel["attributes"])
+            attrs["loop.suppressed"] = suppressed
+            attrs["loop.first_timestamp"] = entry.first_ts
+            attrs["loop.last_timestamp"] = entry.last_ts
+            otel["attributes"] = attrs
+        context["otel"] = otel
         return {
             "eventId": f"local-log-loop:{entry.server_id}:{digest}",
             "kind": "SERVER_LOG",
@@ -437,16 +454,20 @@ class MineSentinelRuntimeLogTailer:
     async def _emit_dropped_observation(self, state: _SourceState, dropped_count: int):
         """Emit a synthetic observation so burst drops surface in reports, not just logs."""
         timestamp_ms = int(time.time() * 1000)
+        server_id = state.source.server_id or "minecraft"
+        server_name = state.source.server_name or state.source.server_id or "Minecraft"
+        server_type = (state.source.server_type or "minecraft").lower()
+        body = (
+            f"hourly tailer 在单次轮询中丢弃了 {dropped_count} 行日志（超过 max_lines_per_poll="
+            f"{self.config.max_lines_per_poll}），建议调大 max_bytes_per_poll / max_lines_per_poll。"
+        )
         observation = {
             "eventId": f"local-drop:{state.source.server_id}:{timestamp_ms}",
             "kind": "SERVER_LOG",
             "timestamp": timestamp_ms,
-            "serverId": state.source.server_id or "minecraft",
-            "serverName": state.source.server_name or state.source.server_id or "Minecraft",
-            "content": (
-                f"hourly tailer 在单次轮询中丢弃了 {dropped_count} 行日志（超过 max_lines_per_poll="
-                f"{self.config.max_lines_per_poll}），建议调大 max_bytes_per_poll / max_lines_per_poll。"
-            ),
+            "serverId": server_id,
+            "serverName": server_name,
+            "content": body,
             "tags": ["server_log", "runtime_log", "loop_suppressed", "warn"],
             "context": {
                 "source": "astrbot_runtime_log",
@@ -454,7 +475,23 @@ class MineSentinelRuntimeLogTailer:
                 "level": "WARN",
                 "loopSuppressed": dropped_count,
                 "drop_event": True,
-                "serverType": (state.source.server_type or "minecraft").lower(),
+                "serverType": server_type,
+                "otel": _otel_fields(
+                    timestamp_ms=timestamp_ms,
+                    observed_ms=timestamp_ms,
+                    level="WARN",
+                    body=body,
+                    event_name="mine_sentinel.dropped_lines",
+                    server_id=server_id,
+                    server_type=server_type,
+                    server_name=server_name,
+                    log_file=str(state.log_file),
+                    attributes={
+                        "drop.count": dropped_count,
+                        "drop.max_lines_per_poll": self.config.max_lines_per_poll,
+                        "log.compressed": state.log_file.name.lower().endswith(".gz"),
+                    },
+                ),
             },
         }
         await self._emit_observations(self.loop_filter.process(observation))
@@ -783,6 +820,9 @@ def _build_observation(
         tags.append("new_template")
     if anomaly.is_anomaly:
         tags.append("anomaly_spike")
+    observed_ms = int(time.time() * 1000)
+    server_id = source.server_id or "minecraft"
+    server_name = source.server_name or source.server_id or "Minecraft"
     context = {
         "source": "astrbot_runtime_log",
         "logFile": str(log_file),
@@ -797,11 +837,35 @@ def _build_observation(
         "anomalyReason": anomaly.reason,
         "anomalyBaseline": round(anomaly.baseline, 2),
         "anomalyCurrentCount": anomaly.current_count,
+        # OpenTelemetry Logs Data Model 结构化字段
+        "otel": _otel_fields(
+            timestamp_ms=timestamp_ms,
+            observed_ms=observed_ms,
+            level=level,
+            body=content,
+            event_name=template_id,
+            server_id=server_id,
+            server_type=server_type,
+            server_name=server_name,
+            log_file=str(log_file),
+            attributes={
+                "template.id": template_id,
+                "template.size": parsed.cluster_size,
+                "fingerprint": fingerprint,
+                "log.compressed": log_file.name.lower().endswith(".gz"),
+                "anomaly.score": round(anomaly.score, 3),
+                "anomaly.reason": anomaly.reason,
+                "anomaly.baseline": round(anomaly.baseline, 2),
+                "anomaly.current_count": anomaly.current_count,
+            },
+        ),
     }
     if parsed.params:
         context["templateParams"] = parsed.params[:8]
+        context["otel"]["attributes"]["template.params"] = parsed.params[:8]
     if parsed.fallback:
         context["templateFallback"] = True
+        context["otel"]["attributes"]["template.fallback"] = True
     return {
         "eventId": f"local-log:{source.server_id}:{digest}",
         "kind": "SERVER_LOG",
@@ -890,6 +954,68 @@ def _detect_level(line: str) -> str:
     if any(word in lowered for word in ("warn", "warning", "failed", "timeout")):
         return "WARN"
     return "INFO"
+
+
+# --- OpenTelemetry Logs Data Model 映射 ---------------------------------
+# OTel SeverityNumber: TRACE=1, DEBUG=5, INFO=9, WARN=13, ERROR=17, FATAL=21
+# https://opentelemetry.io/docs/specs/otel/logs/data-model/
+OTEL_SEVERITY_NUMBER = {
+    "TRACE": 1,
+    "DEBUG": 5,
+    "INFO": 9,
+    "WARN": 13,
+    "WARNING": 13,
+    "ERROR": 17,
+    "FATAL": 21,
+    "SEVERE": 21,
+}
+
+
+def _severity_number(level: str) -> int:
+    """把 MC 日志级别映射为 OTel SeverityNumber（默认 INFO=9）。"""
+    return OTEL_SEVERITY_NUMBER.get(level.upper(), 9)
+
+
+def _otel_fields(
+    timestamp_ms: int,
+    observed_ms: int,
+    level: str,
+    body: str,
+    event_name: str,
+    server_id: str,
+    server_type: str,
+    server_name: str,
+    log_file: str,
+    attributes: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """构建 OpenTelemetry Logs Data Model 风格的结构化字段。
+
+    把 MineSentinel 内部观察映射到 OTel 标准，使日志可被 OTel-compatible
+    工具（Collector / Loki / Tempo / Datadog）明确消费，也为后续 LLM
+    证据检索提供统一字段名。
+
+    https://opentelemetry.io/docs/specs/otel/logs/data-model/
+    """
+    attrs: dict[str, Any] = {
+        "log.file.name": Path(log_file).name if log_file else "",
+        "log.file.path": log_file,
+    }
+    if attributes:
+        attrs.update(attributes)
+    return {
+        "timestamp": timestamp_ms,
+        "observedTimestamp": observed_ms,
+        "severityText": level,
+        "severityNumber": _severity_number(level),
+        "body": body,
+        "eventName": event_name,
+        "resource": {
+            "service.name": server_id,
+            "service.namespace": server_type,
+            "host.name": server_name,
+        },
+        "attributes": attrs,
+    }
 
 
 def _fingerprint(line: str) -> str:
