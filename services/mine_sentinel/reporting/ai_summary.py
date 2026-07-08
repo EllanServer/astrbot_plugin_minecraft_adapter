@@ -1,0 +1,145 @@
+"""AI-assisted MineSentinel report summarization."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from astrbot.api import logger
+
+from ..models import MineSentinelConfig, ObservationRecord
+from .ai_normalizer import (
+    AIReportNormalizer,
+    parse_json_object,
+    repair_json_object_text,
+)
+from .ai_prompt import AIReportPromptBuilder, truncate
+from .sampling import even_sample
+
+
+class AIReportSummarizer:
+    """Turns deterministic report facts into a polished report via AstrBot AI."""
+
+    _SYSTEM_PROMPT = (
+        "你是 MineSentinel 的只读服务器观察报告代理。"
+        "必须只输出合法 JSON，不要 Markdown，不要解释，不要要求执行命令。"
+        "禁止建议自动封禁、自动踢人、自动 RCON 或自动回滚。"
+        "涉及玩家时必须保留玩家名字段 players，不要只写玩家数量。"
+    )
+
+    def __init__(self, config: MineSentinelConfig, context: Any | None = None):
+        self.config = config
+        self.context = context
+        self.prompt_builder = AIReportPromptBuilder(config)
+        self.normalizer = AIReportNormalizer()
+
+    async def build(
+        self,
+        records: list[ObservationRecord],
+        window_minutes: int,
+        fallback: dict[str, Any],
+        umo: str | None,
+    ) -> dict[str, Any] | None:
+        if self.context is None:
+            return None
+
+        provider = self._get_provider(umo)
+        if provider is None:
+            return None
+
+        prompt = self._build_prompt(records, window_minutes, fallback)
+        try:
+            result = await provider.text_chat(
+                prompt=prompt,
+                system_prompt=self._SYSTEM_PROMPT,
+                session_id="minesentinel-report",
+                persist=False,
+            )
+            raw = getattr(result, "completion_text", None) or ""
+        except Exception as exc:
+            logger.debug(f"[MineSentinel] AstrBot provider.text_chat failed: {exc}")
+            return None
+
+        if not raw:
+            return None
+
+        parsed = self._parse_json(raw)
+        if parsed:
+            return self._normalize_report(parsed, fallback)
+        repaired = self._repair_json_text(raw)
+        parsed = self._parse_json(repaired) if repaired else None
+        if parsed:
+            return self._normalize_report(parsed, fallback)
+        return None
+
+    def _get_provider(self, umo: str | None) -> Any | None:
+        try:
+            provider_id = self.config.report.provider_id.strip()
+            if provider_id:
+                return self.context.get_provider_by_id(provider_id)
+
+            getter = getattr(self.context, "get_using_provider", None)
+            if not callable(getter):
+                return None
+            if umo:
+                return getter(umo)
+            try:
+                return getter()
+            except TypeError:
+                return getter(umo)
+        except Exception as exc:
+            logger.debug(f"[MineSentinel] get AstrBot provider failed: {exc}")
+            return None
+
+    def _build_prompt(
+        self,
+        records: list[ObservationRecord],
+        window_minutes: int,
+        fallback: dict[str, Any],
+    ) -> str:
+        return self.prompt_builder.build(records, window_minutes, fallback)
+
+    def _parse_json(self, text: str) -> dict[str, Any] | None:
+        return parse_json_object(text)
+
+    def _repair_json_text(self, text: str) -> str:
+        return repair_json_object_text(text)
+
+    def _normalize_report(
+        self,
+        data: dict[str, Any],
+        fallback: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.normalizer.normalize_report(data, fallback)
+
+    def _normalize_issues(self, result: dict[str, Any], fallback: dict[str, Any]):
+        return self.normalizer.normalize_issues(result, fallback)
+
+    def _compact_fallback(self, fallback: dict[str, Any]) -> dict[str, Any]:
+        return self.prompt_builder.compact_fallback(fallback)
+
+    def _timeline_chunks(
+        self,
+        records: list[ObservationRecord],
+    ) -> list[dict[str, Any]]:
+        return self.prompt_builder.timeline_chunks(records)
+
+    def _sample_for_ai(
+        self,
+        records: list[ObservationRecord],
+        fallback: dict[str, Any] | None = None,
+    ) -> list[ObservationRecord]:
+        return self.prompt_builder.sample_for_ai(records, fallback)
+
+    def _compact_record(self, record: ObservationRecord) -> dict[str, Any]:
+        return self.prompt_builder.compact_record(record)
+
+    @staticmethod
+    def _sample_records(records: list[Any], max_records: int) -> list[Any]:
+        return even_sample(records, max_records)
+
+    def _drop_chunk_samples(self, chunks: list[dict[str, Any]]) -> bool:
+        return self.prompt_builder.drop_chunk_samples(chunks)
+
+    @staticmethod
+    def _truncate(value: str, max_length: int) -> str:
+        return truncate(value, max_length)

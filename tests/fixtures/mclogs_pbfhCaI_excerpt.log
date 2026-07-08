@@ -1,0 +1,15 @@
+[20:52:03] [Server thread/WARN]: YOU ARE RUNNING THIS SERVER AS AN ADMINISTRATIVE OR ROOT USER. THIS IS NOT ADVISED.
+[20:52:03] [Server thread/WARN]: YOU ARE OPENING YOURSELF UP TO POTENTIAL RISKS WHEN DOING THIS.
+[20:52:25] [Server thread/WARN]: [org.mariadb.jdbc.message.server.ErrorPacket] Error: 1193-HY000: Unknown system variable 'WSREP_ON'
+[20:52:25] [Server thread/WARN]: [CarbonChat]   [Database] Using MariaDB 12.2 which is newer than the version Flyway has been verified with. The latest verified version of MariaDB is 11.7.
+[20:53:20] [Server thread/WARN]: **** SERVER IS RUNNING IN OFFLINE/INSECURE MODE!
+[20:53:20] [Server thread/WARN]: The server will make no attempt to authenticate usernames. Beware.
+[20:53:32] [Server thread/WARN]: [MythicMobs] ✗ Configuration Error: Particle 'snow_shovel' is not supported by this version
+[20:53:33] [Server thread/WARN]: [MythicMobs] ✗ Configuration Error in Mechanic summon
+[20:54:10] [Server thread/ERROR]: Cannot load plugins\PlayerTitle\notify.yml
+[20:55:15] [Server thread/INFO]: Done (206.607s)! For help, type "help"
+[20:55:15] [Server thread/INFO]: TypeThe0ry (/127.0.0.1:54730) lost connection: Disconnected
+[20:55:46] [Server thread/INFO]: TypeThe0ry issued server command: /plugins
+[21:02:34] [Server thread/INFO]: Caesar_Galahad issued server command: /astrbot reload
+[21:03:06] [Server thread/ERROR]: [ca.spottedleaf.dataconverter.minecraft.versions.V4290] Failed to convert json to nbt: Small Flower Streamer
+[21:26:40] [Server thread/INFO]: Caesar_Galahad issued server command: /tp peng707
