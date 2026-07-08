@@ -1785,6 +1785,8 @@ class HeuristicReportBuilder:
                 record,
                 category,
                 text,
+                raw_content=raw_content,
+                level=level,
                 assume_not_benign=True,
             ):
                 self._gate_classification_cache[cache_key] = category
@@ -2084,6 +2086,8 @@ class HeuristicReportBuilder:
                 record,
                 category,
                 text,
+                raw_content=raw_content,
+                level=level,
                 assume_not_benign=True,
             ):
                 self._classification_cache[cache_key] = category
@@ -2097,6 +2101,8 @@ class HeuristicReportBuilder:
         category: str,
         text: str | None = None,
         *,
+        raw_content: str | None = None,
+        level: str | None = None,
         assume_not_benign: bool = False,
     ) -> bool:
         text = text if text is not None else self._record_text(record)
@@ -2108,10 +2114,18 @@ class HeuristicReportBuilder:
                 record,
                 category,
                 text,
+                raw_content=raw_content,
+                level=level,
                 assume_not_benign=True,
             )
         else:
-            matched = self._category_matches_uncached(record, category, text)
+            matched = self._category_matches_uncached(
+                record,
+                category,
+                text,
+                raw_content=raw_content,
+                level=level,
+            )
         self._category_match_cache[cache_key] = matched
         return matched
 
@@ -2121,15 +2135,32 @@ class HeuristicReportBuilder:
         category: str,
         text: str,
         *,
+        raw_content: str | None = None,
+        level: str | None = None,
         assume_not_benign: bool = False,
     ) -> bool:
         tags = record.tags or []
         keys = CATEGORY_KEYS.get(category, ())
-        raw_content = self._record_raw_content(record)
+        raw_content = (
+            raw_content
+            if raw_content is not None
+            else self._record_raw_content(record)
+        )
         stack_trace_line = raw_content.startswith("at ") or raw_content.startswith(
             "caused by:"
         )
-        level = str((record.context or {}).get("level") or "").lower()
+        level = (
+            level
+            if level is not None
+            else str((record.context or {}).get("level") or "").lower()
+        )
+        record_words: frozenset[str] | None = None
+
+        def keys_match(candidate_keys: tuple[str, ...]) -> bool:
+            nonlocal record_words
+            if record_words is None:
+                record_words = self._record_words(record, text)
+            return self._record_keys_match(record, text, candidate_keys, record_words)
 
         if (
             not assume_not_benign
@@ -2146,9 +2177,7 @@ class HeuristicReportBuilder:
             if (
                 category == "community_ops"
                 and ops_category in {"插件与模组", "传送与位置", "数据库与存储", "网络与代理", "世界与区块"}
-                and self._record_keys_match(
-                    record,
-                    text,
+                and keys_match(
                     ("could not pass event", "eventexception", "playerteleportevent"),
                 )
             ):
@@ -2177,7 +2206,7 @@ class HeuristicReportBuilder:
                 "xray", "kill aura", "killaura", "vulcan",
                 "封禁", "禁言", "踢出", "作弊", "外挂",
             )
-            if self._record_keys_match(record, text, strong_markers):
+            if keys_match(strong_markers):
                 return True
             soft_markers = ("fly", "speed", "reach", "violation", "vl")
             anti_cheat_context = (
@@ -2187,7 +2216,7 @@ class HeuristicReportBuilder:
                 or "flagged" in text
                 or "failed" in text
             )
-            return anti_cheat_context and self._record_keys_match(record, text, soft_markers)
+            return anti_cheat_context and keys_match(soft_markers)
 
         if category == "community_ops":
             prism_maintenance = (
@@ -2207,13 +2236,11 @@ class HeuristicReportBuilder:
                 "运营", "活动", "公告", "通知", "奖励", "投票",
                 "赛季", "比赛", "招募",
             )
-            if self._record_keys_match(record, text, ops_markers):
+            if keys_match(ops_markers):
                 return True
             broad_social_markers = ("discord", "qq group", "community", "群", "社区")
-            has_social_surface = self._record_keys_match(record, text, broad_social_markers)
-            has_ops_context = self._record_keys_match(
-                record,
-                text,
+            has_social_surface = keys_match(broad_social_markers)
+            has_ops_context = keys_match(
                 (
                     "announcement", "notice", "event", "reward", "vote",
                     "poll", "season", "competition", "rank",
@@ -2237,9 +2264,7 @@ class HeuristicReportBuilder:
                 return False
 
         if category == "moderation":
-            if ("uuid='" in text or "uuid=" in text) and not self._record_keys_match(
-                record,
-                text,
+            if ("uuid='" in text or "uuid=" in text) and not keys_match(
                 (
                     "uuid of player", "permission", "permissions", "auth",
                     "login", "logged in", "logged out", "session",
@@ -2276,9 +2301,7 @@ class HeuristicReportBuilder:
                 return False
 
         if category == "player_feedback":
-            if "chat_message" in tags and self._record_keys_match(
-                record,
-                text,
+            if "chat_message" in tags and keys_match(
                 ("没权限", "没有权限", "权限不够", "进不去", "过不去"),
             ):
                 return True
@@ -2286,7 +2309,7 @@ class HeuristicReportBuilder:
                 "suggest", "suggestion", "feedback", "feature request",
                 "proposal", "建议", "反馈", "加个", "新增", "优化", "改进",
             )
-            if self._record_keys_match(record, text, strong_feedback):
+            if keys_match(strong_feedback):
                 return True
             soft_feedback = (
                 "idea", "request", "wish", "hope",
@@ -2297,13 +2320,9 @@ class HeuristicReportBuilder:
                 "功能", "服务器", "插件", "商店", "地图", "副本",
                 "加", "改", "优化",
             )
-            return self._record_keys_match(
-                record, text, soft_feedback
-            ) and self._record_keys_match(
-                record, text, product_context
-            )
+            return keys_match(soft_feedback) and keys_match(product_context)
 
-        return self._record_keys_match(record, text, keys)
+        return keys_match(keys)
 
     # --- Tag --------------------------------------------------------------
     def tag(self, record: ObservationRecord) -> str:
@@ -3866,11 +3885,13 @@ class HeuristicReportBuilder:
         record: ObservationRecord,
         text: str,
         keys: tuple[str, ...],
+        record_words: frozenset[str] | None = None,
     ) -> bool:
         """Match category keys using per-record token cache for short ASCII words."""
         words = _word_keys(keys)
         if words:
-            record_words = self._record_words(record, text)
+            if record_words is None:
+                record_words = self._record_words(record, text)
             if not record_words.isdisjoint(words):
                 return True
         non_word_keys = _non_word_keys(keys)

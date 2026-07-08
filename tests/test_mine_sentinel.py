@@ -2939,9 +2939,9 @@ class MineSentinelRulesTests(unittest.TestCase):
         original_match = builder._category_matches_uncached
         calls = []
 
-        def counted_match(record, category, text):
+        def counted_match(record, category, text, **kwargs):
             calls.append((id(record), category))
-            return original_match(record, category, text)
+            return original_match(record, category, text, **kwargs)
 
         builder._category_matches_uncached = counted_match
         records = [
