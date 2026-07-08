@@ -74,6 +74,15 @@ _HEX_RE = re.compile(r"\b0x[0-9a-f]+\b", re.IGNORECASE)
 _LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{32,}\b")
 _NUMBER_RE = re.compile(r"(?<![A-Za-z_])-?\d+(?:\.\d+)?")
 _SPACE_RE = re.compile(r"\s+")
+_TRANSPORT_FORMAT_CHARS = frozenset(
+    {
+        "\ufeff",  # UTF-8 BOM copied from web logs.
+        "\u200b",  # zero-width space.
+        "\u200c",  # zero-width non-joiner.
+        "\u200d",  # zero-width joiner.
+        "\u2060",  # word joiner.
+    }
+)
 _PREFIX_RE = re.compile(
     r"^\[?\d{2}:\d{2}:\d{2}(?:[.,]\d{1,6})?\]?\s*"
     r"(?:\[[^\]]+\]\s*)?(?:\[[A-Z]+\]\s*)?",
@@ -2259,7 +2268,8 @@ def _sanitize_line(line: str) -> str:
     text = _ANSI_RE.sub("", str(line or ""))
     text = "".join(
         ch for ch in text
-        if not (_is_control_char(ch) and ch not in {"\t", "\n", "\r"})
+        if ch not in _TRANSPORT_FORMAT_CHARS
+        and not (_is_control_char(ch) and ch not in {"\t", "\n", "\r"})
     )
     text = _IPV4_RE.sub("<ip>", text)
     return text.strip()
@@ -2278,7 +2288,8 @@ def _clean_for_llm(line: str) -> tuple[str, int, list[str]]:
     flags: list[str] = []
     stripped = "".join(
         ch for ch in text
-        if not (_is_control_char(ch) and ch not in {"\t", "\n", "\r"})
+        if ch not in _TRANSPORT_FORMAT_CHARS
+        and not (_is_control_char(ch) and ch not in {"\t", "\n", "\r"})
     )
     if stripped != text:
         flags.append("control_stripped")

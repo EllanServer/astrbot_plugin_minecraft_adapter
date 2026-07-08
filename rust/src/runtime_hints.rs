@@ -455,9 +455,22 @@ fn collapse_ws(text: &str) -> String {
 fn strip_control_chars(text: &str) -> String {
     text.chars()
         .filter(|ch| {
-            !((*ch as u32) < 32 || (*ch as u32) == 127) || matches!(*ch, '\t' | '\n' | '\r')
+            !is_transport_format_char(*ch)
+                && (!((*ch as u32) < 32 || (*ch as u32) == 127)
+                    || matches!(*ch, '\t' | '\n' | '\r'))
         })
         .collect()
+}
+
+fn is_transport_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{feff}' // UTF-8 BOM copied from web logs.
+            | '\u{200b}' // zero-width space.
+            | '\u{200c}' // zero-width non-joiner.
+            | '\u{200d}' // zero-width joiner.
+            | '\u{2060}' // word joiner.
+    )
 }
 
 fn has_long_repeated_run(value: &str, threshold: usize) -> bool {

@@ -3956,6 +3956,26 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertEqual(ctx["otel"]["attributes"]["llm.clean_text"], clean)
         self.assertEqual(ctx["otel"]["attributes"]["llm.clean_hash"], ctx.get("llmCleanHash"))
 
+    def test_build_observation_strips_transport_format_chars(self):
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+
+        runtime_config = MineSentinelRuntimeLogConfig()
+        obs = self._build(
+            "\ufeff[16:00:00] [Server thread/WARN]: "
+            "[Quick\u200bShop-Hikari] ConnectTimeoutException from 1.2.3.4",
+            runtime_config,
+        )
+        ctx = obs["context"]
+        clean = ctx.get("llmCleanText", "")
+
+        self.assertNotIn("\ufeff", obs["content"])
+        self.assertNotIn("\u200b", obs["content"])
+        self.assertNotIn("\ufeff", clean)
+        self.assertNotIn("\u200b", clean)
+        self.assertEqual(ctx.get("opsHintCode"), "economy_shop")
+        self.assertIn("quickshop", ctx.get("opsHintMarkers", []))
+        self.assertIn("control_stripped", ctx.get("dataQualityFlags", []))
+
     def test_runtime_log_hints_add_ops_hint_for_economy_timeout(self):
         from services.mine_sentinel import runtime_log as runtime_module
 
