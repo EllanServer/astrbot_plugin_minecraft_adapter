@@ -3014,6 +3014,25 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertEqual(ops_info.get("subtype"), "经济/商店异常")
         self.assertEqual(ops_info.get("report_categories"), ["economy"])
 
+    def test_malformed_json_is_plugin_config_classification(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "com.google.gson.JsonSyntaxException: "
+            "com.google.gson.stream.MalformedJsonException: malformed JSON",
+            level="ERROR",
+            context={
+                "opsHintCode": "plugin_config",
+                "opsHintSeverity": "medium",
+                "opsHintMarkers": ["jsonsyntaxexception", "malformed json"],
+            },
+        )
+
+        self.assertEqual(builder.classify(record), "plugin")
+        ops_info = record.context.get("opsClassification") or {}
+        self.assertEqual(ops_info.get("category"), "插件与模组")
+        self.assertEqual(ops_info.get("subtype"), "配置解析异常")
+        self.assertEqual(ops_info.get("report_categories"), ["plugin", "bug"])
+
     def test_plugin_translation_warning_is_low_risk_observation(self):
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         record = self._make_record(
@@ -4066,6 +4085,19 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertEqual(hints.get("opsHintCode"), "economy_shop")
         self.assertEqual(hints.get("opsHintSeverity"), "high")
         self.assertIn("quickshop", hints.get("opsHintMarkers", []))
+
+    def test_runtime_log_hints_add_ops_hint_for_malformed_json(self):
+        from services.mine_sentinel import runtime_log as runtime_module
+
+        hints = runtime_module._python_runtime_log_hints(
+            "com.google.gson.JsonSyntaxException: "
+            "com.google.gson.stream.MalformedJsonException: malformed JSON",
+            2000,
+        )
+
+        self.assertEqual(hints.get("opsHintCode"), "plugin_config")
+        self.assertEqual(hints.get("opsHintSeverity"), "medium")
+        self.assertIn("jsonsyntaxexception", hints.get("opsHintMarkers", []))
 
     def test_runtime_log_hints_add_low_risk_plugin_translation_hint(self):
         from services.mine_sentinel import runtime_log as runtime_module
@@ -7114,6 +7146,26 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
         )
         issue_text = json.dumps(self.report["issues"], ensure_ascii=False)
         self.assertNotIn("The session ticker", issue_text)
+
+    def test_real_malformed_json_roots_are_plugin_config_not_generic_bug(self):
+        malformed_records = [
+            record
+            for record in self.records
+            if (
+                "MalformedJsonException" in record.content
+                or "JsonSyntaxException" in record.content
+                or "Failed to convert json to nbt" in record.content
+                or "JsonReader.syntaxError" in record.content
+            )
+        ]
+        self.assertGreaterEqual(len(malformed_records), 20)
+
+        builder = HeuristicReportBuilder(self.config)
+        categories = {builder.classify(record) for record in malformed_records}
+        self.assertEqual(categories, {"plugin"})
+        for record in malformed_records[:8]:
+            ops_info = record.context.get("opsClassification") or {}
+            self.assertEqual(ops_info.get("subtype"), "配置解析异常")
 
     def test_real_report_has_five_sections_and_bounded_prompt(self):
         from services.mine_sentinel.reporting.ai_prompt import AIReportPromptBuilder

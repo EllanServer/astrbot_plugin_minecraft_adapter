@@ -707,6 +707,11 @@ const PLUGIN_CONFIG_MARKERS: &[&str] = &[
     "configuration error",
     "mapping values are not allowed",
     "json parse",
+    "jsonsyntaxexception",
+    "jsonparseexception",
+    "malformed json",
+    "jsonreader.syntaxerror",
+    "failed to convert json to nbt",
     "yaml",
     "toml",
 ];
@@ -774,6 +779,18 @@ mod tests {
         assert_eq!(hint.code, "economy_shop");
         assert_eq!(hint.severity, "high");
         assert!(hint.markers.contains(&"quickshop"));
+    }
+
+    #[test]
+    fn detects_ops_hint_for_malformed_json_config() {
+        let hint = detect_ops_hint(
+            "com.google.gson.JsonSyntaxException: com.google.gson.stream.MalformedJsonException: malformed JSON",
+            "ERROR",
+        )
+        .expect("ops hint");
+        assert_eq!(hint.code, "plugin_config");
+        assert_eq!(hint.severity, "medium");
+        assert!(hint.markers.contains(&"jsonsyntaxexception"));
     }
 
     #[test]
