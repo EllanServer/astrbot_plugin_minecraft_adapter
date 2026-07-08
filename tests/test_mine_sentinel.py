@@ -79,6 +79,21 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             getattr(package, "MinecraftAdapterPlugin")
 
+    def test_handlers_export_only_mine_sentinel_command_handler(self):
+        ensure_test_import_paths()
+        handlers = importlib.import_module("astrbot_plugin_minecraft_adapter.handlers")
+        commands = importlib.import_module(
+            "astrbot_plugin_minecraft_adapter.handlers.mine_sentinel_commands"
+        )
+
+        self.assertEqual(handlers.__all__, ["MineSentinelCommandHandler"])
+        self.assertIs(
+            handlers.MineSentinelCommandHandler,
+            commands.MineSentinelCommandHandler,
+        )
+        with self.assertRaises(AttributeError):
+            getattr(handlers, "CommandHandler")
+
     def test_plugin_data_path_migrates_legacy_storage(self):
         ensure_test_import_paths()
         module = importlib.import_module("astrbot_plugin_minecraft_adapter.main")

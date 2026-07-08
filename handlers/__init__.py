@@ -1,18 +1,18 @@
-"""Minecraft adapter command handlers."""
+"""MineSentinel command handlers."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-__all__ = ["CommandHandler"]
+__all__ = ["MineSentinelCommandHandler"]
 
 if TYPE_CHECKING:
-    from .commands import CommandHandler
+    from .mine_sentinel_commands import MineSentinelCommandHandler
 
 
 def __getattr__(name: str):
-    if name == "CommandHandler":
-        from .commands import CommandHandler
+    if name == "MineSentinelCommandHandler":
+        from .mine_sentinel_commands import MineSentinelCommandHandler
 
-        return CommandHandler
+        return MineSentinelCommandHandler
     raise AttributeError(name)

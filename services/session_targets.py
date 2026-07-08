@@ -88,7 +88,7 @@ def normalize_session_targets(targets: Iterable[Any]) -> list[str]:
 
 
 def resolve_astrbot_session(context: Any, target: Any) -> str:
-    """Resolve shorthand or adapter-name sessions to AstrBot's active platform id."""
+    """Resolve shorthand or platform-name sessions to AstrBot's active platform id."""
     session = normalize_session_target(target)
     if not session:
         return ""
