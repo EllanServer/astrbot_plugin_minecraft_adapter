@@ -3036,13 +3036,13 @@ class MineSentinelRulesTests(unittest.TestCase):
     def test_plugin_translation_warning_is_low_risk_observation(self):
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         record = self._make_record(
-            "[Server thread/WARN]: [MarriageMaster] "
-            "No translation for key: Ingame.Info.Headline",
+            "[Server thread/WARN]: [nightcore] "
+            "Lang file for the 'zh' locale does not exist. Will use the 'en' one.",
             level="WARN",
             context={
                 "opsHintCode": "plugin_translation",
                 "opsHintSeverity": "low",
-                "opsHintMarkers": ["no translation for key:"],
+                "opsHintMarkers": ["lang file", "locale does not exist"],
             },
         )
 
@@ -4102,15 +4102,25 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
     def test_runtime_log_hints_add_low_risk_plugin_translation_hint(self):
         from services.mine_sentinel import runtime_log as runtime_module
 
-        hints = runtime_module._python_runtime_log_hints(
-            "[20:54:06] [Server thread/WARN]: [MarriageMaster] "
-            "No translation for key: Ingame.Info.Headline",
-            2000,
-        )
+        cases = [
+            (
+                "[20:54:06] [Server thread/WARN]: [MarriageMaster] "
+                "No translation for key: Ingame.Info.Headline",
+                "no translation for key:",
+            ),
+            (
+                "[20:52:52] [Server thread/WARN]: [nightcore] "
+                "Lang file for the 'zh' locale does not exist. Will use the 'en' one.",
+                "lang file",
+            ),
+        ]
 
-        self.assertEqual(hints.get("opsHintCode"), "plugin_translation")
-        self.assertEqual(hints.get("opsHintSeverity"), "low")
-        self.assertIn("no translation for key:", hints.get("opsHintMarkers", []))
+        for line, marker in cases:
+            with self.subTest(marker=marker):
+                hints = runtime_module._python_runtime_log_hints(line, 2000)
+                self.assertEqual(hints.get("opsHintCode"), "plugin_translation")
+                self.assertEqual(hints.get("opsHintSeverity"), "low")
+                self.assertIn(marker, hints.get("opsHintMarkers", []))
 
     def test_runtime_log_hints_add_low_risk_scheduler_delay_hint(self):
         from services.mine_sentinel import runtime_log as runtime_module
@@ -7101,12 +7111,15 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
         translation_records = [
             record
             for record in self.records
-            if "No translation for key:" in record.content
+            if (
+                "No translation for key:" in record.content
+                or "locale does not exist" in record.content
+            )
         ]
-        self.assertGreaterEqual(len(translation_records), 5)
+        self.assertGreaterEqual(len(translation_records), 14)
 
         builder = HeuristicReportBuilder(self.config)
-        for record in translation_records[:5]:
+        for record in translation_records:
             self.assertEqual(builder.classify(record), "plugin")
             self.assertEqual(builder.tag(record), "server_log_plugin_observation")
             ops_info = record.context.get("opsClassification") or {}
@@ -7121,6 +7134,7 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
         )
         issue_text = json.dumps(self.report["issues"], ensure_ascii=False)
         self.assertNotIn("No translation for key:", issue_text)
+        self.assertNotIn("locale does not exist", issue_text)
 
     def test_real_session_ticker_delay_is_not_network_issue_evidence(self):
         ticker_records = [

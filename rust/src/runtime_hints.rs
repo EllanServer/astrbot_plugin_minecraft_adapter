@@ -720,6 +720,8 @@ const PLUGIN_TRANSLATION_MARKERS: &[&str] = &[
     "no translation for key:",
     "missing translation",
     "translation key",
+    "lang file",
+    "locale does not exist",
 ];
 
 const PLUGIN_SCHEDULER_DELAY_MARKERS: &[&str] = &["session ticker"];
@@ -815,6 +817,18 @@ mod tests {
         assert_eq!(hint.code, "plugin_translation");
         assert_eq!(hint.severity, "low");
         assert!(hint.markers.contains(&"no translation for key:"));
+    }
+
+    #[test]
+    fn detects_missing_locale_file_as_translation_hint() {
+        let hint = detect_ops_hint(
+            "[Server thread/WARN]: [nightcore] Lang file for the 'zh' locale does not exist. Will use the 'en' one.",
+            "WARN",
+        )
+        .expect("ops hint");
+        assert_eq!(hint.code, "plugin_translation");
+        assert_eq!(hint.severity, "low");
+        assert!(hint.markers.contains(&"lang file"));
     }
 
     #[test]

@@ -1662,6 +1662,8 @@ _OPS_HINT_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "no translation for key:",
             "missing translation",
             "translation key",
+            "lang file",
+            "locale does not exist",
         ),
     ),
     (

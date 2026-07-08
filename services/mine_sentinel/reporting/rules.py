@@ -905,6 +905,8 @@ OPS_LOG_RULES: tuple[dict[str, Any], ...] = (
             "no translation for key:",
             "missing translation",
             "translation key",
+            "lang file",
+            "locale does not exist",
         ),
         "severity": "low",
         "impact": "插件本地化或资源文件缺失，通常不影响核心玩法，但会导致提示文本缺失。",
