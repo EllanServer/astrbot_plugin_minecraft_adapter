@@ -50,7 +50,7 @@ class AIReportSummarizer:
         try:
             result = await provider.text_chat(
                 prompt=prompt,
-                system_prompt=self._SYSTEM_PROMPT,
+                system_prompt=self._system_prompt(),
                 session_id="minesentinel-report",
                 persist=False,
             )
@@ -97,6 +97,16 @@ class AIReportSummarizer:
         fallback: dict[str, Any],
     ) -> str:
         return self.prompt_builder.build(records, window_minutes, fallback)
+
+    @staticmethod
+    def _system_prompt() -> str:
+        return (
+            "你是 MineSentinel 的日报润色助手。你只接收结构化 JSON 事实，不要推断未出现的数据。\n"
+            "请返回 JSON 对象，不要输出 Markdown、解释、代码块或其他非 JSON 内容。\n"
+            "保持字段语义不变：issues、categories、chat_players、dialogue_findings、ops_notes、"
+            "time_window、summary 等。\n"
+            "允许在不变更事实的前提下优化可读性、结构顺序和措辞。"
+        )
 
     def _parse_json(self, text: str) -> dict[str, Any] | None:
         return parse_json_object(text)

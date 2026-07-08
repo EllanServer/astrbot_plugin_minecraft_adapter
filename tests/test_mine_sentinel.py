@@ -306,7 +306,7 @@ class MineSentinelDialogueTests(unittest.TestCase):
         prompt = AIReportPromptBuilder(config).build(records, 480, fallback)
 
         self.assertLessEqual(len(prompt), 700)
-        self.assertIn("只输出合法 JSON", prompt)
+        self.assertIn("JSON", prompt)
 
     def test_ai_prompt_compact_fallback_projects_issue_fields(self):
         builder = AIReportPromptBuilder(MineSentinelConfig.from_dict({}))

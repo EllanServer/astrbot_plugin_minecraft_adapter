@@ -83,7 +83,7 @@
   - `mine_sentinel.storage.include_raw` 默认关闭，报告不依赖 raw 字段；开启会增加磁盘占用和隐私风险
   - 8 小时报告的本地规则统计会尽量使用完整窗口记录，并在报告中列出具体玩家名
   - `mine_sentinel.report.max_records_in_memory` 默认 `50000`，用于限制单次报告放进内存分析的 observation 数；极端聊天量触发上限时会优先保留可疑玩家对话并在运维备注中说明，完整 JSONL 仍然落盘并可导出/上传
-  - `mine_sentinel.report.max_ai_records` 默认 `120`，`max_ai_prompt_chars` 默认 `30000`，仅限制提交给 AI 的润色输入，不影响本地完整记录落盘
+  - `mine_sentinel.report.max_ai_records` 默认 `120`，`max_ai_prompt_chars` 默认 `100000`，`max_ai_content_length` 默认 `240`，仅限制提交给 AI 的润色输入，不影响本地完整记录落盘
   - `mine_sentinel.report.provider_id` 为空时使用当前/目标会话正在使用的 AstrBot provider；填写 provider ID 时使用指定模型
   - `mine_sentinel.report.send_to_target_sessions` 开启后，手动报告、定时报告和告警会发送到服务器配置中的目标会话
   - `mine_sentinel.report.delivery_targets` 可独立指定 NapCat/AstrBot 发送目标，支持完整 UMO（如 `aiocqhttp:GroupMessage:123456789`）或简写 `group:QQ群号`、`qq:QQ号`、`private:QQ号`；纯数字默认按 QQ 群处理

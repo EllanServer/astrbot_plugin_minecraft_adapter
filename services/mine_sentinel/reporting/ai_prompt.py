@@ -78,7 +78,7 @@ class AIReportPromptBuilder:
         chunks_json = compact_json(chunks)
 
         while True:
-            prompt = self.prompt_text_from_json(
+            prompt = self.prompt_text_from_json_v2(
                 window_minutes,
                 fallback_json,
                 chunks_json,
@@ -106,11 +106,34 @@ class AIReportPromptBuilder:
         timeline_chunks: list[dict[str, Any]],
         compact_records: list[dict[str, Any]],
     ) -> str:
-        return AIReportPromptBuilder.prompt_text_from_json(
+        return AIReportPromptBuilder.prompt_text_from_json_v2(
             window_minutes,
             fallback_json,
             compact_json(timeline_chunks),
             compact_json(compact_records),
+        )
+
+    @staticmethod
+    def prompt_text_from_json_v2(
+        window_minutes: int,
+        fallback_json: str,
+        timeline_json: str,
+        records_json: str,
+    ) -> str:
+        return (
+            "You are MineSentinel report-polishing assistant, using JSON facts only (no raw logs).\n"
+            "Return exactly one JSON object and do not add markdown, code fences, comments, or prose.\n"
+            "Preserve and polish these top-level fields: summary, time_window, servers, chat_count, "
+            "chat_players, dialogue_findings, categories, issues, ops_notes.\n"
+            "Issue fields (if available) include: category, tag, source_tag, incident_index, severity, title, "
+            "players, mentioned_players, affected_servers, affected_backends, affected_locations, dialogue_terms, "
+            "metric_context_text, evidence_count, signal_count, unique_players, first_seen_ts, last_seen_ts, "
+            "suggested_action.\n"
+            "Keep semantics stable and only add concise wording improvements.\n"
+            f"\ntime_window_minutes: {window_minutes}\n"
+            f"fallback_json: {fallback_json}\n"
+            f"timeline_chunks: {timeline_json}\n"
+            f"compact_records: {records_json}"
         )
 
     @staticmethod
@@ -120,41 +143,11 @@ class AIReportPromptBuilder:
         timeline_json: str,
         records_json: str,
     ) -> str:
-        return (
-            "你是 Minecraft 服务器只读旁路监控 MineSentinel 的报告代理。"
-            "只输出合法 JSON，不要执行任何管理动作。"
-            "必须使用以下 schema: summary,time_window,servers,chat_count,chat_players,"
-            "dialogue_findings,"
-            "categories(daily,complaint,bug,economy,moderation,suggestion,cross_server),"
-            "issues(category,tag,incident_index,severity,players,mentioned_players,"
-            "affected_locations,dialogue_terms,metric_context_text,"
-            "evidence_count,signal_count,unique_players,"
-            "suggested_action),"
-            "ops_notes。"
-            "输入里的启发式初稿来自完整窗口记录；分段时间线也是完整窗口的压缩统计；"
-            "issues.evidence_samples 若包含多行上下文，> 行是命中的证据聊天，"
-            "其余行是同服/同后端前后文；"
-            "抽样观察里的 context 是来源、消息类型、世界/维度和后端服线索，"
-            "只能辅助判断前因后果；"
-            "原始样本只用于补措辞，不代表全部记录。"
-            "这些 JSON 字段会被组装为 QQ 群五段式总结："
-            "整体情况、聊天与事件总结、玩家问题/投诉识别、风险提醒、建议处理；"
-            "请让 summary、dialogue_findings、categories 和 suggested_action 面向玩家群可读，"
-            "保留具体玩家名、时间线索、上下文结论和人工处理建议。"
-            "生成聊天与事件相关内容时必须按事故聚合，而不是按问题类别拆分："
-            "同一服务器、同一世界或后端、同一 3 到 5 分钟窗口内的多条异常反馈，"
-            "应优先合并为一个 incident，并在该 incident 内列出多个标签和影响面；"
-            "不要把卡顿/延迟、掉线/回档、传送异常、经济/商店异常等类别各自写成独立事件，"
-            "除非它们发生在不同时间、不同服务器/后端、不同玩家上下文或明显属于不同事故；"
-            "incident_index 只能表示真实事故序号，同一批上下文不要重复输出多个 事件 #1；"
-            "server_metrics 不要作为聊天事件单独写入 issues 或 dialogue_findings，"
-            "服务器指标只用于 metric_context_text、ops_notes、风险提醒或解释玩家反馈；"
-            "每个事故最多保留 2 到 4 条关键证据，避免在多个事件中重复粘贴同一批上下文；"
-            "如果窗口内只有一个明显异常时间点，应说明其他时间段未发现明显持续异常。"
-            f"时间窗口: 最近 {window_minutes} 分钟。\n"
-            f"启发式初稿: {fallback_json}\n"
-            f"分段时间线: {timeline_json}\n"
-            f"抽样观察: {records_json}"
+        return AIReportPromptBuilder.prompt_text_from_json_v2(
+            window_minutes,
+            fallback_json,
+            timeline_json,
+            records_json,
         )
 
     def compact_fallback(self, fallback: dict[str, Any]) -> dict[str, Any]:
