@@ -1,13 +1,13 @@
-"""Normalize AI report JSON back onto deterministic MineSentinel facts."""
+"""Normalize AI report JSON back onto deterministic runtime-log facts."""
 
 from __future__ import annotations
 
 import json
 import re
-from collections import defaultdict
 from typing import Any
 
-from .common import format_locations, format_players
+from .common import format_locations
+from .sections import normalize_report_sections
 
 
 def parse_json_object(text: str) -> dict[str, Any] | None:
@@ -24,7 +24,7 @@ def repair_json_object_text(text: str) -> str:
 
 
 class AIReportNormalizer:
-    """Preserves players, locations, metrics, and counts from fallback facts."""
+    """Preserves locations, evidence, and counts from fallback facts."""
 
     def normalize_report(
         self,
@@ -33,30 +33,48 @@ class AIReportNormalizer:
     ) -> dict[str, Any]:
         result = dict(fallback)
         result.update({key: value for key, value in data.items() if key in result})
-        categories = result.get("categories")
-        if not isinstance(categories, dict):
-            categories = fallback["categories"]
+        ai_categories = data.get("categories")
+        if not isinstance(ai_categories, dict):
+            ai_categories = {}
+        fallback_categories = fallback.get("categories") or {}
+        categories = {}
         for key in (
             "daily",
             "complaint",
             "bug",
+            "network",
+            "plugin",
             "economy",
+            "community",
+            "chat_review",
+            "player_feedback",
+            "community_ops",
             "moderation",
-            "suggestion",
             "cross_server",
+            "suggestion",
         ):
-            if not isinstance(categories.get(key), list):
+            fallback_items = fallback_categories.get(key) or []
+            ai_items = ai_categories.get(key)
+            if fallback_items and isinstance(ai_items, list):
+                categories[key] = ai_items
+            elif isinstance(fallback_items, list):
+                categories[key] = fallback_items
+            else:
                 categories[key] = []
         result["categories"] = categories
+        if not fallback.get("vulcan_alerts"):
+            result["vulcan_alerts"] = fallback.get("vulcan_alerts", {})
+        if not fallback.get("chat_topics"):
+            result["chat_topics"] = fallback.get("chat_topics", {})
         self.normalize_issues(result, fallback)
         if not isinstance(result.get("ops_notes"), list):
             result["ops_notes"] = fallback["ops_notes"]
-        if not isinstance(result.get("chat_players"), list):
-            result["chat_players"] = fallback.get("chat_players", [])
-        if not result.get("chat_players_text"):
-            result["chat_players_text"] = format_players(result["chat_players"])
-        if not isinstance(result.get("dialogue_findings"), list):
-            result["dialogue_findings"] = fallback.get("dialogue_findings", [])
+        if not isinstance(result.get("incident_findings"), list):
+            result["incident_findings"] = fallback.get("incident_findings", [])
+        result["report_sections"] = normalize_report_sections(
+            data.get("report_sections"),
+            result,
+        )
         return result
 
     def normalize_issues(self, result: dict[str, Any], fallback: dict[str, Any]):
@@ -67,30 +85,27 @@ class AIReportNormalizer:
         fallback_issues = [
             issue for issue in fallback.get("issues", []) if isinstance(issue, dict)
         ]
-        fallback_lookup = _fallback_issue_index(fallback_issues)
         used_fallback_indexes: set[int] = set()
         normalized_issues = []
         for issue in result["issues"]:
             if not isinstance(issue, dict):
                 continue
-            matched_index, fallback_issue = self._match_fallback_issue(
+            fallback_index, fallback_issue = self._match_fallback_issue(
                 issue,
                 fallback_issues,
-                fallback_lookup,
                 used_fallback_indexes,
             )
-            if matched_index < 0:
+            if fallback_index < 0:
                 continue
-            if matched_index >= 0:
-                used_fallback_indexes.add(matched_index)
+            if fallback_index >= 0:
+                used_fallback_indexes.add(fallback_index)
             self._normalize_structured_fields(issue, fallback_issue)
             self._normalize_players(issue, fallback_issue)
             self._normalize_counts(issue, fallback_issue)
             self._normalize_locations(issue, fallback_issue)
-            self._normalize_metric_context(issue, fallback_issue)
             normalized_issues.append(issue)
 
-        if normalized_issues and any(issue.get("players") for issue in normalized_issues):
+        if normalized_issues:
             result["issues"] = normalized_issues
         else:
             result["issues"] = fallback["issues"]
@@ -99,21 +114,27 @@ class AIReportNormalizer:
     def _match_fallback_issue(
         issue: dict[str, Any],
         fallback_issues: list[dict[str, Any]],
-        fallback_index: "_FallbackIssueIndex",
         used_indexes: set[int],
     ) -> tuple[int, dict[str, Any]]:
         key = (issue.get("category"), issue.get("tag"))
         incident_index = _as_int(issue.get("incident_index"))
         if incident_index is not None:
-            for index in fallback_index["by_incident"].get((*key, incident_index), ()):
+            for index, fallback_issue in enumerate(fallback_issues):
                 if index in used_indexes:
                     continue
-                return index, fallback_issues[index]
+                fallback_key = (fallback_issue.get("category"), fallback_issue.get("tag"))
+                if (
+                    fallback_key == key
+                    and _as_int(fallback_issue.get("incident_index")) == incident_index
+                ):
+                    return index, fallback_issue
 
-        for index in fallback_index["by_key"].get(key, ()):
+        for index, fallback_issue in enumerate(fallback_issues):
             if index in used_indexes:
                 continue
-            return index, fallback_issues[index]
+            fallback_key = (fallback_issue.get("category"), fallback_issue.get("tag"))
+            if fallback_key == key:
+                return index, fallback_issue
         return -1, {}
 
     @staticmethod
@@ -132,18 +153,13 @@ class AIReportNormalizer:
             "first_seen_ts",
             "last_seen_ts",
             "urgent_signal_count",
-            "suggested_action",
-            "should_alert",
         ):
-            if issue.get(field) in (None, "", [], {}) and field in fallback_issue:
+            if field not in issue and field in fallback_issue:
                 issue[field] = fallback_issue[field]
-        if issue.get("severity") not in {"low", "medium", "high", "critical"}:
-            issue["severity"] = fallback_issue.get("severity", "medium")
-        if not isinstance(issue.get("dialogue_terms"), list):
-            terms = fallback_issue.get("dialogue_terms") or []
-            issue["dialogue_terms"] = [str(term) for term in terms if term]
-        samples = issue.get("evidence_samples")
-        if not isinstance(samples, list) or not samples:
+        if not isinstance(issue.get("issue_terms"), list):
+            terms = fallback_issue.get("issue_terms") or []
+            issue["issue_terms"] = [str(term) for term in terms if term]
+        if not isinstance(issue.get("evidence_samples"), list):
             samples = fallback_issue.get("evidence_samples") or []
             issue["evidence_samples"] = [str(sample) for sample in samples if sample]
 
@@ -157,7 +173,7 @@ class AIReportNormalizer:
             players = fallback_issue.get("players") or []
         issue["players"] = [str(player) for player in players if player]
         if not issue.get("players_text"):
-            issue["players_text"] = format_players(issue["players"])
+            issue["players_text"] = "无"
 
         mentioned_players = issue.get("mentioned_players")
         if not isinstance(mentioned_players, list):
@@ -166,9 +182,7 @@ class AIReportNormalizer:
             str(player) for player in mentioned_players if player
         ]
         if not issue.get("mentioned_players_text"):
-            issue["mentioned_players_text"] = format_players(
-                issue["mentioned_players"]
-            )
+            issue["mentioned_players_text"] = "无"
 
     @staticmethod
     def _normalize_counts(
@@ -203,44 +217,8 @@ class AIReportNormalizer:
                 issue.get("affected_locations") or []
             )
 
-    @staticmethod
-    def _normalize_metric_context(
-        issue: dict[str, Any],
-        fallback_issue: dict[str, Any],
-    ):
-        if not issue.get("metric_context_text"):
-            issue["metric_context_text"] = fallback_issue.get(
-                "metric_context_text",
-                "",
-            )
-        if not isinstance(issue.get("metric_context"), dict):
-            metric_context = fallback_issue.get("metric_context")
-            if isinstance(metric_context, dict):
-                issue["metric_context"] = metric_context
-
-
 def _as_int(value: Any) -> int | None:
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-_FallbackIssueIndex = dict[str, dict[tuple[Any, ...], list[int]]]
-
-
-def _fallback_issue_index(
-    fallback_issues: list[dict[str, Any]],
-) -> _FallbackIssueIndex:
-    by_key: dict[tuple[Any, ...], list[int]] = defaultdict(list)
-    by_incident: dict[tuple[Any, ...], list[int]] = defaultdict(list)
-    for index, issue in enumerate(fallback_issues):
-        key = (issue.get("category"), issue.get("tag"))
-        by_key[key].append(index)
-        incident_index = _as_int(issue.get("incident_index"))
-        if incident_index is not None:
-            by_incident[(*key, incident_index)].append(index)
-    return {
-        "by_key": dict(by_key),
-        "by_incident": dict(by_incident),
-    }

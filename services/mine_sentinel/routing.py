@@ -6,63 +6,16 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from .models import ObservationRecord
-
-
-QQ_TARGET_TYPES = {
-    "group": "GroupMessage",
-    "qq_group": "GroupMessage",
-    "qqgroup": "GroupMessage",
-    "friend": "FriendMessage",
-    "private": "FriendMessage",
-    "qq": "FriendMessage",
-    "user": "FriendMessage",
-    "qq_user": "FriendMessage",
-}
+from ..session_targets import normalize_session_target, normalize_session_targets
 
 
 def normalize_delivery_target(target: Any) -> str:
-    """Convert report delivery shorthand into an AstrBot/NapCat UMO."""
-    if isinstance(target, dict):
-        raw_id = target.get("id") or target.get("target") or target.get("qq")
-        target_type = str(
-            target.get("type") or target.get("message_type") or target.get("kind") or ""
-        ).strip()
-        platform = str(target.get("platform") or "aiocqhttp").strip() or "aiocqhttp"
-        if not raw_id:
-            return ""
-        if target_type in {"GroupMessage", "FriendMessage"}:
-            return f"{platform}:{target_type}:{str(raw_id).strip()}"
-        mapped = QQ_TARGET_TYPES.get(target_type.lower())
-        if mapped:
-            return f"{platform}:{mapped}:{str(raw_id).strip()}"
-        return str(raw_id).strip()
-
-    text = str(target or "").strip()
-    if not text:
-        return ""
-    if text.count(":") >= 2:
-        return text
-    if ":" in text:
-        prefix, raw_id = text.split(":", 1)
-        mapped = QQ_TARGET_TYPES.get(prefix.strip().lower())
-        raw_id = raw_id.strip()
-        if mapped and raw_id:
-            return f"aiocqhttp:{mapped}:{raw_id}"
-        return text
-    if text.isdigit():
-        return f"aiocqhttp:GroupMessage:{text}"
-    return text
+    """Convert report delivery shorthand into an AstrBot session target."""
+    return normalize_session_target(target)
 
 
 def normalize_delivery_targets(targets: Iterable[Any]) -> list[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for target in targets:
-        umo = normalize_delivery_target(target)
-        if umo and umo not in seen:
-            seen.add(umo)
-            normalized.append(umo)
-    return normalized
+    return normalize_session_targets(targets)
 
 
 class MineSentinelTargetRouter:
@@ -127,7 +80,7 @@ class MineSentinelTargetRouter:
             return []
         config = self.get_server_config(record.server_id)
         raw_sessions = getattr(config, "target_sessions", []) or []
-        return sorted({str(session) for session in raw_sessions if session})
+        return sorted(normalize_session_targets(raw_sessions))
 
     def _report_sessions(self) -> list[str]:
         if not self.report_targets:

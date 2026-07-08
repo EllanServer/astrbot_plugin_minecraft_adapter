@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -11,19 +10,18 @@ from typing import Any
 INCIDENT_MERGE_WINDOW_MS = 5 * 60 * 1000
 ACTIONABLE_SEVERITIES = {"medium", "high", "critical"}
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-MODERATION_TAGS = {"cheat_or_grief_report", "chat_conflict"}
-SUGGESTION_TAGS = {"player_suggestion"}
+COMMUNITY_TAGS = {"server_log_community"}
+CHAT_REVIEW_TAGS = {"server_log_chat_review"}
+PLAYER_FEEDBACK_TAGS = {"server_log_player_feedback"}
+COMMUNITY_OPS_TAGS = {"server_log_community_ops"}
+MODERATION_TAGS = {"server_log_auth", "server_log_permission"}
+SUGGESTION_TAGS = set()
 ABUSE_HINTS = (
-    "复制",
-    "dupe",
-    "刷物品",
-    "外挂",
-    "作弊",
-    "飞行",
-    "透视",
-    "举报",
-    "炸家",
-    "偷东西",
+    "permission",
+    "auth",
+    "whitelist",
+    "login",
+    "权限",
 )
 
 
@@ -50,48 +48,16 @@ class IncidentGroup:
             max_severity=str(issue.get("severity") or "low").lower(),
         )
 
-    @classmethod
-    def from_precomputed(
-        cls,
-        issue: dict[str, Any],
-        family: str,
-        scopes: list[str],
-        start: int,
-        end: int,
-    ) -> "IncidentGroup":
-        return cls(
-            family=family,
-            scopes=set(scopes),
-            issues=[issue],
-            start_ts=start,
-            end_ts=end,
-            max_severity=str(issue.get("severity") or "low").lower(),
-        )
-
-    def add(self, issue: dict[str, Any]) -> set[str]:
-        return self.add_precomputed(
-            issue,
-            issue_scopes(issue),
-            *issue_time_bounds(issue),
-        )
-
-    def add_precomputed(
-        self,
-        issue: dict[str, Any],
-        scopes: list[str],
-        start: int,
-        end: int,
-    ) -> set[str]:
+    def add(self, issue: dict[str, Any]):
+        start, end = issue_time_bounds(issue)
         self.issues.append(issue)
-        added_scopes = set(scopes) - self.scopes
-        self.scopes.update(scopes)
+        self.scopes.update(issue_scopes(issue))
         if start:
             self.start_ts = min(self.start_ts or start, start)
         if end:
             self.end_ts = max(self.end_ts, end)
         if severity_rank(issue) > SEVERITY_RANK.get(self.max_severity, 0):
             self.max_severity = str(issue.get("severity") or "low").lower()
-        return added_scopes
 
 
 class IssuePolicy:
@@ -110,14 +76,22 @@ class IssuePolicy:
         ]
 
     @staticmethod
-    def is_metric_issue(issue: dict[str, Any]) -> bool:
-        return is_metric_issue(issue)
-
-    @staticmethod
     def is_moderation_issue(issue: dict[str, Any]) -> bool:
         return (
-            str(issue.get("category") or "").lower() == "moderation"
-            or str(issue.get("tag") or "").lower() == "chat_conflict"
+            str(issue.get("category") or "").lower() in {
+                "community",
+                "chat_review",
+                "player_feedback",
+                "community_ops",
+                "moderation",
+            }
+            or str(issue.get("tag") or "").lower() in (
+                COMMUNITY_TAGS
+                | CHAT_REVIEW_TAGS
+                | PLAYER_FEEDBACK_TAGS
+                | COMMUNITY_OPS_TAGS
+                | MODERATION_TAGS
+            )
         )
 
 
@@ -129,79 +103,50 @@ class IncidentGrouper:
 
     def group(self, issues: list[dict[str, Any]]) -> list[IncidentGroup]:
         groups: list[IncidentGroup] = []
-        group_index = _IncidentGroupIndex()
+        # Inverted index: (family, scope) -> list of groups that share that
+        # scope. Lets each new issue probe only candidate groups sharing at
+        # least one scope, instead of scanning every existing group (O(N×M) ->
+        # roughly O(N×candidates_per_scope)).
+        index: dict[tuple[str, str], list[IncidentGroup]] = {}
         for issue in sorted(issues, key=issue_sort_key):
-            if is_metric_issue(issue):
-                continue
             family = issue_family(issue)
-            scopes = issue_scopes(issue)
-            scope_values = set(scopes)
-            issue_start, issue_end = issue_time_bounds(issue)
+            scopes = set(issue_scopes(issue))
+            # Gather candidate groups that share at least one scope.
+            seen_ids: set[int] = set()
+            candidates: list[IncidentGroup] = []
+            for scope in scopes:
+                for group in index.get((family, scope), ()):
+                    if id(group) not in seen_ids:
+                        seen_ids.add(id(group))
+                        candidates.append(group)
             placed = False
-            min_group_end = (
-                issue_start - self.merge_window_ms if issue_start else None
-            )
-            for group in group_index.candidates(family, scopes, min_group_end):
-                if self.can_merge_precomputed(
-                    group,
-                    family,
-                    scope_values,
-                    issue_start,
-                    issue_end,
-                ):
-                    added_scopes = group.add_precomputed(
-                        issue,
-                        scopes,
-                        issue_start,
-                        issue_end,
-                    )
-                    group_index.update_group(group, added_scopes)
+            for group in candidates:
+                if self.can_merge(group, issue):
+                    group.add(issue)
+                    # New scopes from the issue may expand the group's index
+                    # footprint so future issues with those scopes find it.
+                    for new_scope in group.scopes - scopes:
+                        index.setdefault((family, new_scope), []).append(group)
                     placed = True
                     break
             if not placed:
-                group = IncidentGroup.from_precomputed(
-                    issue,
-                    family,
-                    scopes,
-                    issue_start,
-                    issue_end,
-                )
-                groups.append(group)
-                group_index.add_group(group)
+                new_group = IncidentGroup.from_issue(issue)
+                groups.append(new_group)
+                for scope in new_group.scopes:
+                    index.setdefault((family, scope), []).append(new_group)
         groups.sort(key=incident_sort_key)
         return groups
 
     def can_merge(self, group: IncidentGroup, issue: dict[str, Any]) -> bool:
-        return self.can_merge_precomputed(
-            group,
-            issue_family(issue),
-            set(issue_scopes(issue)),
-            *issue_time_bounds(issue),
-        )
-
-    def can_merge_precomputed(
-        self,
-        group: IncidentGroup,
-        family: str,
-        issue_scope_values: set[str],
-        issue_start: int,
-        issue_end: int,
-    ) -> bool:
-        if group.family != family:
+        if group.family != issue_family(issue):
             return False
+        issue_scope_values = set(issue_scopes(issue))
         if group.scopes and issue_scope_values and group.scopes.isdisjoint(issue_scope_values):
             return False
-        return self.times_close_bounds(group, issue_start, issue_end)
+        return self.times_close(group, issue)
 
     def times_close(self, group: IncidentGroup, issue: dict[str, Any]) -> bool:
-        return self.times_close_bounds(group, *issue_time_bounds(issue))
-
-    def times_close_bounds(
-        self,
-        group: IncidentGroup,
-        issue_start: int,
-        issue_end: int,
-    ) -> bool:
+        issue_start, issue_end = issue_time_bounds(issue)
         if not issue_start or not issue_end or not group.start_ts or not group.end_ts:
             return True
         return (
@@ -210,74 +155,20 @@ class IncidentGrouper:
         )
 
 
-class _IncidentGroupIndex:
-    """Preserve group order while narrowing merge candidates by family/scope."""
-
-    def __init__(self):
-        self._groups_by_key: dict[tuple[str, str], list[IncidentGroup]] = defaultdict(list)
-        self._order: dict[int, int] = {}
-
-    def add_group(self, group: IncidentGroup):
-        group_id = id(group)
-        if group_id not in self._order:
-            self._order[group_id] = len(self._order)
-        for scope in group.scopes:
-            self._groups_by_key[(group.family, scope)].append(group)
-
-    def update_group(self, group: IncidentGroup, added_scopes: set[str]):
-        for scope in added_scopes:
-            self._groups_by_key[(group.family, scope)].append(group)
-
-    def candidates(
-        self,
-        family: str,
-        scopes: list[str],
-        min_end_ts: int | None = None,
-    ) -> list[IncidentGroup]:
-        candidates: list[IncidentGroup] = []
-        seen: set[int] = set()
-        for scope in scopes:
-            for group in self._active_groups((family, scope), min_end_ts):
-                group_id = id(group)
-                if group_id in seen:
-                    continue
-                seen.add(group_id)
-                candidates.append(group)
-        candidates.sort(key=lambda group: self._order.get(id(group), 0))
-        return candidates
-
-    def _active_groups(
-        self,
-        key: tuple[str, str],
-        min_end_ts: int | None,
-    ) -> list[IncidentGroup] | tuple[IncidentGroup, ...]:
-        groups = self._groups_by_key.get(key)
-        if not groups:
-            return ()
-        if min_end_ts is None:
-            return groups
-
-        active = [
-            group
-            for group in groups
-            if not group.end_ts or group.end_ts >= min_end_ts
-        ]
-        if len(active) != len(groups):
-            self._groups_by_key[key] = active
-        return active
-
-
 def is_passive_issue(issue: dict[str, Any]) -> bool:
-    return str(issue.get("category") or "").lower() == "daily" or is_metric_issue(issue)
+    """daily 分类或 daily_noise 标签的 issue 视为被动，不参与 incident 聚合。
 
-
-def is_metric_issue(issue: dict[str, Any]) -> bool:
+    PR10: daily_noise 标签的记录即使因聚合被分到非 daily 类（理论上不会，
+    因为 rules.classify 已强制归 daily），也作为兜底被动处理，避免正常
+    login/disconnect/UUID 等形成"事件#1 服务器集中出现多类运行日志异常"。
+    """
+    if str(issue.get("category") or "").lower() == "daily":
+        return True
     tag = str(issue.get("tag") or "").lower()
-    source_tag = str(issue.get("source_tag") or "").lower()
-    category = str(issue.get("category") or "").lower()
-    return tag == "server_metrics" or (
-        category == "daily" and ("metric" in tag or "metric" in source_tag)
-    )
+    if tag == "server_log_anticheat_vulcan":
+        # Vulcan 告警单独走结构化 vulcan_alerts 段，不进 incident 聚合
+        return True
+    return False
 
 
 def issue_sort_key(issue: dict[str, Any]) -> tuple[int, int, str]:
@@ -303,6 +194,14 @@ def issue_time_bounds(issue: dict[str, Any]) -> tuple[int, int]:
 def issue_family(issue: dict[str, Any]) -> str:
     category = str(issue.get("category") or "").lower()
     tag = str(issue.get("tag") or "").lower()
+    if category == "community" or tag in COMMUNITY_TAGS:
+        return "community"
+    if category == "chat_review" or tag in CHAT_REVIEW_TAGS:
+        return "chat_review"
+    if category == "player_feedback" or tag in PLAYER_FEEDBACK_TAGS:
+        return "player_feedback"
+    if category == "community_ops" or tag in COMMUNITY_OPS_TAGS:
+        return "community_ops"
     if category == "moderation" or tag in MODERATION_TAGS:
         return "moderation"
     if tag == "feature_broken" and looks_like_abuse(issue):
@@ -316,7 +215,7 @@ def looks_like_abuse(issue: dict[str, Any]) -> bool:
     text_parts = [
         str(issue.get("tag") or ""),
         str(issue.get("title") or ""),
-        " ".join(str(term) for term in issue.get("dialogue_terms") or []),
+        " ".join(str(term) for term in issue.get("issue_terms") or []),
         " ".join(str(sample) for sample in issue.get("evidence_samples") or []),
     ]
     text = " ".join(text_parts).lower()

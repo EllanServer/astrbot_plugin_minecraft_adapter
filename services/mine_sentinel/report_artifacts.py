@@ -47,18 +47,19 @@ class MineSentinelReportArtifacts:
         )
         self._append_window_metadata(report, window_minutes)
         self._append_bounded_window_note(report, window_data)
+        export_records = self.reporter.rules.filter_records_for_report(records)
         export_path = await self.export_report_records(
-            records,
+            export_records,
             window_minutes,
             server_id,
             umo,
             export_full_window=bool(window_data and window_data.truncated),
         )
         if export_path:
-            report["_export_file_path"] = export_path.as_posix()
+            report["_export_file_path"] = str(export_path)
             report["_export_file_name"] = export_path.name
             report.setdefault("ops_notes", [])
-            report["ops_notes"].append(f"完整聊天记录附件：{export_path.name}")
+            report["ops_notes"].append(f"完整审计日志附件：{export_path.name}")
         return report
 
     async def export_report_records(
@@ -81,6 +82,7 @@ class MineSentinelReportArtifacts:
                     window_minutes,
                     server_id,
                     label,
+                    self.reporter.rules.record_allowed_for_report,
                 )
             return await self.thread_runner(
                 self.disk_store.export_records,

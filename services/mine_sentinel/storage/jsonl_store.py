@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gzip
 import time
 from contextlib import ExitStack
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,7 @@ from ..models import MineSentinelConfig, ObservationRecord
 from .codec import ObservationRecordCodec
 from .dedupe import DedupeTracker
 from .models import RecentObservationWindow
+from .offset_index import JsonlOffsetIndex
 from .paths import (
     candidate_files,
     cleanup_old_files,
@@ -19,10 +22,6 @@ from .paths import (
     safe_name,
 )
 from .window import RecentWindowBuilder
-from ..reporting.dialogue_rules import dialogue_rules_from_config
-
-
-WRITE_BUFFER_LINES = 1024
 
 
 class DiskObservationStore:
@@ -37,8 +36,13 @@ class DiskObservationStore:
         self.observation_dir.mkdir(parents=True, exist_ok=True)
         self.export_dir.mkdir(parents=True, exist_ok=True)
         self._last_cleanup_at: float | None = None
-        self._recent_ingest_chat: dict[str, int] = {}
-        self._last_ingest_prune_ms = 0
+        # Short-lived cache for the most recent window read, so that an alert
+        # triggered right after a periodic report (or vice versa) does not scan
+        # disk twice for the same window. Key: (window_minutes, server_id).
+        self._window_cache_key: tuple[int, str | None] | None = None
+        self._window_cache_value: RecentObservationWindow | None = None
+        self._window_cache_at: float = 0.0
+        self._window_cache_ttl: float = 30.0
 
     def add_batch(self, server_id: str, payload: dict[str, Any]) -> int:
         if not self.config.enabled or not self.config.storage.enabled:
@@ -49,57 +53,68 @@ class DiskObservationStore:
             return 0
 
         now = time.time()
-        now_ms = int(now * 1000)
         cutoff_ms = int((now - self.config.storage.retention_minutes * 60) * 1000)
         batch_server_id = str(payload.get("serverId") or server_id)
         batch_server_name = str(payload.get("serverName") or batch_server_id)
 
         written = 0
-        buffers: dict[Path, list[str]] = {}
-        handles = {}
-        path_cache: dict[tuple[str, str], Path] = {}
+        handles: dict[Path, Any] = {}
+        indexes: dict[Path, JsonlOffsetIndex] = {}
         with ExitStack() as stack:
-            with self._dedupe_tracker() as batch_seen:
-                for item in observations:
-                    if not isinstance(item, dict):
-                        continue
-                    timestamp = _raw_timestamp(item)
-                    if timestamp and timestamp < cutoff_ms:
-                        continue
-                    dedupe_keys = self.codec.raw_dedupe_keys(item, batch_server_id)
-                    if batch_seen.seen_any_or_add_all(dedupe_keys):
-                        continue
-                    if self._seen_recent_ingest_chat(
-                        item,
-                        batch_server_id,
-                        now_ms,
-                        dedupe_keys,
-                    ):
-                        continue
-                    record = ObservationRecord.from_dict(
-                        item,
-                        batch_server_id,
-                        batch_server_name,
+            for item in observations:
+                if not isinstance(item, dict):
+                    continue
+                record = ObservationRecord.from_dict(
+                    item,
+                    batch_server_id,
+                    batch_server_name,
+                )
+                if record.kind.upper() != "SERVER_LOG":
+                    continue
+                if not record.server_id:
+                    record.server_id = batch_server_id
+                if record.timestamp and record.timestamp < cutoff_ms:
+                    continue
+                self.codec.normalize_record(record)
+                path = self._record_path(record)
+                handle = handles.get(path)
+                if handle is None:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    # PR9 hotfix v3: 用二进制 append 模式打开。
+                    # 文本模式的 tell() 返回 TextIO cookie，不应被当作
+                    # 二进制 byte offset 用于 read_jsonl_window 的 seek()。
+                    # UTF-8 中文日志、不同换行处理、缓冲状态下 cookie 与
+                    # raw byte offset 不一致，会导致 seek 到错误位置，
+                    # 轻则读到半截 JSON 行被 JSONDecodeError 跳过，
+                    # 重则窗口报告漏日志。
+                    handle = stack.enter_context(path.open("ab"))
+                    handles[path] = handle
+                    # Load or create the offset index sidecar for this file.
+                    idx = JsonlOffsetIndex.for_jsonl(
+                        path,
+                        trust_legacy_index=self.config.storage.trust_legacy_index,
                     )
-                    if not record.server_id:
-                        record.server_id = batch_server_id
-                    if record.timestamp and record.timestamp < cutoff_ms:
-                        continue
-                    self.codec.normalize_record(record)
-                    path = self._record_path_cached(record, path_cache)
-                    buffer = buffers.setdefault(path, [])
-                    buffer.append(self.codec.json_line(record))
-                    written += 1
-                    if len(buffer) >= WRITE_BUFFER_LINES:
-                        handle = self._append_handle(path, handles, stack)
-                        _flush_lines(handle, buffer)
+                    idx.load()
+                    indexes[path] = idx
+                idx = indexes[path]
+                # Record the byte offset of this line's start before writing.
+                # binary handle.tell() 返回真实 byte offset，与
+                # read_jsonl_window 的 binary seek 一致。
+                line_offset = handle.tell()
+                idx.maybe_index(record.timestamp, line_offset)
+                # 写入 UTF-8 编码的 JSON 行 + 换行。
+                handle.write(self.codec.json_line(record).encode("utf-8"))
+                handle.write(b"\n")
+                written += 1
 
-            for path, buffer in buffers.items():
-                if buffer:
-                    handle = self._append_handle(path, handles, stack)
-                    _flush_lines(handle, buffer)
+            # Flush all touched indexes so reads can use them immediately.
+            for idx in indexes.values():
+                idx.flush()
 
         self.cleanup_if_due(now)
+        # New observations invalidate the cached window read.
+        self._window_cache_key = None
+        self._window_cache_value = None
         return written
 
     def recent(
@@ -118,16 +133,63 @@ class DiskObservationStore:
         if not self.config.enabled or not self.config.storage.enabled:
             return RecentObservationWindow([], 0, 0, False, 0)
 
-        cutoff_ms = int((time.time() - window_minutes * 60) * 1000)
+        cache_key = (window_minutes, server_id)
+        now = time.time()
+        if (
+            self._window_cache_key == cache_key
+            and self._window_cache_value is not None
+            and now - self._window_cache_at < self._window_cache_ttl
+            and max_records is None
+        ):
+            return self._window_cache_value
+
+        cutoff_ms = int((now - window_minutes * 60) * 1000)
+        # window end bound = now; lets read_jsonl_window stop scanning a file
+        # once it encounters records beyond the window upper bound.
+        # +1ms 余量：read_jsonl_window 的 end_ms 是右开边界（ts >= end_ms break），
+        # 当前时刻写入的记录 timestamp == int(now*1000) 不应被排除。
+        end_ms = int(now * 1000) + 1
         limit = max(1, max_records or self.config.report.max_records_in_memory)
-        builder = RecentWindowBuilder(
-            limit,
-            dialogue_rules_from_config(self.config.dialogue.custom_rules),
-        )
+        builder = RecentWindowBuilder(limit)
         with self._dedupe_tracker() as seen:
-            for row in self._iter_recent_rows(server_id, cutoff_ms, seen):
-                builder.add_raw(row, lambda row=row: ObservationRecord.from_dict(row))
-        return builder.build()
+            for path in self._candidate_files(server_id, cutoff_ms):
+                # 加载 .idx 偏移索引，让 read_jsonl_window 从 cutoff 附近 seek。
+                idx = JsonlOffsetIndex.for_jsonl(
+                    path,
+                    trust_legacy_index=self.config.storage.trust_legacy_index,
+                )
+                idx.load()
+                for row in self.codec.read_jsonl_window(
+                    path, cutoff_ms, end_ms, index=idx
+                ):
+                    record = ObservationRecord.from_dict(row)
+                    if record.timestamp < cutoff_ms:
+                        continue
+                    if record.timestamp > end_ms:
+                        continue
+                    key = self.codec.dedupe_key(record)
+                    if seen.seen_or_add(key):
+                        continue
+                    builder.add(record)
+        result = builder.build()
+
+        if max_records is None:
+            self._window_cache_key = cache_key
+            self._window_cache_value = result
+            self._window_cache_at = now
+        return result
+
+    def _export_suffix(self) -> str:
+        """Return the file suffix for exports based on config."""
+        if self.config.report.export_format == "jsonl.gz":
+            return ".jsonl.gz"
+        return ".jsonl"
+
+    def _open_export(self, path: Path, mode: str = "w"):
+        """Open an export file, using gzip when the suffix is ``.jsonl.gz``."""
+        if path.name.endswith(".gz"):
+            return gzip.open(path, mode + "t", encoding="utf-8")
+        return path.open(mode, encoding="utf-8")
 
     def export_records(
         self,
@@ -135,19 +197,25 @@ class DiskObservationStore:
         window_minutes: int,
         server_id: str | None = None,
         label: str = "",
+        end_ms: int | None = None,
     ) -> Path | None:
         if not records:
             return None
-        now = int(time.time())
-        path = export_path(self.export_dir, window_minutes, server_id, label, now)
-        with path.open("w", encoding="utf-8") as handle:
-            buffer: list[str] = []
+        # PR9 hotfix v5: 用毫秒级时间戳，配合 window_export_stem 的毫秒级精度。
+        # end_ms 可选：周期报告 retry 时传固定的 scheduled_window_end_ms 使
+        # 多次重试命中同一文件名以复用；手动 report now 不传，用当前时间。
+        now = int(time.time() * 1000) if end_ms is None else end_ms
+        suffix = self._export_suffix()
+        path = export_path(
+            self.export_dir, window_minutes, server_id, label, now, suffix=suffix
+        )
+        # 同窗口复用：如果文件已存在且复用开启，直接返回
+        if self.config.report.export_reuse_existing and path.exists():
+            return path
+        with self._open_export(path) as handle:
             for record in records:
-                buffer.append(self.codec.json_line(record))
-                if len(buffer) >= WRITE_BUFFER_LINES:
-                    _flush_lines(handle, buffer)
-            if buffer:
-                _flush_lines(handle, buffer)
+                handle.write(self.codec.json_line(record))
+                handle.write("\n")
         return path
 
     def export_recent(
@@ -155,25 +223,51 @@ class DiskObservationStore:
         window_minutes: int,
         server_id: str | None = None,
         label: str = "",
+        predicate: Callable[[ObservationRecord], bool] | None = None,
     ) -> Path | None:
         if not self.config.enabled or not self.config.storage.enabled:
             return None
 
-        now = int(time.time())
-        cutoff_ms = int((now - window_minutes * 60) * 1000)
-        path = export_path(self.export_dir, window_minutes, server_id, label, now)
+        now_ts = int(time.time())
+        cutoff_ms = int((now_ts - window_minutes * 60) * 1000)
+        # +1ms 余量：read_jsonl_window 的 end_ms 是右开边界（ts >= end_ms break），
+        # 当前时刻写入的记录不应被排除。
+        end_ms = int(now_ts * 1000) + 1
+        suffix = self._export_suffix()
+        # PR9 hotfix v5: 传毫秒级 end_ms 给 export_path，配合毫秒级文件名精度。
+        path = export_path(
+            self.export_dir, window_minutes, server_id, label, end_ms, suffix=suffix
+        )
+
+        # 同窗口复用：如果文件已存在且复用开启，直接返回
+        if self.config.report.export_reuse_existing and path.exists():
+            return path
 
         written = 0
-        buffer: list[str] = []
         with self._dedupe_tracker() as seen:
-            with path.open("w", encoding="utf-8") as handle:
-                for _row, line in self._iter_recent_row_lines(server_id, cutoff_ms, seen):
-                    buffer.append(line)
-                    written += 1
-                    if len(buffer) >= WRITE_BUFFER_LINES:
-                        _flush_lines(handle, buffer)
-                if buffer:
-                    _flush_lines(handle, buffer)
+            with self._open_export(path) as handle:
+                for source_path in self._candidate_files(server_id, cutoff_ms):
+                    idx = JsonlOffsetIndex.for_jsonl(
+                        source_path,
+                        trust_legacy_index=self.config.storage.trust_legacy_index,
+                    )
+                    idx.load()
+                    for row in self.codec.read_jsonl_window(
+                        source_path, cutoff_ms, end_ms, index=idx
+                    ):
+                        record = ObservationRecord.from_dict(row)
+                        if record.timestamp < cutoff_ms:
+                            continue
+                        if record.timestamp > end_ms:
+                            continue
+                        key = self.codec.dedupe_key(record)
+                        if seen.seen_or_add(key):
+                            continue
+                        if predicate is not None and not predicate(record):
+                            continue
+                        handle.write(self.codec.json_line(record))
+                        handle.write("\n")
+                        written += 1
         if not written:
             path.unlink(missing_ok=True)
             return None
@@ -202,20 +296,6 @@ class DiskObservationStore:
     def _record_path(self, record: ObservationRecord) -> Path:
         return record_path(self.observation_dir, record)
 
-    def _record_path_cached(
-        self,
-        record: ObservationRecord,
-        cache: dict[tuple[str, str], Path],
-    ) -> Path:
-        server_id = record.server_id or "unknown"
-        day = time.strftime("%Y%m%d", time.localtime(max(0, record.timestamp) / 1000))
-        key = (server_id, day)
-        path = cache.get(key)
-        if path is None:
-            path = self.observation_dir / safe_name(server_id) / f"{day}.jsonl"
-            cache[key] = path
-        return path
-
     def _candidate_files(
         self,
         server_id: str | None,
@@ -241,87 +321,6 @@ class DiskObservationStore:
     def _dedupe_key(self, record: ObservationRecord) -> str:
         return self.codec.dedupe_key(record)
 
-    def _seen_recent_ingest_chat(
-        self,
-        data: dict[str, Any],
-        batch_server_id: str,
-        now_ms: int,
-        dedupe_keys: tuple[str, ...] | None = None,
-    ) -> bool:
-        keys = self._raw_chat_content_keys(data, batch_server_id, dedupe_keys)
-        if not keys:
-            return False
-        self._prune_recent_ingest_chat(now_ms)
-        if any(key in self._recent_ingest_chat for key in keys):
-            return True
-        timestamp = _raw_timestamp(data) or now_ms
-        for key in keys:
-            self._recent_ingest_chat[key] = timestamp
-        return False
-
-    def _raw_chat_content_keys(
-        self,
-        data: dict[str, Any],
-        batch_server_id: str,
-        dedupe_keys: tuple[str, ...] | None = None,
-    ) -> tuple[str, ...]:
-        if str(data.get("kind") or "") != "CHAT" or data.get("eventId"):
-            return ()
-        if dedupe_keys:
-            return dedupe_keys
-        return self.codec.raw_chat_content_dedupe_keys(data, batch_server_id)
-
-    def _prune_recent_ingest_chat(self, now_ms: int):
-        window_ms = max(1, self.config.dedupe_window_seconds) * 1000
-        if now_ms - self._last_ingest_prune_ms < window_ms:
-            return
-        cutoff_ms = now_ms - window_ms * 2
-        self._recent_ingest_chat = {
-            key: timestamp
-            for key, timestamp in self._recent_ingest_chat.items()
-            if timestamp >= cutoff_ms
-        }
-        self._last_ingest_prune_ms = now_ms
-
-    def _iter_recent_rows(
-        self,
-        server_id: str | None,
-        cutoff_ms: int,
-        seen: DedupeTracker,
-    ):
-        for path in self._candidate_files(server_id, cutoff_ms):
-            for row in self.codec.read_jsonl(path, cutoff_ms):
-                timestamp = _raw_timestamp(row)
-                if timestamp < cutoff_ms:
-                    continue
-                if self.codec.seen_or_add_raw(seen, row):
-                    continue
-                yield row
-
-    def _iter_recent_row_lines(
-        self,
-        server_id: str | None,
-        cutoff_ms: int,
-        seen: DedupeTracker,
-    ):
-        for path in self._candidate_files(server_id, cutoff_ms):
-            for row, line in self.codec.read_jsonl_with_lines(path, cutoff_ms):
-                timestamp = _raw_timestamp(row)
-                if timestamp < cutoff_ms:
-                    continue
-                if self.codec.seen_or_add_raw(seen, row):
-                    continue
-                yield row, line
-
-    @staticmethod
-    def _append_handle(path: Path, handles: dict, stack: ExitStack):
-        handle = handles.get(path)
-        if handle is None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            handle = stack.enter_context(path.open("a", encoding="utf-8"))
-            handles[path] = handle
-        return handle
-
     def _dedupe_tracker(self) -> DedupeTracker:
         return DedupeTracker(
             max_memory_keys=self.config.storage.dedupe_memory_limit,
@@ -335,16 +334,3 @@ class DiskObservationStore:
     @staticmethod
     def _truncate(value: str, max_length: int) -> str:
         return ObservationRecordCodec.truncate(value, max_length)
-
-
-def _raw_timestamp(data: dict[str, Any]) -> int:
-    try:
-        return int(data.get("timestamp") or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _flush_lines(handle, lines: list[str]):
-    handle.write("\n".join(lines))
-    handle.write("\n")
-    lines.clear()

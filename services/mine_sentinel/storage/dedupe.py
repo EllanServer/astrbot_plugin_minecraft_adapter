@@ -11,14 +11,17 @@ from pathlib import Path
 class DedupeTracker:
     """Exact seen-key tracker that spills to a temp SQLite file when needed."""
 
+    # Number of inserts to buffer before committing to SQLite. Each implicit
+    # commit forces a disk sync; batching amortizes that across many keys.
+    _BATCH_SIZE = 2000
+
     def __init__(self, max_memory_keys: int = 100000, temp_dir: Path | None = None):
         self.max_memory_keys = max(1, int(max_memory_keys))
         self.temp_dir = temp_dir
         self._keys: set[str] = set()
-        self._hot_keys: dict[str, None] = {}
-        self._hot_key_limit = min(4096, self.max_memory_keys)
         self._conn: sqlite3.Connection | None = None
         self._path: Path | None = None
+        self._pending = 0
 
     def __enter__(self) -> "DedupeTracker":
         return self
@@ -44,57 +47,28 @@ class DedupeTracker:
             self._spill_to_sqlite()
 
         assert self._conn is not None
-        if key in self._hot_keys:
-            return True
+        # INSERT OR IGNORE is faster than try/except IntegrityError and lets us
+        # use rowcount to detect duplicates without exception overhead.
         cursor = self._conn.execute("INSERT OR IGNORE INTO seen(key) VALUES (?)", (key,))
-        seen = cursor.rowcount == 0
-        self._remember_hot_key(key)
-        return seen
-
-    def seen_any_or_add_all(self, keys) -> bool:
-        """Atomically add a record's dedupe keys only when none were seen."""
-        unique_keys = _unique_nonempty_keys(keys)
-        if not unique_keys:
-            return False
-        if len(unique_keys) == 1:
-            return self.seen_or_add(unique_keys[0])
-
-        if self._conn is None:
-            if any(key in self._keys for key in unique_keys):
-                return True
-            if len(self._keys) + len(unique_keys) <= self.max_memory_keys:
-                self._keys.update(unique_keys)
-                return False
-            self._spill_to_sqlite()
-
-        assert self._conn is not None
-        if any(key in self._hot_keys for key in unique_keys):
-            return True
-        placeholders = ",".join("?" for _ in unique_keys)
-        cursor = self._conn.execute(
-            f"SELECT key FROM seen WHERE key IN ({placeholders}) LIMIT 1",
-            unique_keys,
-        )
-        row = cursor.fetchone()
-        if row is not None:
-            self._remember_hot_key(row[0])
-            return True
-        self._conn.executemany(
-            "INSERT OR IGNORE INTO seen(key) VALUES (?)",
-            ((key,) for key in unique_keys),
-        )
-        self._remember_hot_keys(unique_keys)
+        if cursor.rowcount == 0:
+            return True  # key already existed
+        self._pending += 1
+        if self._pending >= self._BATCH_SIZE:
+            self._conn.commit()
+            self._pending = 0
         return False
 
     def close(self):
         if self._conn is not None:
+            if self._pending:
+                self._conn.commit()
+                self._pending = 0
             self._conn.close()
             self._conn = None
         if self._path is not None:
             self._path.unlink(missing_ok=True)
             self._path = None
         self._keys.clear()
-        self._hot_keys.clear()
 
     def _spill_to_sqlite(self):
         if self.temp_dir:
@@ -115,34 +89,4 @@ class DedupeTracker:
             ((key,) for key in self._keys),
         )
         self._conn.commit()
-        self._remember_hot_keys(self._keys)
         self._keys.clear()
-
-    def _remember_hot_keys(self, keys):
-        for key in keys:
-            self._remember_hot_key(key)
-
-    def _remember_hot_key(self, key: str):
-        if not key or self._hot_key_limit <= 0:
-            return
-        if key in self._hot_keys:
-            return
-        self._hot_keys[key] = None
-        while len(self._hot_keys) > self._hot_key_limit:
-            self._hot_keys.pop(next(iter(self._hot_keys)))
-
-
-def _unique_nonempty_keys(keys) -> tuple[str, ...]:
-    if isinstance(keys, tuple):
-        if not keys:
-            return ()
-        if len(keys) == 1:
-            return (keys[0],) if keys[0] else ()
-        if len(keys) == 2:
-            first, second = keys
-            if not first:
-                return (second,) if second else ()
-            if not second or second == first:
-                return (first,)
-            return keys
-    return tuple(dict.fromkeys(key for key in keys if key))

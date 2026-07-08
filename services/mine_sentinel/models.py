@@ -2,12 +2,40 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 
 DEFAULT_REPORT_INTERVAL_HOURS = 8
 DEFAULT_REPORT_INTERVAL_MINUTES = DEFAULT_REPORT_INTERVAL_HOURS * 60
+
+_logger = logging.getLogger(__name__)
+
+
+_VALID_TEMPLATE_PARSE_MODES = ("all", "warn_error", "interesting")
+_VALID_EXPORT_FORMATS = ("jsonl", "jsonl.gz")
+
+
+def _enum_choice(value: Any, valid: tuple[str, ...], default: str, field_name: str) -> str:
+    """Return ``value`` if it is one of ``valid`` (case-insensitive), else
+    log a warning and return ``default``.
+
+    Used for string config fields that accept a fixed set of values, so a
+    typo in the user's config doesn't silently fall through to the default
+    branch of an ``if/elif`` chain.
+    """
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in valid:
+        return text
+    _logger.warning(
+        f"[MineSentinel] 配置项 {field_name} 收到非法值 {value!r}，"
+        f"合法值为 {list(valid)}；回退到默认值 {default!r}。"
+    )
+    return default
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -24,8 +52,28 @@ def _as_float(value: Any, default: float) -> float:
         return default
 
 
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
 def _positive_int(value: Any, default: int) -> int:
     return max(1, _as_int(value, default))
+
+
+def _nonnegative_int(value: Any, default: int) -> int:
+    return max(0, _as_int(value, default))
 
 
 def _report_interval_minutes(report_data: dict[str, Any]) -> int:
@@ -58,6 +106,9 @@ class MineSentinelReportConfig:
     max_ai_content_length: int = 240
     send_full_log_file: bool = True
     send_as_image: bool = True
+    # PR9: 导出附件优化——压缩格式 + 同窗口复用
+    export_format: str = "jsonl"  # "jsonl" | "jsonl.gz"
+    export_reuse_existing: bool = True
 
 
 @dataclass
@@ -66,9 +117,28 @@ class MineSentinelAlertConfig:
     min_severity: str = "high"
     cooldown_seconds: int = 600
     min_evidence_count: int = 3
-    min_unique_players: int = 2
     window_minutes: int = 30
     analysis_interval_seconds: int = 60
+
+
+@dataclass
+class MineSentinelHourlySummaryConfig:
+    """Hourly summary mode: read logs once per hour, summarize, and integrate every N hours.
+
+    When enabled, the runtime log tailer's polling loop is skipped; instead a scheduled
+    job reads the logs of each past hour directly from the logs/ directory at the start
+    of every hour, builds an hourly summary, and after `hours_per_cycle` summaries
+    integrates them into a single cycle report for delivery.
+    """
+
+    enabled: bool = False
+    hours_per_cycle: int = 8
+    window_minutes: int = 60
+    poll_enabled: bool = False  # 是否同时启用实时轮询（默认关闭，纯按小时读取）
+    provider_id: str = ""
+    max_records_per_hour: int = 5000
+    max_log_lines_per_hour: int = 20000
+    retention_cycles: int = 2  # 磁盘上保留多少个历史周期的 hourly summary
 
 
 @dataclass
@@ -79,20 +149,79 @@ class MineSentinelStorageConfig:
     include_raw: bool = False
     max_content_length: int = 4000
     dedupe_memory_limit: int = 100000
+    # PR9 hotfix v2: 旧 .idx 文件（无 #trust_legacy header）是否可信。
+    # True（默认）：旧 .idx 按 monotonic=True 处理，保持向后兼容。
+    # False：保守模式，旧 .idx 视为非单调，禁用 seek/early-break，
+    #        读取会全量扫描，性能下降但保证不漏日志。
+    # 新写入的 .idx 始终带 #trust_legacy\t1，不受此开关影响。
+    trust_legacy_index: bool = True
 
 
 @dataclass
-class MineSentinelDialogueConfig:
+class MineSentinelLogSourceConfig:
+    server_id: str = ""
+    server_name: str = ""
+    server_type: str = "minecraft"  # minecraft | velocity
+    root: str = ""
+    logs_dir: str = ""
+    log_file: str = ""
+    target_sessions: list[Any] = field(default_factory=list)
+    delivery_targets: list[Any] = field(default_factory=list)
     enabled: bool = True
-    min_issue_score: float = 2.0
-    min_evidence_count: int = 1
-    max_findings: int = 10
-    max_issue_records: int = 50
-    incident_gap_seconds: int = 1800
-    continuation_window_seconds: int = 90
-    context_window_seconds: int = 120
-    context_messages_per_side: int = 2
-    custom_rules: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class MineSentinelRuntimeLogConfig:
+    enabled: bool = True
+    sources: list[MineSentinelLogSourceConfig] = field(default_factory=list)
+    poll_interval_seconds: int = 5
+    backfill_on_start: bool = True
+    backfill_window_minutes: int = DEFAULT_REPORT_INTERVAL_MINUTES
+    initial_lines: int = 200
+    max_backfill_files: int = 16
+    max_backfill_lines: int = 50000
+    max_lines_per_poll: int = 200
+    max_line_length: int = 1000
+    max_bytes_per_poll: int = 262144
+    loop_filter_enabled: bool = True
+    loop_filter_window_seconds: int = 300
+    loop_summary_interval_seconds: int = 300
+    # 模板/异常检测调参（PR7 暴露到 _conf_schema，便于运维调优）
+    template_max_namespaces: int = 16
+    anomaly_max_templates_per_server: int = 500
+    anomaly_inactive_template_ttl_hours: int = 24
+    anomaly_cleanup_interval: int = 200
+    # PR9: 普通 INFO 降采样——高日志量服 CPU 优化
+    # - template_parse_mode: "all" 全量解析 | "warn_error" 只解析 WARN+ | "interesting" 只解析 WARN+/命中关键词的 INFO
+    # - anomaly_track_info: False 时普通 INFO 不进入 anomaly detector（仅 fingerprint + 简化 observation）
+    template_parse_mode: str = "all"
+    anomaly_track_info: bool = True
+    # PR9: 专用 bounded ThreadPoolExecutor，避免和 asyncio 默认线程池争用。
+    # 0 表示沿用 asyncio.to_thread（默认池），>0 表示创建独立的有界池。
+    io_workers: int = 0
+    # 检查项目（12 类分类）开关与白名单：
+    # - category_enabled: 单分类开关，key 为分类名，value=False 关闭该分类检查；
+    #   命中已关闭分类的记录会从总结链路入口忽略，不降级到其他分类。
+    #   未列出或 value=True 视为开启。daily 始终兜底，关闭后会被强制重新开启。
+    # - category_whitelist: 非空时仅白名单内分类参与检查，其余全部关闭；
+    #   命中白名单外分类的记录会从总结链路入口忽略。
+    #   为空时按 category_enabled 决定。daily 不受白名单限制（始终兜底）。
+    category_enabled: dict[str, bool] = field(default_factory=dict)
+    category_whitelist: list[str] = field(default_factory=list)
+    # 正常日志噪声过滤：匹配任一正则的日志行被打 daily_noise 标签，
+    # 强制归入 daily+low，不参与 incident 聚合，避免正常 login/disconnect/UUID
+    # 等被误判为 moderation/network 异常。daily_noise_filter_enabled=false 关闭。
+    # 默认 patterns 覆盖 Minecraft 原生 + LuckPerms 等高频正常日志。
+    daily_noise_filter_enabled: bool = True
+    daily_noise_patterns: list[str] = field(default_factory=list)
+    # 聊天热点总结：识别 [Async Chat Thread]/<player> 聊天行并提取玩家名，
+    # 在报告中生成 chat_topics 段（活跃玩家 + 高频关键词 + 样本）。
+    chat_summary_enabled: bool = True
+    chat_summary_max_topics: int = 5
+    chat_summary_max_samples: int = 3
+    # Vulcan 反作弊插件识别：检测 [Vulcan] 前缀日志，提取玩家名+检查类型，
+    # 打 anticheat_vulcan 标签，并在报告中结构化呈现时间 + 涉及 ID。
+    vulcan_detect_enabled: bool = True
 
 
 @dataclass(slots=True)
@@ -100,21 +229,26 @@ class MineSentinelConfig:
     enabled: bool = True
     retention_minutes: int = DEFAULT_REPORT_INTERVAL_MINUTES
     max_tags_per_record: int = 8
-    max_metric_fields: int = 32
     max_raw_fields: int = 16
     dedupe_window_seconds: int = 120
     storage: MineSentinelStorageConfig = field(default_factory=MineSentinelStorageConfig)
-    dialogue: MineSentinelDialogueConfig = field(default_factory=MineSentinelDialogueConfig)
+    runtime_log: MineSentinelRuntimeLogConfig = field(
+        default_factory=MineSentinelRuntimeLogConfig
+    )
     report: MineSentinelReportConfig = field(default_factory=MineSentinelReportConfig)
     alert: MineSentinelAlertConfig = field(default_factory=MineSentinelAlertConfig)
+    hourly_summary: MineSentinelHourlySummaryConfig = field(
+        default_factory=MineSentinelHourlySummaryConfig
+    )
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "MineSentinelConfig":
         data = data or {}
         storage_data = data.get("storage", {}) or {}
-        dialogue_data = data.get("dialogue", {}) or {}
+        runtime_log_data = data.get("runtime_log", {}) or {}
         report_data = data.get("report", {}) or {}
         alert_data = data.get("alert", {}) or {}
+        hourly_data = data.get("hourly_summary", {}) or {}
         interval_minutes = _report_interval_minutes(report_data)
         default_window_minutes = _positive_int(
             report_data.get("default_window_minutes"),
@@ -128,7 +262,6 @@ class MineSentinelConfig:
             enabled=data.get("enabled", True),
             retention_minutes=max(retention_minutes, default_window_minutes),
             max_tags_per_record=_positive_int(data.get("max_tags_per_record"), 8),
-            max_metric_fields=_positive_int(data.get("max_metric_fields"), 32),
             max_raw_fields=_positive_int(data.get("max_raw_fields"), 16),
             dedupe_window_seconds=_positive_int(data.get("dedupe_window_seconds"), 120),
             storage=MineSentinelStorageConfig(
@@ -150,52 +283,127 @@ class MineSentinelConfig:
                     storage_data.get("dedupe_memory_limit"),
                     100000,
                 ),
+                trust_legacy_index=_as_bool(
+                    storage_data.get("trust_legacy_index"),
+                    True,
+                ),
             ),
-            dialogue=MineSentinelDialogueConfig(
-                enabled=bool(dialogue_data.get("enabled", True)),
-                min_issue_score=max(
-                    0.0,
-                    _as_float(dialogue_data.get("min_issue_score"), 2.0),
+            runtime_log=MineSentinelRuntimeLogConfig(
+                enabled=_as_bool(runtime_log_data.get("enabled"), True),
+                sources=_runtime_log_sources(runtime_log_data.get("sources")),
+                poll_interval_seconds=_positive_int(
+                    runtime_log_data.get("poll_interval_seconds"),
+                    5,
                 ),
-                min_evidence_count=_positive_int(
-                    dialogue_data.get("min_evidence_count"),
-                    1,
+                backfill_on_start=_as_bool(
+                    runtime_log_data.get("backfill_on_start"),
+                    True,
                 ),
-                max_findings=_positive_int(dialogue_data.get("max_findings"), 10),
-                max_issue_records=_positive_int(
-                    dialogue_data.get("max_issue_records"),
-                    50,
+                backfill_window_minutes=_positive_int(
+                    runtime_log_data.get("backfill_window_minutes"),
+                    default_window_minutes,
                 ),
-                incident_gap_seconds=max(
+                initial_lines=_nonnegative_int(
+                    runtime_log_data.get("initial_lines"),
+                    200,
+                ),
+                max_backfill_files=_positive_int(
+                    runtime_log_data.get("max_backfill_files"),
+                    16,
+                ),
+                max_backfill_lines=_positive_int(
+                    runtime_log_data.get("max_backfill_lines"),
+                    50000,
+                ),
+                max_lines_per_poll=_positive_int(
+                    runtime_log_data.get("max_lines_per_poll"),
+                    200,
+                ),
+                max_line_length=_positive_int(
+                    runtime_log_data.get("max_line_length"),
+                    1000,
+                ),
+                max_bytes_per_poll=_positive_int(
+                    runtime_log_data.get("max_bytes_per_poll"),
+                    262144,
+                ),
+                loop_filter_enabled=_as_bool(
+                    runtime_log_data.get("loop_filter_enabled"),
+                    True,
+                ),
+                loop_filter_window_seconds=_positive_int(
+                    runtime_log_data.get("loop_filter_window_seconds"),
+                    300,
+                ),
+                loop_summary_interval_seconds=_positive_int(
+                    runtime_log_data.get("loop_summary_interval_seconds"),
+                    300,
+                ),
+                template_max_namespaces=_positive_int(
+                    runtime_log_data.get("template_max_namespaces"),
+                    16,
+                ),
+                anomaly_max_templates_per_server=_positive_int(
+                    runtime_log_data.get("anomaly_max_templates_per_server"),
+                    500,
+                ),
+                anomaly_inactive_template_ttl_hours=_positive_int(
+                    runtime_log_data.get("anomaly_inactive_template_ttl_hours"),
+                    24,
+                ),
+                anomaly_cleanup_interval=_positive_int(
+                    runtime_log_data.get("anomaly_cleanup_interval"),
+                    200,
+                ),
+                template_parse_mode=_enum_choice(
+                    runtime_log_data.get("template_parse_mode"),
+                    _VALID_TEMPLATE_PARSE_MODES,
+                    "all",
+                    "runtime_log.template_parse_mode",
+                ),
+                anomaly_track_info=_as_bool(
+                    runtime_log_data.get("anomaly_track_info"),
+                    True,
+                ),
+                io_workers=max(
                     0,
-                    _as_int(dialogue_data.get("incident_gap_seconds"), 1800),
+                    _as_int(runtime_log_data.get("io_workers"), 0),
                 ),
-                continuation_window_seconds=max(
-                    0,
-                    _as_int(dialogue_data.get("continuation_window_seconds"), 90),
+                category_enabled=_category_enabled_dict(
+                    runtime_log_data.get("category_enabled"),
+                    runtime_log_data.get("disabled_categories"),
                 ),
-                context_window_seconds=max(
-                    0,
-                    _as_int(dialogue_data.get("context_window_seconds"), 120),
+                category_whitelist=_category_whitelist_list(
+                    runtime_log_data.get("category_whitelist")
                 ),
-                context_messages_per_side=max(
-                    0,
-                    _as_int(dialogue_data.get("context_messages_per_side"), 2),
+                daily_noise_filter_enabled=_as_bool(
+                    runtime_log_data.get("daily_noise_filter_enabled"),
+                    True,
                 ),
-                custom_rules=[
-                    dict(item)
-                    for item in (dialogue_data.get("custom_rules") or [])
-                    if isinstance(item, dict)
-                ],
+                daily_noise_patterns=_str_list(
+                    runtime_log_data.get("daily_noise_patterns")
+                ),
+                chat_summary_enabled=_as_bool(
+                    runtime_log_data.get("chat_summary_enabled"),
+                    True,
+                ),
+                chat_summary_max_topics=_positive_int(
+                    runtime_log_data.get("chat_summary_max_topics"),
+                    5,
+                ),
+                chat_summary_max_samples=_positive_int(
+                    runtime_log_data.get("chat_summary_max_samples"),
+                    3,
+                ),
+                vulcan_detect_enabled=_as_bool(
+                    runtime_log_data.get("vulcan_detect_enabled"),
+                    True,
+                ),
             ),
             report=MineSentinelReportConfig(
                 default_window_minutes=default_window_minutes,
                 send_to_target_sessions=bool(report_data.get("send_to_target_sessions", True)),
-                delivery_targets=[
-                    item
-                    for item in (report_data.get("delivery_targets") or [])
-                    if item not in (None, "")
-                ],
+                delivery_targets=_list_values(report_data.get("delivery_targets")),
                 include_evidence_samples=bool(report_data.get("include_evidence_samples", True)),
                 max_evidence_samples=_positive_int(report_data.get("max_evidence_samples"), 5),
                 provider_id=str(report_data.get("provider_id", "")),
@@ -217,20 +425,251 @@ class MineSentinelConfig:
                 ),
                 send_full_log_file=bool(report_data.get("send_full_log_file", True)),
                 send_as_image=bool(report_data.get("send_as_image", True)),
+                export_format=_enum_choice(
+                    report_data.get("export_format"),
+                    _VALID_EXPORT_FORMATS,
+                    "jsonl",
+                    "report.export_format",
+                ),
+                export_reuse_existing=bool(
+                    report_data.get("export_reuse_existing", True)
+                ),
             ),
             alert=MineSentinelAlertConfig(
                 enabled=bool(alert_data.get("enabled", False)),
                 min_severity=str(alert_data.get("min_severity", "high")),
                 cooldown_seconds=max(0, _as_int(alert_data.get("cooldown_seconds"), 600)),
                 min_evidence_count=_positive_int(alert_data.get("min_evidence_count"), 3),
-                min_unique_players=_positive_int(alert_data.get("min_unique_players"), 2),
                 window_minutes=_positive_int(alert_data.get("window_minutes"), 30),
                 analysis_interval_seconds=max(
                     0,
                     _as_int(alert_data.get("analysis_interval_seconds"), 60),
                 ),
             ),
+            hourly_summary=MineSentinelHourlySummaryConfig(
+                enabled=_as_bool(hourly_data.get("enabled"), False),
+                hours_per_cycle=_positive_int(hourly_data.get("hours_per_cycle"), 8),
+                window_minutes=_positive_int(hourly_data.get("window_minutes"), 60),
+                poll_enabled=_as_bool(hourly_data.get("poll_enabled"), False),
+                provider_id=str(hourly_data.get("provider_id") or ""),
+                max_records_per_hour=_positive_int(
+                    hourly_data.get("max_records_per_hour"), 5000
+                ),
+                max_log_lines_per_hour=_positive_int(
+                    hourly_data.get("max_log_lines_per_hour"), 20000
+                ),
+                retention_cycles=_positive_int(hourly_data.get("retention_cycles"), 2),
+            ),
         )
+
+
+def _runtime_log_sources(value: Any) -> list[MineSentinelLogSourceConfig]:
+    if not isinstance(value, list):
+        return []
+    sources: list[MineSentinelLogSourceConfig] = []
+    for index, item in enumerate(value):
+        source = _runtime_log_source(item, index)
+        if source:
+            sources.append(source)
+    return sources
+
+
+def _runtime_log_source(item: Any, index: int) -> MineSentinelLogSourceConfig | None:
+    if isinstance(item, str):
+        path_text = item.strip()
+        if not path_text:
+            return None
+        root, log_file = _split_runtime_log_path(path_text)
+        return MineSentinelLogSourceConfig(
+            server_id=_infer_log_source_id(root or log_file, index),
+            server_name=_infer_log_source_id(root or log_file, index),
+            root=root,
+            log_file=log_file,
+            enabled=True,
+        )
+    if not isinstance(item, dict):
+        return None
+
+    raw_path = str(item.get("path") or "").strip()
+    root = str(item.get("root") or item.get("server_root") or "").strip()
+    log_file = str(item.get("log_file") or item.get("log") or "").strip()
+    logs_dir = str(item.get("logs_dir") or "").strip()
+    if raw_path and not (root or log_file or logs_dir):
+        root, log_file = _split_runtime_log_path(raw_path)
+    if logs_dir and not log_file:
+        log_file = str(Path(logs_dir) / "latest.log")
+
+    source_hint = root or logs_dir or log_file
+    server_id = str(item.get("server_id") or "").strip()
+    server_name = str(item.get("server_name") or item.get("name") or "").strip()
+    if not server_id:
+        server_id = server_name or _infer_log_source_id(source_hint, index)
+    if not server_name:
+        server_name = server_id
+    if not (root or log_file or logs_dir):
+        return None
+    server_type = str(item.get("server_type") or item.get("type") or "").strip().lower()
+    if server_type not in {"minecraft", "velocity", "paper", "spigot", "purpur", "folia"}:
+        server_type = "minecraft" if not server_type else "velocity" if server_type == "velocity" else "minecraft"
+    if server_type in {"paper", "spigot", "purpur", "folia"}:
+        server_type = "minecraft"
+    target_sessions = _list_values(item.get("target_sessions"))
+    delivery_targets = _list_values(item.get("delivery_targets"))
+    return MineSentinelLogSourceConfig(
+        server_id=server_id,
+        server_name=server_name,
+        server_type=server_type,
+        root=root,
+        logs_dir=logs_dir,
+        log_file=log_file,
+        target_sessions=target_sessions,
+        delivery_targets=delivery_targets,
+        enabled=_as_bool(item.get("enabled"), True),
+    )
+
+
+def _split_runtime_log_path(path_text: str) -> tuple[str, str]:
+    path = Path(path_text)
+    name = path.name.lower()
+    if name == "latest.log" or name.endswith(".log") or name.endswith(".log.gz"):
+        return "", path_text
+    return path_text, ""
+
+
+def _list_values(value: Any) -> list[Any]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw = value
+    else:
+        raw = [value]
+    return [item for item in raw if item not in (None, "")]
+
+
+def _category_enabled_dict(
+    enabled_value: Any, disabled_value: Any
+) -> dict[str, bool]:
+    """解析 category_enabled 配置。
+
+    支持两种来源合并：
+    1. ``category_enabled``: dict[str, bool]，显式逐项开关。
+    2. ``disabled_categories``: list[str]，等价于把这些分类设为 False（向后兼容简写）。
+
+    返回的 dict 只记录 *被显式关闭* 的分类（value=False），
+    未列出的分类视为开启，由 rules 层 ``.get(cat, True)`` 判定。
+    daily 始终兜底，不出现在返回值里。
+    """
+    result: dict[str, bool] = {}
+    if isinstance(enabled_value, dict):
+        for raw_key, raw_val in enabled_value.items():
+            key = str(raw_key).strip().lower()
+            if not key:
+                continue
+            result[key] = _as_bool(raw_val, True)
+    if disabled_value not in (None, ""):
+        if isinstance(disabled_value, (list, tuple, set)):
+            for item in disabled_value:
+                key = str(item).strip().lower()
+                if key:
+                    result[key] = False
+        elif isinstance(disabled_value, str):
+            # 单个字符串也按一个分类处理
+            key = disabled_value.strip().lower()
+            if key:
+                result[key] = False
+    # daily 是兜底分类，禁止关闭
+    result.pop("daily", None)
+    # 只保留 False 项，True 项无意义（默认就是 True）
+    return {k: v for k, v in result.items() if v is False}
+
+
+def _category_whitelist_list(value: Any) -> list[str]:
+    """解析 category_whitelist 配置，返回小写分类名列表。"""
+    if value in (None, ""):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw = value
+    else:
+        raw = [value]
+    whitelist: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if item in (None, ""):
+            continue
+        key = str(item).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        whitelist.append(key)
+    return whitelist
+
+
+def _str_list(value: Any) -> list[str]:
+    """解析字符串列表配置，过滤空值。"""
+    if value in (None, ""):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw = value
+    else:
+        raw = [value]
+    return [str(item).strip() for item in raw if item not in (None, "") and str(item).strip()]
+
+
+# 默认 daily noise 正则集合：覆盖 Minecraft 原生 + 常见插件的高频正常日志，
+# 这些日志原本会因关键词命中 network/moderation 等分类而被误判为异常事件。
+# 用户可通过 daily_noise_patterns 追加或覆盖；空列表 + filter_enabled=true 时
+# 仍使用此默认集合，明确写空数组并设 filter_enabled=false 才能完全关闭。
+DEFAULT_DAILY_NOISE_PATTERNS: tuple[str, ...] = (
+    # 玩家正常断开（"lost connection: Disconnected" 会被 network 关键词命中）
+    r"lost connection:\s*Disconnected\s*$",
+    # 玩家正常登录（"logged in" 会被 moderation 关键词命中）
+    r"logged in with entity id",
+    # 玩家 UUID 分配（"uuid" 会被 moderation 关键词命中）
+    r"UUID of player \S+ is",
+    # LuckPerms 权限插件 worker 常规日志
+    r"\[LP\]\s*LOG\b",
+    r"luckperms-worker-\d+/",
+    # 插件启动/注册/会话恢复等生命周期日志，常含 auth/session/listener/community
+    # 等分类关键词，但本身不是玩家权限或社区管理事件。
+    r"\[Server thread/INFO\]:\s*-?\s*[A-Za-z0-9_.+-]+(?:\s*\([^)]+\))?(?:,\s*[A-Za-z0-9_.+-]+(?:\s*\([^)]+\))?){5,}",
+    r"^\s*-\s+[A-Za-z0-9_.-]+(?:\s*\([^)]+\))?,",
+    r"\bRegistered .+ listener!?$",
+    r"\bFake Commands is disable!?$",
+    r"\bhas been successfully loaded!?$",
+    r"\bSuccessfully loaded request manager\b",
+    r"\bStoring sessions that were preserved before previous shutdown\b",
+    r"\bSession store / pubsub factory used:",
+    r"\bRepair of failed migration\b.*\bNo failed migration detected\b",
+    r"\bNo failed migration detected\b",
+    r"\bUnknown or incomplete command\b",
+    r"认证管理器已(?:初始化|重载)",
+    r"通知服务已初始化",
+    r"通信组件初始化完成 \(代理模式\)",
+    r"消息转发服务已初始化",
+    r"代理模式下不启动WS/REST服务器",
+    r"Plugin Messaging Channel已注册",
+    r"后端服务器已进入代理模式",
+    r"代理模式已启用，跳过WS/REST服务器初始化",
+    r"已向代理端发送认证请求",
+    r"代理端认证成功",
+    r"CMI proxy plugin detected",
+    r"CMI detected Velocity network",
+    # 玩家进出服务器（join/leave 已归 daily，但显式过滤更安全）
+    r"\bjoined the game\s*$",
+    r"\bleft the game\s*$",
+)
+
+
+def _infer_log_source_id(path_text: str, index: int) -> str:
+    if not path_text:
+        return f"minecraft_{index + 1}"
+    path = Path(path_text)
+    if path.name.lower() == "latest.log" or path.name.lower().endswith((".log", ".gz")):
+        candidate = path.parent.parent.name or path.parent.name or path.stem
+    else:
+        candidate = path.name
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in candidate).strip("_")
+    return normalized or f"minecraft_{index + 1}"
 
 
 @dataclass(slots=True)
@@ -247,7 +686,6 @@ class ObservationRecord:
     content: str = ""
     tags: list[str] = field(default_factory=list)
     context: dict[str, Any] = field(default_factory=dict)
-    metrics: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -268,7 +706,6 @@ class ObservationRecord:
             content=str(data.get("content") or ""),
             tags=[str(t) for t in data.get("tags", []) if t is not None],
             context=dict(data.get("context") or {}),
-            metrics=dict(data.get("metrics") or {}),
             raw=dict(data.get("raw") or {}),
         )
 
@@ -279,6 +716,4 @@ class ObservationRecord:
     def evidence_text(self) -> str:
         source = self.backend_server or self.server_id
         player = f"{self.player_name}: " if self.player_name else ""
-        if self.kind == "SERVER_METRICS":
-            return f"[{source}] metrics {self.metrics}"
         return f"[{source}] {player}{self.content}".strip()

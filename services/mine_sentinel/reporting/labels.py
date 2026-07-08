@@ -5,36 +5,45 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .dialogue_rules import DIALOGUE_RULES
-
 
 CATEGORY_TITLES = {
     "daily": "日常观察",
-    "complaint": "玩家投诉/性能反馈",
-    "bug": "玩法/功能异常",
-    "economy": "经济/商店异常",
-    "moderation": "管理/违规反馈",
-    "suggestion": "玩家建议/体验请求",
-    "cross_server": "跨服/传送异常",
+    "complaint": "性能/可用性异常",
+    "bug": "服务端/插件异常",
+    "network": "网络/连接异常",
+    "plugin": "插件相关日志",
+    "economy": "经济/商店相关日志",
+    "community": "社区管理",
+    "chat_review": "聊天审查",
+    "player_feedback": "玩家反馈",
+    "community_ops": "社区运营",
+    "moderation": "权限/登录相关日志",
+    "cross_server": "代理/跨服相关日志",
+    "suggestion": "人工关注事项",
 }
 
 GENERIC_TAG_TITLES = {
-    "server_metrics": "服务器指标",
-    "player_join": "玩家上线",
-    "player_quit": "玩家离线",
-    "chat": "聊天记录",
+    "server_log_info": "服务器运行日志",
+    "server_log_warn": "服务器警告日志",
+    "server_log_error": "服务器错误日志",
+    "server_log_fatal": "服务器严重错误日志",
+    "server_log_severe": "服务器严重错误日志",
+    "server_log_performance": "服务器性能异常日志",
+    "server_log_loop_warn": "重复警告日志",
+    "server_log_loop_error": "重复错误日志",
+    "server_log_loop_fatal": "重复严重错误日志",
+    "server_log_loop_severe": "重复严重错误日志",
+    "server_log_community": "社区管理日志",
+    "server_log_chat_review": "聊天审查日志",
+    "server_log_player_feedback": "玩家反馈日志",
+    "server_log_community_ops": "社区运营日志",
+    "server_log_auth": "权限/登录日志",
+    "server_log_network": "网络/连接日志",
+    "server_log_plugin": "插件日志",
+    "server_log_cross_server": "跨服/代理日志",
+    "server_log_economy": "经济/商店日志",
     "plugin_error": "插件错误",
     "server_switch": "跨服切换",
-    "server_security_warning": "服务器安全配置风险",
-    "slow_startup": "启动耗时过长",
-    "database_warning": "数据库兼容/连接警告",
-    "mythicmobs_config_error": "MythicMobs 配置错误",
-    "data_converter_error": "数据转换/NBT 错误",
-    "plugin_config_error": "插件配置加载错误",
-    "plugin_integration_warning": "插件外部集成警告",
-    "console_error": "控制台错误",
-    "console_warning": "控制台警告",
-    "admin_command": "管理员命令",
 }
 
 
@@ -47,7 +56,7 @@ class LabelCatalog:
         category_titles: dict[str, str] | None = None,
         generic_tag_titles: dict[str, str] | None = None,
     ):
-        self.tag_titles = tag_titles or {rule.tag: rule.title for rule in DIALOGUE_RULES}
+        self.tag_titles = tag_titles or {}
         self.category_titles = category_titles or CATEGORY_TITLES
         self.generic_tag_titles = generic_tag_titles or GENERIC_TAG_TITLES
 
@@ -59,7 +68,7 @@ class LabelCatalog:
         if tag_title:
             return tag_title
         category = str(issue.get("category") or "").lower()
-        return self.category_titles.get(category) or "玩家反馈"
+        return self.category_titles.get(category) or "运行日志事件"
 
     def tag_title(self, value: Any) -> str:
         raw = str(value or "").strip()
@@ -79,8 +88,6 @@ class LabelCatalog:
         tag = value.strip().lower()
         if not tag:
             return ""
-        if tag.startswith("dialogue:"):
-            tag = tag.split(":", 1)[1]
         return self.tag_titles.get(tag) or self.generic_tag_titles.get(tag) or ""
 
     def looks_like_raw_tag(self, value: str) -> bool:

@@ -1,3 +1,14 @@
 __pycache__/
 dev/
 .vscode/
+
+# Local AstrBot runtime/config data, not plugin source
+data/cmd_config.json
+data/t2i_templates/
+
+# Rust build artifacts (built via maturin, never commit)
+rust/target/
+dist/
+build/
+*.whl
+*.egg-info/

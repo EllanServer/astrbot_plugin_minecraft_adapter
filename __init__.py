@@ -1,10 +1,18 @@
-# AstrBot Minecraft 适配器插件
-"""AstrBot 的 Minecraft 服务器适配器插件
+"""MineSentinel runtime-log audit plugin for AstrBot."""
 
-本插件实现了 Minecraft 服务器与 AstrBot 之间的通信，
-提供 AI 聊天、消息转发和服务器管理功能。
-"""
+from __future__ import annotations
 
-from .main import MinecraftAdapterPlugin
+from typing import TYPE_CHECKING
 
-__all__ = ["MinecraftAdapterPlugin"]
+if TYPE_CHECKING:
+    from .main import MineSentinelPlugin
+
+__all__ = ["MineSentinelPlugin"]
+
+
+def __getattr__(name: str):
+    if name == "MineSentinelPlugin":
+        from .main import MineSentinelPlugin
+
+        return MineSentinelPlugin
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

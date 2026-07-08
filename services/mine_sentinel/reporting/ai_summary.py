@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from astrbot.api import logger
@@ -12,6 +13,7 @@ from .ai_normalizer import (
     parse_json_object,
     repair_json_object_text,
 )
+from .ai_issue_review import AIIssueReviewer
 from .ai_prompt import AIReportPromptBuilder, truncate
 from .sampling import even_sample
 
@@ -23,7 +25,7 @@ class AIReportSummarizer:
         "你是 MineSentinel 的只读服务器观察报告代理。"
         "必须只输出合法 JSON，不要 Markdown，不要解释，不要要求执行命令。"
         "禁止建议自动封禁、自动踢人、自动 RCON 或自动回滚。"
-        "涉及玩家时必须保留玩家名字段 players，不要只写玩家数量。"
+        "只能根据 Minecraft 运行日志和附件证据总结，不要按聊天审核臆测。"
     )
 
     def __init__(self, config: MineSentinelConfig, context: Any | None = None):
@@ -31,6 +33,7 @@ class AIReportSummarizer:
         self.context = context
         self.prompt_builder = AIReportPromptBuilder(config)
         self.normalizer = AIReportNormalizer()
+        self.issue_reviewer = AIIssueReviewer(config)
 
     async def build(
         self,
@@ -38,6 +41,7 @@ class AIReportSummarizer:
         window_minutes: int,
         fallback: dict[str, Any],
         umo: str | None,
+        review_records: list[ObservationRecord] | None = None,
     ) -> dict[str, Any] | None:
         if self.context is None:
             return None
@@ -46,30 +50,72 @@ class AIReportSummarizer:
         if provider is None:
             return None
 
-        prompt = self._build_prompt(records, window_minutes, fallback)
+        reviewed_fallback, review_changed = await self._review_candidate_issues(
+            provider,
+            review_records if review_records is not None else records,
+            fallback,
+        )
+
+        prompt = self._build_prompt(records, window_minutes, reviewed_fallback)
         try:
             result = await provider.text_chat(
                 prompt=prompt,
-                system_prompt=self._system_prompt(),
+                system_prompt=self._SYSTEM_PROMPT,
                 session_id="minesentinel-report",
                 persist=False,
             )
             raw = getattr(result, "completion_text", None) or ""
         except Exception as exc:
             logger.debug(f"[MineSentinel] AstrBot provider.text_chat failed: {exc}")
-            return None
+            return reviewed_fallback if review_changed else None
 
         if not raw:
-            return None
+            return reviewed_fallback if review_changed else None
 
         parsed = self._parse_json(raw)
         if parsed:
-            return self._normalize_report(parsed, fallback)
+            return self._normalize_report(parsed, reviewed_fallback)
         repaired = self._repair_json_text(raw)
         parsed = self._parse_json(repaired) if repaired else None
         if parsed:
-            return self._normalize_report(parsed, fallback)
-        return None
+            return self._normalize_report(parsed, reviewed_fallback)
+        return reviewed_fallback if review_changed else None
+
+    async def _review_candidate_issues(
+        self,
+        provider: Any,
+        records: list[ObservationRecord],
+        fallback: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        prompts = self.issue_reviewer.build_prompts(records, fallback)
+        if not prompts:
+            return fallback, False
+        decisions: list[dict[str, Any]] = []
+        any_response = False
+        for prompt in prompts:
+            try:
+                result = await provider.text_chat(
+                    prompt=prompt,
+                    system_prompt=self._SYSTEM_PROMPT,
+                    session_id="minesentinel-issue-review",
+                    persist=False,
+                )
+                raw = getattr(result, "completion_text", None) or ""
+            except Exception as exc:
+                logger.debug(f"[MineSentinel] AstrBot issue review failed: {exc}")
+                continue
+            if not raw:
+                continue
+            any_response = True
+            decisions.extend(self.issue_reviewer.parse_review_decisions(raw))
+        if not any_response:
+            return fallback, False
+        if not decisions:
+            return fallback, False
+        return self.issue_reviewer.apply_review(
+            json.dumps({"issues": decisions}, ensure_ascii=False),
+            fallback,
+        )
 
     def _get_provider(self, umo: str | None) -> Any | None:
         try:
@@ -97,16 +143,6 @@ class AIReportSummarizer:
         fallback: dict[str, Any],
     ) -> str:
         return self.prompt_builder.build(records, window_minutes, fallback)
-
-    @staticmethod
-    def _system_prompt() -> str:
-        return (
-            "你是 MineSentinel 的日报润色助手。你只接收结构化 JSON 事实，不要推断未出现的数据。\n"
-            "请返回 JSON 对象，不要输出 Markdown、解释、代码块或其他非 JSON 内容。\n"
-            "保持字段语义不变：issues、categories、chat_players、dialogue_findings、ops_notes、"
-            "time_window、summary 等。\n"
-            "允许在不变更事实的前提下优化可读性、结构顺序和措辞。"
-        )
 
     def _parse_json(self, text: str) -> dict[str, Any] | None:
         return parse_json_object(text)

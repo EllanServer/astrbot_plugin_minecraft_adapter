@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from io import BytesIO
@@ -12,7 +13,16 @@ from PIL import Image, ImageDraw
 
 from ...rendering.fonts import FontProvider
 from ...rendering.image import save_png
-from ..issue_formatting import format_millis
+from . import text_renderer as text_report
+from .incident_format import (
+    dedupe_key as _dedupe_key,
+    format_duration as _format_duration,
+    format_time_window as _format_time_window,
+    incident_time_text as _incident_time_text,
+    incident_title as _incident_title,
+    quiet_window_text as _quiet_window_text,
+    resolve_attachment_name,
+)
 from .incidents import IncidentGroup, IncidentGrouper, IssuePolicy, issue_sort_key
 from .labels import DEFAULT_LABELS
 from .presentation import ReportPresentationBuilder
@@ -44,7 +54,7 @@ class MineSentinelReportImageRenderer:
         self._labels = DEFAULT_LABELS
         self._presentation_builder = ReportPresentationBuilder(
             issue_policy=IssuePolicy(),
-            incident_grouper=IncidentGrouper(),
+            incident_grouper=IncidentGrouper(merge_window_ms=60 * 60 * 1000),
         )
 
     async def render(
@@ -55,6 +65,24 @@ class MineSentinelReportImageRenderer:
         unique_players: int,
     ) -> BytesIO:
         await self._ensure_assets()
+        # The actual drawing is pure CPU-bound PIL work on a large canvas;
+        # run it off the event loop so heartbeats/message dispatch are not
+        # blocked while a report image (often 20000+px tall) is rendered.
+        return await asyncio.to_thread(
+            self._draw_report,
+            report,
+            total_count,
+            dedupe_count,
+            unique_players,
+        )
+
+    def _draw_report(
+        self,
+        report: dict,
+        total_count: int,
+        dedupe_count: int,
+        unique_players: int,
+    ) -> BytesIO:
         presentation = self._presentation_builder.build(
             report,
             total_count,
@@ -67,51 +95,66 @@ class MineSentinelReportImageRenderer:
             "MineSentinel 巡检报告",
             f"{_format_servers(report)} · {_format_time_window(report)}",
         )
+        incident_groups, observation_groups = text_report._split_incident_groups(
+            presentation.incidents
+        )
         canvas.stats(
             [
-                ("观察记录", str(total_count), "#eff6ff", self.BLUE),
-                ("事故级问题", str(len(presentation.incidents)), "#fff7ed", self.AMBER),
-                ("涉及玩家", str(unique_players), "#ecfdf5", self.GREEN),
-                ("完整记录", _format_attachment_name(report), "#f0f9ff", self.CYAN),
+                ("重点事件", str(len(incident_groups)), "#fff7ed", self.AMBER),
+                ("高风险事件", str(text_report._high_risk_count(incident_groups)), "#fef2f2", self.RED),
+                ("待人工复核", str(text_report._manual_review_count(incident_groups)), "#eff6ff", self.BLUE),
+                ("一般观察", str(len(observation_groups)), "#ecfdf5", self.GREEN),
             ]
         )
+        player_count = text_report._player_count(report, presentation.unique_players)
         canvas.section_title("整体情况")
-        canvas.paragraph(
-            _overall_line(
-                report,
-                unique_players,
-                len(presentation.incidents),
-                _format_duration(report),
-            ),
-            size=28,
-            color=self.TEXT,
-        )
+        for line in text_report._overall_lines(
+            report,
+            player_count,
+            len(incident_groups),
+            len(observation_groups),
+            text_report._high_risk_count(incident_groups),
+            text_report._manual_review_count(incident_groups),
+            _format_duration(report),
+            incident_groups,
+        ):
+            canvas.paragraph(line, size=26, color=self.TEXT)
 
-        canvas.section_title("聊天与事件总结")
-        if presentation.incidents:
-            for index, group in enumerate(presentation.incidents[:8], 1):
+        canvas.section_title("重点事件总结")
+        if incident_groups:
+            for index, group in enumerate(incident_groups[:8], 1):
                 canvas.incident_card(index, group)
-            canvas.info_note(_quiet_window_text(report, presentation.incidents))
+            canvas.info_note(_quiet_window_text(report, incident_groups))
         else:
-            canvas.info_note("本窗口未发现需要特别记录的聊天或事件。")
+            canvas.info_note("本窗口未发现需要管理员优先处理的事故或玩家问题。")
+
+        canvas.section_title("聊天与社区观察")
+        if observation_groups:
+            for index, group in enumerate(observation_groups[:6], 1):
+                canvas.incident_card(index, group, label="观察", observation=True)
+        else:
+            canvas.info_note("本窗口未识别到需要单独记录的低风险聊天或社区观察。")
 
         canvas.section_title("玩家问题/投诉识别")
-        player_lines = _player_problem_lines(presentation.incidents, report)
-        canvas.bullet_list(player_lines)
+        canvas.bullet_list(text_report._player_problem_lines(presentation.issues, incident_groups + observation_groups))
 
-        canvas.section_title("风险提醒")
-        canvas.bullet_list(_risk_lines(report, presentation.issues, presentation.incidents))
+        canvas.section_title("风险提醒与建议处理")
+        canvas.bullet_list(
+            text_report._risk_lines(
+                report,
+                presentation.issues,
+                presentation.actionable_issues,
+                len(incident_groups),
+                incident_groups,
+                observation_groups,
+            )
+        )
 
         canvas.section_title("建议处理")
-        canvas.numbered_list(_action_lines(presentation.actionable_issues))
+        canvas.numbered_list(text_report._action_lines(presentation.issues))
 
-        reference_items = _incident_reference_items(presentation.incidents[:8])
-        if reference_items:
-            canvas.section_title("引用上下文")
-            canvas.reference_list(reference_items)
-
-        evidence = _evidence_line(total_count, dedupe_count, unique_players)
-        canvas.footer(evidence)
+        canvas.footer(f"证据：共 {presentation.total_count} 条观察，涉及玩家 {player_count} 人。")
+        canvas.footer(f"本次总结由 AI 根据完整{_format_duration(report)}聊天上下文、玩家事件和服务器指标生成。")
         return canvas.output()
 
     async def _ensure_assets(self):
@@ -127,6 +170,20 @@ class MineSentinelReportImageRenderer:
         return self._font_cache[size]
 
     def issue_title(self, issue: dict[str, Any]) -> str:
+        chat_labels = [
+            str(label).strip()
+            for label in (issue.get("chat_labels") or [])
+            if str(label).strip()
+        ]
+        if chat_labels:
+            return "、".join(chat_labels[:4])
+        ops_subtypes = [
+            str(label).strip()
+            for label in (issue.get("ops_subtypes") or [])
+            if str(label).strip()
+        ]
+        if ops_subtypes:
+            return "、".join(ops_subtypes[:4])
         return self._labels.issue_title(issue)
 
 
@@ -184,17 +241,34 @@ class _ReportCanvas:
             self.y += line_h
         self.y += 8
 
-    def incident_card(self, index: int, group: IncidentGroup):
+    def _card_paragraph(self, text: str, size: int = 21, color: str | None = None):
+        x = self.r.OUTER_PAD + self.r.CARD_PAD
+        w = self.r.CONTENT_W - self.r.CARD_PAD * 2
+        lines = self._wrap(text, w, self.r.font(size))
+        line_h = self._line_height(self.r.font(size), extra=6)
+        self._ensure(line_h * len(lines) + 10)
+        for line in lines:
+            self.draw.text((x, self.y), line, font=self.r.font(size), fill=color or self.r.TEXT)
+            self.y += line_h
+        self.y += 8
+
+    def incident_card(
+        self,
+        index: int,
+        group: IncidentGroup,
+        label: str = "事件",
+        observation: bool = False,
+    ):
         issues = list(group.issues)
-        sorted_issues = sorted(issues, key=issue_sort_key)
-        labels = _incident_labels(self.r, issues, sorted_issues)
-        title = _incident_title(group, labels)
+        labels = _incident_labels(self.r, issues)
+        title = text_report._incident_display_title(group, labels, observation=observation)
         time_text = _incident_time_text(group)
         x = self.r.OUTER_PAD
         w = self.r.CONTENT_W
         top = self.y
-        placeholder_bottom = top + 2600
-        self._ensure(2600)
+        placeholder_height = 760 if observation else 1800
+        placeholder_bottom = top + placeholder_height
+        self._ensure(placeholder_height)
         self.draw.rounded_rectangle(
             (x, top, x + w, placeholder_bottom),
             radius=20,
@@ -204,22 +278,47 @@ class _ReportCanvas:
 
         badge_fill, accent = _incident_colors(group.family)
         self.draw.rectangle((x, top + 22, x + 8, top + 58), fill=accent)
-        self._badge(f"事件 #{index}", x + 24, self.y + 2, "#f3f4f6", self.r.TEXT)
-        self.draw.text((x + 140, self.y), title, font=self.r.font(30), fill=self.r.TEXT)
+        self._badge(f"{label} #{index}", x + 24, self.y + 2, "#f3f4f6", self.r.TEXT)
+        self._fit_text(title, x + 140, self.y, w - 178, self.r.font(30), self.r.TEXT)
         self.draw.text((x + 140, self.y + 40), time_text, font=self.r.font(20), fill=self.r.MUTED)
         self.y += 76
 
-        self._badge_row(labels[:10], x + self.r.CARD_PAD, badge_fill, accent)
-        self._detail_row("相关玩家", _incident_players(issues))
-        self._detail_row("位置/后端", _incident_locations(issues))
-        metrics = _incident_metric_text(issues)
-        if metrics:
-            self._detail_row("同窗指标", metrics)
+        self._detail_row("等级", text_report._severity_label(group))
+        self._detail_row("状态", text_report._group_status(group))
+        evidence_strength = text_report._evidence_strength_line(group)
+        if evidence_strength:
+            self._detail_row("证据强度", evidence_strength)
+        if observation:
+            self._detail_row("处理", text_report._incident_recommended_action(group))
+            bottom = self.y + self.r.CARD_PAD
+            if bottom < placeholder_bottom:
+                self.draw.rectangle((x, bottom, x + w, placeholder_bottom), fill=self.r.BG)
+            self.draw.rounded_rectangle(
+                (x, top, x + w, bottom),
+                radius=20,
+                outline=self.r.BORDER,
+                width=1,
+            )
+            self.y = bottom + 18
+            return
 
-        actions = _incident_action_lines(issues, limit=3, sorted_issues=sorted_issues)
-        if actions:
-            self._subhead("建议处理")
-            self._mini_bullet_list(actions)
+        self._detail_row("影响范围", text_report._impact_scope(group))
+
+        self._subhead("摘要")
+        self._card_paragraph(text_report._incident_summary_sentence(group, labels), size=21, color=self.r.TEXT)
+
+        evidence = text_report._incident_key_evidence(issues, limit=3)
+        self._subhead("关键证据")
+        if evidence:
+            self._quote_list(evidence)
+        else:
+            self._mini_bullet_list(["无可直接展示的关键证据，需查看完整附件。"])
+
+        self._detail_row("初步判断", text_report._incident_judgement_line(group))
+        self._detail_row(
+            "建议处理",
+            text_report._incident_recommended_action(group),
+        )
 
         bottom = self.y + self.r.CARD_PAD
         if bottom < placeholder_bottom:
@@ -435,38 +534,6 @@ def _wrap_tokens(text: str) -> list[str]:
 _CLOSING_PUNCTUATION = set("，。；：！？、）】》」』”’")
 
 
-def _format_time_window(report: dict) -> str:
-    start = _as_millis(report.get("window_start_ts"))
-    end = _as_millis(report.get("window_end_ts"))
-    if start and end:
-        start_day = time.strftime("%Y-%m-%d", time.localtime(start / 1000))
-        end_day = time.strftime("%Y-%m-%d", time.localtime(end / 1000))
-        start_hm = time.strftime("%H:%M", time.localtime(start / 1000))
-        end_hm = time.strftime("%H:%M", time.localtime(end / 1000))
-        if start_day == end_day:
-            return f"{start_day} {start_hm} - {end_hm}"
-        return f"{start_day} {start_hm} - {end_day} {end_hm}"
-    return str(report.get("time_window") or "未知")
-
-
-def _format_duration(report: dict) -> str:
-    start = _as_millis(report.get("window_start_ts"))
-    end = _as_millis(report.get("window_end_ts"))
-    minutes = 0
-    if start and end and end > start:
-        minutes = max(1, round((end - start) / 60000))
-    else:
-        try:
-            minutes = int(report.get("_window_minutes") or 0)
-        except (TypeError, ValueError):
-            minutes = 0
-    if minutes and minutes % 60 == 0:
-        return f"{minutes // 60} 小时"
-    if minutes:
-        return f"{minutes} 分钟"
-    return "本窗口"
-
-
 def _format_servers(report: dict) -> str:
     values: list[str] = []
     server_names = report.get("server_names") or []
@@ -483,62 +550,16 @@ def _format_servers(report: dict) -> str:
 
 
 def _format_attachment_name(report: dict) -> str:
-    name = str(report.get("_export_file_name") or "").strip()
-    if not name and report.get("_export_file_path"):
-        name = Path(str(report["_export_file_path"])).name
-    return name or "未生成"
-
-
-def _overall_line(
-    report: dict,
-    unique_players: int,
-    incident_count: int,
-    duration: str,
-) -> str:
-    status = (
-        f"过去 {duration}发现 {incident_count} 个需要优先关注的事故级问题。"
-        if incident_count
-        else f"过去 {duration}服务器整体稳定，未发现大规模异常。"
-    )
-    players = str(report.get("chat_players_text") or "").strip()
-    if not players or players == "未知":
-        players = "暂无明确发言玩家"
-    return f"{status}共有 {unique_players} 名玩家出现记录，活跃玩家主要是：{players}。"
-
-
-def _incident_title(group: IncidentGroup, labels: list[str]) -> str:
-    if group.family == "moderation":
-        return "疑似作弊/破坏或利用漏洞反馈"
-    if group.family == "suggestion":
-        return labels[0] if labels else "玩家建议/体验请求"
-    if len(labels) > 1:
-        return "服务器集中出现多类异常反馈"
-    return labels[0] if labels else "玩家异常反馈"
-
-
-def _incident_time_text(group: IncidentGroup) -> str:
-    start = _as_millis(group.start_ts)
-    end = _as_millis(group.end_ts)
-    if start and end and start != end:
-        return f"{format_millis(start)} ~ {format_millis(end)} 左右"
-    if start or end:
-        return f"{format_millis(start or end)} 左右"
-    return "本窗口内"
+    return resolve_attachment_name(report) or "未生成"
 
 
 def _incident_labels(
     renderer: MineSentinelReportImageRenderer,
     issues: list[dict[str, Any]],
-    sorted_issues: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     labels: list[str] = []
     seen: set[str] = set()
-    ordered_issues = (
-        sorted_issues
-        if sorted_issues is not None
-        else sorted(issues, key=issue_sort_key)
-    )
-    for issue in ordered_issues:
+    for issue in sorted(issues, key=issue_sort_key):
         label = renderer.issue_title(issue)
         key = _dedupe_key(label)
         if key in seen:
@@ -572,298 +593,11 @@ def _incident_locations(issues: list[dict[str, Any]]) -> str:
     return "、".join(sorted(locations)) if locations else "未知"
 
 
-def _incident_metric_text(issues: list[dict[str, Any]]) -> str:
-    metrics: list[str] = []
-    seen: set[str] = set()
-    for issue in issues:
-        metric = str(issue.get("metric_context_text") or "").strip()
-        if not metric:
-            continue
-        key = _dedupe_key(metric)
-        if key in seen:
-            continue
-        seen.add(key)
-        metrics.append(metric)
-    return "；".join(metrics[:3])
-
-
-def _incident_evidence_lines(
-    issues: list[dict[str, Any]],
-    limit: int = 6,
-    sorted_issues: list[dict[str, Any]] | None = None,
-) -> list[str]:
-    snippets: list[str] = []
-    seen: set[str] = set()
-    ordered_issues = (
-        sorted_issues
-        if sorted_issues is not None
-        else sorted(issues, key=issue_sort_key)
-    )
-    for issue in ordered_issues:
-        for sample in issue.get("evidence_samples") or []:
-            for line in _sample_evidence_lines(str(sample)):
-                key = _dedupe_key(line)
-                if key in seen:
-                    continue
-                seen.add(key)
-                snippets.append(line)
-                if len(snippets) >= limit:
-                    return snippets
-    return snippets
-
-
-def _sample_evidence_lines(sample: str) -> list[str]:
-    hit_lines: list[str] = []
-    context_lines: list[str] = []
-    for raw_line in sample.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("上下文 "):
-            continue
-        is_hit = line.startswith(">")
-        line = line.lstrip("> ").strip()
-        if not line:
-            continue
-        if is_hit:
-            hit_lines.append(line)
-        else:
-            context_lines.append(line)
-    return hit_lines or context_lines[:3]
-
-
-def _incident_action_lines(
-    issues: list[dict[str, Any]],
-    limit: int = 3,
-    sorted_issues: list[dict[str, Any]] | None = None,
-) -> list[str]:
-    actions: list[str] = []
-    seen: set[str] = set()
-    ordered_issues = (
-        sorted_issues
-        if sorted_issues is not None
-        else sorted(issues, key=issue_sort_key)
-    )
-    for issue in ordered_issues:
-        action = _clean_sentence(str(issue.get("suggested_action") or "").strip())
-        if not action:
-            continue
-        key = _dedupe_key(action)
-        if key in seen:
-            continue
-        seen.add(key)
-        actions.append(action)
-        if len(actions) >= limit:
-            break
-    return actions
-
-
-def _incident_reference_items(
-    groups: list[IncidentGroup],
-) -> list[tuple[str, list[str]]]:
-    items: list[tuple[str, list[str]]] = []
-    for index, group in enumerate(groups, 1):
-        issues = list(group.issues)
-        sorted_issues = sorted(issues, key=issue_sort_key)
-        labels = [
-            DEFAULT_LABELS.issue_title(issue)
-            for issue in sorted_issues
-        ]
-        title = f"事件 #{index} · {_incident_title(group, _unique_text(labels))}"
-        lines = _incident_evidence_lines(issues, limit=5, sorted_issues=sorted_issues)
-        if lines:
-            items.append((title, lines))
-    return items
-
-
-def _player_problem_lines(groups: list[IncidentGroup], report: dict) -> list[str]:
-    lines: list[str] = []
-    for group in groups[:8]:
-        issues = list(group.issues)
-        sorted_issues = sorted(issues, key=issue_sort_key)
-        players = _incident_players(issues)
-        if players == "未知":
-            continue
-        labels = [
-            DEFAULT_LABELS.issue_title(issue)
-            for issue in sorted_issues
-        ]
-        title = "、".join(_unique_text(labels[:6])) or _incident_title(group, labels)
-        actions = "；".join(
-            line.rstrip("。") for line in _incident_action_lines(issues, 3, sorted_issues)
-        )
-        metric = _incident_metric_text(issues)
-        metric_part = f"，{metric}" if metric else ""
-        action_part = f"，{actions}。" if actions else "，建议管理员人工复核上下文。"
-        lines.append(f"{players}：集中反馈{title}{metric_part}{action_part}")
-
-    if lines:
-        return lines
-    players = [str(player) for player in report.get("chat_players") or [] if str(player)]
-    if players:
-        return [f"{'、'.join(players[:8])}：没有发现需要管理员介入的异常行为。"]
-    return ["没有发现玩家要求管理员紧急处理的未解决问题。"]
-
-
-def _risk_lines(
-    report: dict,
-    issues: list[dict[str, Any]],
-    groups: list[IncidentGroup],
-) -> list[str]:
-    lines: list[str] = []
-    if any(group.family == "moderation" for group in groups):
-        lines.append("检测到聊天冲突、作弊/破坏举报或管理相关反馈，建议人工复核上下文。")
-    else:
-        lines.append("没有检测到明显辱骂、刷屏、广告或恶意引战。")
-
-    if groups:
-        lines.append(f"有 {len(groups)} 个事故级问题需要优先确认。")
-    else:
-        lines.append("没有发现玩家要求管理员紧急处理的未解决问题。")
-
-    if any(str(issue.get("tag") or "") == "performance_lag" for issue in issues):
-        lines.append("卡顿反馈值得关注，建议下次巡检继续跟踪 TPS、内存、实体数量和红石机器。")
-
-    for note in report.get("ops_notes") or []:
-        note = str(note).strip()
-        if not note or "完整 observation 文件" in note or "完整聊天记录附件" in note:
-            continue
-        lines.append(_clean_sentence(note))
-        if len(lines) >= 6:
-            break
-    return lines[:6]
-
-
-def _action_lines(issues: list[dict[str, Any]]) -> list[str]:
-    actions: list[str] = []
-    seen: set[str] = set()
-    for issue in issues:
-        action = _admin_action_line(issue)
-        if not action:
-            continue
-        key = _dedupe_key(action)
-        if key in seen:
-            continue
-        seen.add(key)
-        actions.append(action)
-        if len(actions) >= 8:
-            break
-    return actions or [
-        "继续观察玩家反馈和服务器指标。",
-        "保留完整 JSONL 附件，必要时按玩家名和时间点人工复核。",
-    ]
-
-
-def _admin_action_line(issue: dict[str, Any]) -> str:
-    action = _clean_sentence(str(issue.get("suggested_action") or "").strip())
-    if not action:
-        return ""
-    scope = _admin_action_scope(issue)
-    label = _admin_action_label(issue)
-    if scope:
-        return f"{label}（{scope}）：{action}"
-    return f"{label}：{action}"
-
-
-def _admin_action_label(issue: dict[str, Any]) -> str:
-    category = str(issue.get("category") or "").lower()
-    tag = str(issue.get("tag") or "").lower()
-    if category == "moderation" or tag == "chat_conflict":
-        return "社群处理"
-    if tag in {
-        "performance_lag",
-        "disconnect_or_rollback",
-        "cross_server_transfer",
-        "server_security_warning",
-        "slow_startup",
-        "database_warning",
-        "mythicmobs_config_error",
-        "plugin_config_error",
-        "plugin_integration_warning",
-        "console_error",
-        "console_warning",
-    }:
-        return "运维排查"
-    if category in {"bug", "economy"} or tag in {
-        "item_or_progress_loss",
-        "feature_broken",
-        "economy_or_shop_abuse",
-    }:
-        return "数据核对"
-    if category == "suggestion" or tag == "player_suggestion":
-        return "体验反馈"
-    return "人工复核"
-
-
-def _admin_action_scope(issue: dict[str, Any]) -> str:
-    parts: list[str] = []
-    players = [
-        str(player).strip()
-        for player in issue.get("players") or []
-        if str(player).strip()
-    ]
-    if players:
-        parts.append(f"玩家 {'、'.join(players[:4])}")
-    locations = [
-        str(location).strip()
-        for location in issue.get("affected_locations") or []
-        if str(location).strip()
-    ]
-    if locations:
-        parts.append(f"位置 {'、'.join(locations[:4])}")
-    return "；".join(parts)
-
-
-def _quiet_window_text(report: dict, groups: list[IncidentGroup]) -> str:
-    if not groups or int(report.get("chat_count") or 0) <= 0:
-        return ""
-    if len(groups) == 1:
-        time_text = _incident_time_text(groups[0]).replace(" 左右", "")
-        return f"除 {time_text} 的集中反馈外，当前摘要中没有体现其他时间段的大规模聊天冲突、刷屏、广告或持续性争吵。"
-    return "除上述事件外，当前摘要中没有体现其他时间段的大规模聊天冲突、刷屏、广告或持续性争吵。"
-
-
-def _evidence_line(total_count: int, dedupe_count: int, unique_players: int) -> str:
-    if dedupe_count:
-        return f"证据：共 {total_count} 条观察，去重 {dedupe_count} 条，涉及玩家 {unique_players} 人。"
-    return f"证据：共 {total_count} 条观察，涉及玩家 {unique_players} 人。"
-
-
 def _incident_colors(family: str) -> tuple[str, str]:
+    if family == "community":
+        return "#fefce8", "#ca8a04"
     if family == "moderation":
         return "#fef2f2", "#dc2626"
     if family == "suggestion":
         return "#f0fdf4", "#059669"
     return "#eff6ff", "#2563eb"
-
-
-def _unique_text(values: list[str]) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        key = _dedupe_key(value)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(value)
-    return result
-
-
-def _clean_sentence(value: str) -> str:
-    text = value.strip()
-    text = re.sub(r"^-+\s*", "", text)
-    if not text:
-        return ""
-    if text[-1] not in "。！？.!?":
-        text += "。"
-    return text
-
-
-def _dedupe_key(value: str) -> str:
-    return re.sub(r"\s+", "", value).lower()[:120]
-
-
-def _as_millis(value: Any) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return number if number > 0 else 0
