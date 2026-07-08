@@ -1660,6 +1660,13 @@ _OPS_HINT_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "plugin_scheduler_delay",
+        "low",
+        (
+            "session ticker",
+        ),
+    ),
+    (
         "plugin_runtime",
         "high",
         (

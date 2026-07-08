@@ -349,6 +349,13 @@ fn detect_ops_hint(content: &str, level: &str) -> Option<OpsHint> {
             markers,
         });
     }
+    if let Some(markers) = matched_markers(&text, PLUGIN_SCHEDULER_DELAY_MARKERS) {
+        return Some(OpsHint {
+            code: "plugin_scheduler_delay",
+            severity: "low",
+            markers,
+        });
+    }
     if let Some(markers) = matched_markers(&text, PLUGIN_RUNTIME_MARKERS) {
         return Some(OpsHint {
             code: "plugin_runtime",
@@ -710,6 +717,8 @@ const PLUGIN_TRANSLATION_MARKERS: &[&str] = &[
     "translation key",
 ];
 
+const PLUGIN_SCHEDULER_DELAY_MARKERS: &[&str] = &["session ticker"];
+
 const PLUGIN_RUNTIME_MARKERS: &[&str] = &[
     "could not pass event",
     "eventexception",
@@ -789,6 +798,18 @@ mod tests {
         assert_eq!(hint.code, "plugin_translation");
         assert_eq!(hint.severity, "low");
         assert!(hint.markers.contains(&"no translation for key:"));
+    }
+
+    #[test]
+    fn detects_plugin_scheduler_delay_as_low_risk() {
+        let hint = detect_ops_hint(
+            "[TypewriterPoolThread-1/WARN]: [Typewriter] The session ticker for TypeThe0ry is running behind! Took 161ms",
+            "WARN",
+        )
+        .expect("ops hint");
+        assert_eq!(hint.code, "plugin_scheduler_delay");
+        assert_eq!(hint.severity, "low");
+        assert!(hint.markers.contains(&"session ticker"));
     }
 
     #[test]

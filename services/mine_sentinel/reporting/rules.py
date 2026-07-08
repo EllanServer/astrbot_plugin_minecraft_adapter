@@ -964,6 +964,21 @@ OPS_LOG_RULES: tuple[dict[str, Any], ...] = (
         "report_categories": ("complaint",),
     },
     {
+        "category": "性能与资源",
+        "subtype": "插件任务调度延迟",
+        "markers": (
+            "session ticker",
+        ),
+        "all_markers": (
+            "running behind",
+        ),
+        "severity": "low",
+        "impact": "单个插件后台任务出现轻微调度延迟，通常只作为性能旁证，不等同于网络掉线。",
+        "needs_admin": False,
+        "report_categories": ("complaint",),
+        "ops_observation": True,
+    },
+    {
         "category": "网络与代理",
         "subtype": "网络连接异常",
         "markers": (
@@ -1232,6 +1247,14 @@ OPS_HINT_CLASSIFICATIONS: dict[str, dict[str, Any]] = {
         "severity": "low",
         "impact": "插件本地化或资源文件缺失，通常不影响核心玩法，但会导致提示文本缺失。",
         "report_categories": ("plugin",),
+        "ops_observation": True,
+    },
+    "plugin_scheduler_delay": {
+        "category": "性能与资源",
+        "subtype": "插件任务调度延迟",
+        "severity": "low",
+        "impact": "单个插件后台任务出现轻微调度延迟，通常只作为性能旁证，不等同于网络掉线。",
+        "report_categories": ("complaint",),
         "ops_observation": True,
     },
     "plugin_runtime": {
