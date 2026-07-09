@@ -390,7 +390,7 @@ class HourlySummarizer:
             "日志样本（最多 200 条，已截断）:",
         ]
         for record in sample:
-            lines.append(f"- [{record.timestamp_ms}] {record.content[:200]}")
+            lines.append(f"- [{record.timestamp}] {record.content[:200]}")
         return "\n".join(lines)[:20000]
 
     def _build_cycle_prompt(
