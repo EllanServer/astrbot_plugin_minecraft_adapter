@@ -78,8 +78,8 @@ class HourlySummaryStore:
         self.base_dir = Path(base_dir) / "hourly_summaries"
 
     def _server_dir(self, server_id: str) -> Path:
-        safe = server_id or "default"
-        path = self.base_dir / safe
+        server_dir_name = server_id or "default"
+        path = self.base_dir / server_dir_name
         path.mkdir(parents=True, exist_ok=True)
         return path
 

@@ -81,17 +81,6 @@ class MineSentinelReportDispatcher:
 
         await asyncio.gather(*(_send_one(umo) for umo in targets))
 
-    async def send_message(
-        self,
-        umo: str,
-        text: str,
-        file_path: Path | None = None,
-    ) -> bool:
-        sent = await self.delivery.send_message(umo, text, file_path)
-        if not sent:
-            self._capture_delivery_error()
-        return sent
-
     async def send_report(
         self,
         umo: str,

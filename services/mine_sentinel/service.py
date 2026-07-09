@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -48,8 +47,9 @@ class MineSentinelService:
         self.context = context
         self.config = MineSentinelConfig.from_dict(config_data)
         self.get_server_config = get_server_config
-        # PR9: 专用 bounded ThreadPoolExecutor。当配置 io_workers > 0 且调用方
-        # 未注入 io_runner 时，创建独立线程池隔离 MineSentinel 的 IO 任务。
+        # PR9: 专用 bounded ThreadPoolExecutor。当调用方未注入 io_runner 时
+        # 委托 build_io_executor（io_workers<=0 时返回 None 回退默认池），
+        # 创建独立线程池隔离 MineSentinel 的 IO 任务。
         self._io_executor: ThreadPoolExecutor | None = None
         if io_runner is None:
             self._io_executor = build_io_executor(
@@ -516,7 +516,7 @@ class MineSentinelService:
             summaries, server_id, umo=None
         )
         text = format_cycle_report(report, summaries, server_name)
-        # Try to load persisted summaries again to ensure we have the latest.
+        # 未配置投递目标时仅记录到日志，不实际发送。
         if not self._has_report_delivery_targets():
             logger.warning(
                 f"[MineSentinel] hourly 周期 {server_id} 完成但未配置投递目标，"
@@ -633,25 +633,6 @@ class MineSentinelService:
         # records 字段为 tuple（M17 不可变约定），返回 list 副本以保持
         # 既定 list[ObservationRecord] 返回契约不变。
         return list((await self._recent_window(window_minutes, server_id)).records)
-
-    async def _export_report_records(
-        self,
-        records: list[ObservationRecord],
-        window_minutes: int,
-        server_id: str | None,
-        umo: str | None,
-        export_full_window: bool = False,
-    ):
-        path = await self.report_artifacts.export_report_records(
-            records,
-            window_minutes,
-            server_id,
-            umo,
-            export_full_window,
-        )
-        if self.report_artifacts.last_error:
-            self.last_error = self.report_artifacts.last_error
-        return path
 
     def _report_file_path(self, report: dict) -> Path | None:
         return self.report_artifacts.report_file_path(report)

@@ -28,16 +28,6 @@ class AIIssueReviewer:
     def __init__(self, config: MineSentinelConfig):
         self.config = config
 
-    def build_prompt(
-        self,
-        records: list[ObservationRecord],
-        fallback: dict[str, Any],
-    ) -> str:
-        payload = self.build_payload(records, fallback)
-        if not payload.get("issues"):
-            return ""
-        return self._fit_prompt(payload)
-
     def build_prompts(
         self,
         records: list[ObservationRecord],

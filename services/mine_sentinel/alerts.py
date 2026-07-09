@@ -52,6 +52,9 @@ class MineSentinelAlertEngine:
 
     def build_messages(self, server_id: str, report: dict[str, Any]) -> list[str]:
         messages = []
+        # should_analyze 已做过一次清理；此处进入 build_messages 时再清理一次，
+        # 后续循环内不再重复调用，避免每个 issue 都遍历字典。
+        self._cleanup_dicts(time.time())
         for issue in report.get("issues", []):
             if not issue.get("should_alert"):
                 continue
@@ -62,7 +65,6 @@ class MineSentinelAlertEngine:
                 < self.config.alert.cooldown_seconds
             ):
                 continue
-            self._cleanup_dicts(now)
             self._alert_cooldowns[key] = now
             signal_count = issue.get("signal_count")
             evidence_count = issue.get("evidence_count")

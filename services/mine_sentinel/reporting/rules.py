@@ -2620,7 +2620,7 @@ class HeuristicReportBuilder:
         if multi_scope and severity in {"medium", "high"}:
             return True
         # chat_review 特殊规则：默认不告警，除非 severity>=high / evidence_count>=5 / 命中敏感词
-        # / 命中 chat_flood 标签（玩家级刷屏已强制 chat_review，需单独触发告警，否则审核漏报）
+        # / 命中 chat_flood/chat_abuse 行为标签（玩家级刷屏已强制 chat_review，需单独触发告警，否则审核漏报）
         if category == "chat_review":
             if severity in {"high", "critical"}:
                 return True

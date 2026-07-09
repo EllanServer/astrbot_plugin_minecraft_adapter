@@ -15,8 +15,7 @@ from .ai_normalizer import (
     repair_json_object_text,
 )
 from .ai_issue_review import AIIssueReviewer
-from .ai_prompt import AIReportPromptBuilder, truncate
-from .sampling import even_sample
+from .ai_prompt import AIReportPromptBuilder
 
 
 class AIReportSummarizer:
@@ -169,36 +168,3 @@ class AIReportSummarizer:
         fallback: dict[str, Any],
     ) -> dict[str, Any]:
         return self.normalizer.normalize_report(data, fallback)
-
-    def _normalize_issues(self, result: dict[str, Any], fallback: dict[str, Any]):
-        return self.normalizer.normalize_issues(result, fallback)
-
-    def _compact_fallback(self, fallback: dict[str, Any]) -> dict[str, Any]:
-        return self.prompt_builder.compact_fallback(fallback)
-
-    def _timeline_chunks(
-        self,
-        records: list[ObservationRecord],
-    ) -> list[dict[str, Any]]:
-        return self.prompt_builder.timeline_chunks(records)
-
-    def _sample_for_ai(
-        self,
-        records: list[ObservationRecord],
-        fallback: dict[str, Any] | None = None,
-    ) -> list[ObservationRecord]:
-        return self.prompt_builder.sample_for_ai(records, fallback)
-
-    def _compact_record(self, record: ObservationRecord) -> dict[str, Any]:
-        return self.prompt_builder.compact_record(record)
-
-    @staticmethod
-    def _sample_records(records: list[Any], max_records: int) -> list[Any]:
-        return even_sample(records, max_records)
-
-    def _drop_chunk_samples(self, chunks: list[dict[str, Any]]) -> bool:
-        return self.prompt_builder.drop_chunk_samples(chunks)
-
-    @staticmethod
-    def _truncate(value: str, max_length: int) -> str:
-        return truncate(value, max_length)

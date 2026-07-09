@@ -350,10 +350,11 @@ class RuntimeLogLoopFilter:
         otel = dict(context.get("otel") or {})
         otel["timestamp"] = entry.last_ts
         otel["observedTimestamp"] = observed_ms
-        otel["body"] = (
+        body_text = (
             f"同类服务器报错已合并：{suppressed} 条重复日志被过滤；"
             f"首条样本：{_truncate(entry.sample, 320)}"
         )
+        otel["body"] = body_text
         if "attributes" in otel:
             attrs = dict(otel["attributes"])
             attrs["loop.suppressed"] = suppressed
@@ -367,10 +368,7 @@ class RuntimeLogLoopFilter:
             "timestamp": entry.last_ts,
             "serverId": entry.server_id,
             "serverName": entry.server_name,
-            "content": (
-                f"同类服务器报错已合并：{suppressed} 条重复日志被过滤；"
-                f"首条样本：{_truncate(entry.sample, 320)}"
-            ),
+            "content": body_text,
             "tags": [
                 "server_log",
                 "runtime_log",
@@ -1485,9 +1483,9 @@ def _detect_chat_flood(
     - samples: 最多 5 条样本消息原文
 
     三类刷屏（参考百度百科+社区规则定义）：
-    1. high_frequency: 60 秒内同一玩家发送 >=5 条消息（高频刷屏）
+    1. high_frequency: 30 秒内同一玩家发送 >=8 条消息（高频刷屏）
     2. repeat_content: 5 分钟内同一玩家发送 >=5 条相同/高度相似消息（重复刷屏）
-    3. meaningless: 5 分钟内同一玩家发送 >=5 条无意义符号消息（无意义刷屏）
+    3. meaningless: 5 分钟内同一玩家发送 >=3 条无意义符号消息（无意义刷屏）
     """
     from .models import ObservationRecord as _OR  # 类型提示用
 
@@ -1538,7 +1536,7 @@ def _detect_player_floods(
             # 跳过这个窗口内的记录，避免重叠
             break
 
-    # 2. 重复刷屏：5 分钟窗口内 >=3 条相同/高度相似消息
+    # 2. 重复刷屏：5 分钟窗口内 >=5 条相同/高度相似消息
     normalized_list = [
         (r, _normalize_message(str((r.context or {}).get("chatMessage") or "")))
         for r in records
@@ -1567,7 +1565,7 @@ def _detect_player_floods(
             ))
             break
 
-    # 3. 无意义刷屏：5 分钟窗口内 >=5 条无意义符号消息
+    # 3. 无意义刷屏：5 分钟窗口内 >=3 条无意义符号消息
     meaningless_records = [
         r for r in records
         if _detect_meaningless_message(str((r.context or {}).get("chatMessage") or ""))

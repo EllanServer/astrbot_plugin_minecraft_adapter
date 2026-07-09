@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import re
-import time
-from pathlib import Path
 from typing import Any
 
-from ..issue_formatting import format_millis
 from .incidents import IncidentGroup, IncidentGrouper, IssuePolicy, issue_sort_key
 from .incident_format import (
     as_millis as _as_millis,
@@ -192,10 +189,6 @@ def _active_players(report: dict) -> str:
             if len(players) >= 5:
                 break
     return "、".join(players) if players else "无明确玩家"
-
-
-def _high_incident_count(groups: list[IncidentGroup]) -> int:
-    return sum(1 for group in groups if str(group.max_severity or "").lower() in {"high", "critical"})
 
 
 def _split_incident_groups(
@@ -739,31 +732,6 @@ def _compact_server_evidence(time_text: str, body: str) -> str:
     if match:
         return f"{time_text} [{match.group('level')}] {match.group('message').strip()}".strip()
     return f"{time_text} {text}".strip()
-
-
-def _metrics_summary(group: IncidentGroup) -> str:
-    issues = list(group.issues)
-    categories = {str(issue.get("category") or "") for issue in issues}
-    tags = {str(issue.get("tag") or "") for issue in issues}
-    ops_categories = _unique_issue_values(issues, "ops_categories")
-    ops_subtypes = _unique_issue_values(issues, "ops_subtypes")
-    if ops_subtypes:
-        subtype_text = "、".join(ops_subtypes[:4])
-        category_text = "、".join(ops_categories[:3]) if ops_categories else "运维日志"
-        return f"确定性运维分类指向 {category_text}：{subtype_text}；server_metrics 只能作为同时间旁证，需与日志和聊天反馈交叉确认。"
-    if "server_log_performance" in tags or "complaint" in categories:
-        return "存在性能/延迟相关日志或玩家反馈；server_metrics 仅作旁证，需结合 TPS、MSPT、GC、内存和插件耗时确认。"
-    if "server_log_network" in tags or "server_log_cross_server" in tags:
-        return "存在网络、代理或后端转发线索；需结合连接数、丢包、后端在线状态和代理日志确认。"
-    if "server_log_economy" in tags or "economy" in categories:
-        return "无直接 server_metrics 指标；重点核对经济插件流水、商店记录、背包/数据库同步和是否存在重复扣款。"
-    if "server_log_chat_review" in tags:
-        return "无直接 server_metrics 指标异常；主要依据玩家聊天原文、时间窗和上下文判定。"
-    if "server_log_community" in tags or "community" in categories:
-        return "无直接 server_metrics 指标异常；主要依据反作弊、处罚、举报或管理日志复核。"
-    if any(tag in tags for tag in ("server_log_warn", "server_log_error", "server_log_plugin")):
-        return "日志包含 WARN/ERROR 或插件异常；需结合对应插件日志、启动/重载记录和错误堆栈确认。"
-    return "无明确 server_metrics 指标；以本事件的日志和聊天证据为主。"
 
 
 def _judgement(group: IncidentGroup) -> str:

@@ -6,10 +6,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .common import SEVERITY_RANK
+
 
 INCIDENT_MERGE_WINDOW_MS = 5 * 60 * 1000
 ACTIONABLE_SEVERITIES = {"medium", "high", "critical"}
-SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 COMMUNITY_TAGS = {"server_log_community"}
 CHAT_REVIEW_TAGS = {"server_log_chat_review"}
 PLAYER_FEEDBACK_TAGS = {"server_log_player_feedback"}

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -21,7 +20,6 @@ from .incident_format import (
     incident_time_text as _incident_time_text,
     incident_title as _incident_title,
     quiet_window_text as _quiet_window_text,
-    resolve_attachment_name,
 )
 from .incidents import IncidentGroup, IncidentGrouper, IssuePolicy, issue_sort_key
 from .labels import DEFAULT_LABELS
@@ -361,34 +359,6 @@ class _ReportCanvas:
             self._bullet(item, f"{index}.")
         self.y += 4
 
-    def reference_list(self, items: list[tuple[str, list[str]]]):
-        x = self.r.OUTER_PAD
-        w = self.r.CONTENT_W
-        for title, lines in items:
-            if not lines:
-                continue
-            title_h = self._line_height(self.r.font(21), extra=6)
-            body_font = self.r.font(20)
-            wrapped: list[str] = []
-            for line in lines:
-                wrapped.extend(self._wrap(line, w - 86, body_font))
-            line_h = self._line_height(body_font, extra=6)
-            h = 34 + title_h + max(1, len(wrapped)) * line_h
-            self._ensure(h + 12)
-            self.draw.rounded_rectangle(
-                (x, self.y, x + w, self.y + h),
-                radius=16,
-                fill="#ffffff",
-                outline=self.r.BORDER,
-            )
-            self.draw.rectangle((x + 28, self.y + 24, x + 34, self.y + h - 24), fill="#cbd5e1")
-            self.draw.text((x + 54, self.y + 18), title, font=self.r.font(21), fill=self.r.MUTED)
-            yy = self.y + 18 + title_h
-            for line in wrapped:
-                self.draw.text((x + 54, yy), line, font=body_font, fill="#374151")
-                yy += line_h
-            self.y += h + 12
-
     def footer(self, text: str):
         self.y += 8
         self.info_note(text)
@@ -450,20 +420,6 @@ class _ReportCanvas:
             self.draw.text((x + marker_w, yy), line, font=self.r.font(size), fill=self.r.TEXT)
             yy += line_h
         self.y = yy + 8
-
-    def _badge_row(self, labels: list[str], x: int, fill: str, text_color: str):
-        if not labels:
-            return
-        start_x = x
-        max_x = self.r.OUTER_PAD + self.r.CONTENT_W - self.r.CARD_PAD
-        for label in labels:
-            badge_w = int(self.draw.textlength(label, font=self.r.font(19))) + 26
-            if x + badge_w > max_x:
-                x = start_x
-                self.y += 38
-            self._badge(label, x, self.y, fill, text_color)
-            x += badge_w + 8
-        self.y += 44
 
     def _badge(self, text: str, x: int, y: int, fill: str, text_color: str):
         font = self.r.font(19)
@@ -566,10 +522,6 @@ def _format_servers(report: dict) -> str:
     return " / ".join(values) if values else "全部服务器"
 
 
-def _format_attachment_name(report: dict) -> str:
-    return resolve_attachment_name(report) or "未生成"
-
-
 def _incident_labels(
     renderer: MineSentinelReportImageRenderer,
     issues: list[dict[str, Any]],
@@ -584,30 +536,6 @@ def _incident_labels(
         seen.add(key)
         labels.append(label)
     return labels
-
-
-def _incident_players(issues: list[dict[str, Any]]) -> str:
-    players: list[str] = []
-    seen: set[str] = set()
-    for issue in issues:
-        for player in issue.get("players") or []:
-            value = str(player).strip()
-            if value and value not in seen:
-                seen.add(value)
-                players.append(value)
-    return "、".join(sorted(players)) if players else "未知"
-
-
-def _incident_locations(issues: list[dict[str, Any]]) -> str:
-    locations: list[str] = []
-    seen: set[str] = set()
-    for issue in issues:
-        for location in issue.get("affected_locations") or []:
-            value = str(location).strip()
-            if value and value not in seen:
-                seen.add(value)
-                locations.append(value)
-    return "、".join(sorted(locations)) if locations else "未知"
 
 
 def _incident_colors(family: str) -> tuple[str, str]:

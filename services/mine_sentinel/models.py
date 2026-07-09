@@ -161,7 +161,7 @@ class MineSentinelStorageConfig:
 class MineSentinelLogSourceConfig:
     server_id: str = ""
     server_name: str = ""
-    server_type: str = "minecraft"  # minecraft | velocity
+    server_type: str = "minecraft"  # minecraft | velocity（paper/spigot/purpur/folia 归一为 minecraft）
     root: str = ""
     logs_dir: str = ""
     log_file: str = ""
@@ -509,8 +509,9 @@ def _runtime_log_source(item: Any, index: int) -> MineSentinelLogSourceConfig | 
     if not (root or log_file or logs_dir):
         return None
     server_type = str(item.get("server_type") or item.get("type") or "").strip().lower()
+    # 不在合法集合内则统一置为 minecraft，再将 paper/spigot/purpur/folia 归一为 minecraft
     if server_type not in {"minecraft", "velocity", "paper", "spigot", "purpur", "folia"}:
-        server_type = "minecraft" if not server_type else "velocity" if server_type == "velocity" else "minecraft"
+        server_type = "minecraft"
     if server_type in {"paper", "spigot", "purpur", "folia"}:
         server_type = "minecraft"
     target_sessions = _list_values(item.get("target_sessions"))

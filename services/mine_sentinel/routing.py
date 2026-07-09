@@ -6,12 +6,7 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from .models import ObservationRecord
-from ..session_targets import normalize_session_target, normalize_session_targets
-
-
-def normalize_delivery_target(target: Any) -> str:
-    """Convert report delivery shorthand into an AstrBot session target."""
-    return normalize_session_target(target)
+from ..session_targets import normalize_session_targets
 
 
 def normalize_delivery_targets(targets: Iterable[Any]) -> list[str]:

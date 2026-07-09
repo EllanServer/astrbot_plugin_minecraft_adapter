@@ -21,7 +21,6 @@ from .paths import (
     cleanup_old_files,
     export_path,
     record_path,
-    safe_name,
 )
 from .window import RecentWindowBuilder
 
@@ -397,34 +396,8 @@ class DiskObservationStore:
     ) -> list[Path]:
         return candidate_files(self.observation_dir, server_id, cutoff_ms)
 
-    def _read_jsonl(self, path: Path):
-        yield from self.codec.read_jsonl(path)
-
-    def _normalize_record(self, record: ObservationRecord):
-        self.codec.normalize_record(record)
-
-    def _record_to_json(self, record: ObservationRecord) -> dict[str, Any]:
-        return self.codec.record_to_json(record)
-
-    def _compact_dict(self, data: dict[str, Any], max_fields: int) -> dict[str, Any]:
-        return self.codec.compact_dict(data, max_fields)
-
-    def _compact_value(self, value: Any) -> Any:
-        return self.codec.compact_value(value)
-
-    def _dedupe_key(self, record: ObservationRecord) -> str:
-        return self.codec.dedupe_key(record)
-
     def _dedupe_tracker(self) -> DedupeTracker:
         return DedupeTracker(
             max_memory_keys=self.config.storage.dedupe_memory_limit,
             temp_dir=self.root_dir / "tmp",
         )
-
-    @staticmethod
-    def _safe_name(value: str) -> str:
-        return safe_name(value)
-
-    @staticmethod
-    def _truncate(value: str, max_length: int) -> str:
-        return ObservationRecordCodec.truncate(value, max_length)

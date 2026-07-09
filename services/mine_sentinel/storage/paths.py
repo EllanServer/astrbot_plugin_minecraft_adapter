@@ -69,7 +69,7 @@ def window_export_stem(
     # export_reuse_existing 仍对"完全相同窗口"（如 periodic report
     # 用固定 scheduled_window_end_ms 重试）有效。
     # 兼容：若调用方传入秒级（< 10^12），自动 *1000 转毫秒。
-    if end_timestamp < 10_000_000_000:  # < 10^12 → 秒级
+    if end_timestamp < 10_000_000_000:  # < 10^10 → 秒级
         end_ms = end_timestamp * 1000
     else:
         end_ms = end_timestamp
