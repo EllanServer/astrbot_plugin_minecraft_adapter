@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from pathlib import Path
 
 from ..models import ObservationRecord
+
+logger = logging.getLogger(__name__)
 
 
 def record_path(observation_dir: Path, record: ObservationRecord) -> Path:
@@ -112,6 +115,8 @@ def cleanup_old_files(
     export_dir: Path,
     retention_minutes: int,
 ):
+    # 防御 retention<=0：否则 cutoff 落在当前或未来，会误删当天数据。
+    retention_minutes = max(1, retention_minutes)
     # 注意：observation 按天分片（YYYYMMDD.jsonl），清理粒度为天。
     # 当天的文件永远不会被删（path.stem < cutoff_day 不成立），
     # 即使 retention_minutes=60，当天文件也会保留到跨天后才删。
@@ -123,9 +128,12 @@ def cleanup_old_files(
     )
     for path in observation_dir.glob("*/*.jsonl"):
         if path.stem < cutoff_day:
-            path.unlink(missing_ok=True)
+            # 每个文件 unlink 单独 try/except：单个文件失败（权限/目录等）
+            # 不应中断整轮清理。missing_ok 已处理 FileNotFoundError，
+            # 这里再兜底捕获 PermissionError/IsADirectoryError 等 OSError。
+            _safe_unlink(path)
             # 同时清理对应的 .idx 偏移索引文件
-            path.with_suffix(".idx").unlink(missing_ok=True)
+            _safe_unlink(path.with_suffix(".idx"))
 
     export_cutoff = time.time() - max(retention_minutes, 60) * 60
     # 清理 export 目录下的 .jsonl 和 .jsonl.gz 文件
@@ -133,9 +141,17 @@ def cleanup_old_files(
         for path in export_dir.glob(pattern):
             try:
                 if path.stat().st_mtime < export_cutoff:
-                    path.unlink(missing_ok=True)
-            except FileNotFoundError:
-                pass
+                    _safe_unlink(path)
+            except OSError as exc:
+                logger.warning("检查 export 文件 stat 失败: %s", path, exc_info=True)
+
+
+def _safe_unlink(path: Path) -> None:
+    """unlink 单个文件，失败记 warning 后继续，不中断清理循环。"""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("清理文件失败: %s", path, exc_info=True)
 
 
 def safe_name(value: str) -> str:

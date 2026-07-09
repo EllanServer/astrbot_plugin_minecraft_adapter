@@ -16,6 +16,7 @@ the Minecraft server's mspt/tps.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -27,6 +28,22 @@ from astrbot.api import logger
 from .models import MineSentinelConfig, ObservationRecord
 from .reporting.ai_normalizer import parse_json_object, repair_json_object_text
 from .reporting.rules import HeuristicReportBuilder
+
+
+# M33: provider 调用失败时按固定间隔记 WARNING，保持 LLM 持续不可用可见。
+_provider_fail_logged_at: float = 0.0
+_PROVIDER_FAIL_LOG_INTERVAL = 300.0
+
+
+def _log_provider_failure(message: str, exc: BaseException) -> None:
+    """provider 调用失败时按 5 分钟间隔记 WARNING，间隔内仅记 DEBUG。"""
+    global _provider_fail_logged_at
+    now = time.time()
+    if now - _provider_fail_logged_at > _PROVIDER_FAIL_LOG_INTERVAL:
+        logger.warning(f"[MineSentinel] {message}: {exc}")
+        _provider_fail_logged_at = now
+    else:
+        logger.debug(f"[MineSentinel] {message}: {exc}")
 
 
 @dataclass
@@ -71,10 +88,13 @@ class HourlySummaryStore:
         hour = datetime.fromtimestamp(summary.hour_start_ms / 1000)
         filename = f"{hour:%Y%m%d%H}.json"
         path = server_dir / filename
-        path.write_text(
+        # M31: 写临时文件后 os.replace 原子替换，避免崩溃/并发导致半写 JSON。
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(
             json.dumps(asdict(summary), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        os.replace(tmp_path, path)
         return path
 
     def load(self, server_id: str, hour_start_ms: int) -> HourlySummary | None:
@@ -85,10 +105,17 @@ class HourlySummaryStore:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return HourlySummary(**data)
+            summary = HourlySummary(**data)
         except Exception as exc:
             logger.debug(f"[MineSentinel] failed to load hourly summary {path}: {exc}")
             return None
+        # M32: 防御性类型校验，避免脏数据（如 key_issues 被存成字符串）导致
+        # 后续 .get / 迭代崩溃。dataclass 不在构造时校验类型。
+        if not isinstance(summary.key_issues, list):
+            summary.key_issues = []
+        if not isinstance(summary.top_events, list):
+            summary.top_events = []
+        return summary
 
     def list_cycle_summaries(
         self, server_id: str, cycle_start_ms: int, cycle_end_ms: int
@@ -100,7 +127,9 @@ class HourlySummaryStore:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 summary = HourlySummary(**data)
-            except Exception:
+            except Exception as exc:
+                # M32: 记 warning 而非静默吞，便于发现磁盘损坏/写坏文件。
+                logger.warning(f"[MineSentinel] failed to read hourly summary {path}: {exc}")
                 continue
             if cycle_start_ms <= summary.hour_start_ms < cycle_end_ms:
                 results.append(summary)
@@ -117,7 +146,9 @@ class HourlySummaryStore:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if data.get("hour_start_ms", 0) < cutoff_ms:
                     path.unlink(missing_ok=True)
-            except Exception:
+            except Exception as exc:
+                # M32: 记 warning 而非静默吞。
+                logger.warning(f"[MineSentinel] failed to cleanup hourly summary {path}: {exc}")
                 continue
 
 
@@ -168,7 +199,7 @@ class HourlySummarizer:
             except TypeError:
                 return getter(umo)
         except Exception as exc:
-            logger.debug(f"[MineSentinel] get AstrBot provider failed: {exc}")
+            _log_provider_failure("get AstrBot provider failed", exc)
             return None
 
     async def build_hourly_summary(
@@ -225,7 +256,7 @@ class HourlySummarizer:
             )
             raw = getattr(result, "completion_text", None) or ""
         except Exception as exc:
-            logger.debug(f"[MineSentinel] hourly provider.text_chat failed: {exc}")
+            _log_provider_failure("hourly provider.text_chat failed", exc)
             return hourly
 
         parsed = parse_json_object(raw)
@@ -261,7 +292,7 @@ class HourlySummarizer:
             )
             raw = getattr(result, "completion_text", None) or ""
         except Exception as exc:
-            logger.debug(f"[MineSentinel] cycle provider.text_chat failed: {exc}")
+            _log_provider_failure("cycle provider.text_chat failed", exc)
             return heuristic
         parsed = parse_json_object(raw)
         if parsed is None:

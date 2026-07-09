@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
@@ -48,6 +49,7 @@ class MineSentinelReportDispatcher:
     ):
         current_resolved = self._resolve_session(current_session)
         seen: set[str] = set()
+        targets: list[str] = []
         for umo in self.router.sessions_for_records(
             records,
             current_session,
@@ -60,7 +62,24 @@ class MineSentinelReportDispatcher:
             if resolved and resolved in seen:
                 continue
             seen.add(resolved or umo)
-            await self.send_report(umo, text, image=image, file_path=file_path)
+            targets.append(umo)
+        if not targets:
+            return
+        # 并发投递到各 session，Semaphore 限流避免瞬时压力过大；
+        # 单个 session 失败不影响其他 session 的投递。
+        semaphore = asyncio.Semaphore(4)
+
+        async def _send_one(target_umo: str):
+            async with semaphore:
+                try:
+                    await self.send_report(
+                        target_umo, text, image=image, file_path=file_path
+                    )
+                except Exception as exc:
+                    if self.error_sink:
+                        self.error_sink(f"投递到 {target_umo} 失败: {exc}")
+
+        await asyncio.gather(*(_send_one(umo) for umo in targets))
 
     async def send_message(
         self,

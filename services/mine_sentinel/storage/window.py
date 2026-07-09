@@ -40,7 +40,7 @@ class RecentWindowBuilder:
         records = self._merge_bounded_records()
         records.sort(key=lambda item: item.timestamp)
         return RecentObservationWindow(
-            records=records,
+            records=tuple(records),
             total_count=self.total_count,
             unique_players=len(self.identities),
             truncated=self.total_count > len(records),

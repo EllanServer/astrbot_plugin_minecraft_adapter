@@ -166,11 +166,22 @@ class MineSentinelService:
         logger.info("[MineSentinel] 服务已启动")
 
     async def stop(self):
-        await self.runtime_log_tailer.stop()
-        await self._periodic_report_job.stop()
-        await self._hourly_job.stop()
+        # 每个清理操作独立 try/except，确保单点异常不跳过后续清理。
+        # CancelledError 继承 BaseException，不会被 Exception 捕获，可正常传播。
+        for cleanup in (
+            self.runtime_log_tailer.stop,
+            self._periodic_report_job.stop,
+            self._hourly_job.stop,
+        ):
+            try:
+                await cleanup()
+            except Exception as exc:
+                logger.warning(f"[MineSentinel] cleanup step failed: {exc}")
         # PR9: 关闭专用 bounded ThreadPoolExecutor（如有）。
-        shutdown_io_executor(self._io_executor)
+        try:
+            shutdown_io_executor(self._io_executor)
+        except Exception as exc:
+            logger.warning(f"[MineSentinel] cleanup step failed: {exc}")
         self._io_executor = None
 
     async def handle_batch(self, server_id: str, payload: dict):
@@ -427,8 +438,15 @@ class MineSentinelService:
         # Keep in-memory cycle buffer for the integration step.
         cycle_start = self._ensure_cycle_start(server_id, hour_start_ms)
         buf = self._hourly_cycle_buffers.setdefault(server_id, [])
-        # Drop any summaries that fall outside the current cycle window.
-        buf[:] = [h for h in buf if h.hour_start_ms >= cycle_start]
+        # Drop any summaries that fall outside the current cycle window，
+        # 并按 hour_start_ms 去重：full hour 的 summary 会替换同小时的 partial summary，
+        # 避免启动补读的 partial 与随后整点的 full hour 双重计入。
+        buf[:] = [
+            h
+            for h in buf
+            if h.hour_start_ms >= cycle_start
+            and h.hour_start_ms != hourly.hour_start_ms
+        ]
         buf.append(hourly)
         logger.info(
             f"[MineSentinel] hourly {server_id} 完成 "
@@ -605,14 +623,16 @@ class MineSentinelService:
             except Exception as exc:
                 self.last_error = f"读取硬盘 observation 失败: {exc}"
                 logger.error(f"[MineSentinel] {self.last_error}")
-        return RecentObservationWindow([], 0, 0, False, 0)
+        return RecentObservationWindow((), 0, 0, False, 0)
 
     async def _recent_records(
         self,
         window_minutes: int,
         server_id: str | None = None,
     ) -> list[ObservationRecord]:
-        return (await self._recent_window(window_minutes, server_id)).records
+        # records 字段为 tuple（M17 不可变约定），返回 list 副本以保持
+        # 既定 list[ObservationRecord] 返回契约不变。
+        return list((await self._recent_window(window_minutes, server_id)).records)
 
     async def _export_report_records(
         self,

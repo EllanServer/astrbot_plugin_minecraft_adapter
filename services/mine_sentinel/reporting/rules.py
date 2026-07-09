@@ -2906,6 +2906,8 @@ class HeuristicReportBuilder:
                 if (event["window_start_ms"] <= ts <= event["window_end_ms"]
                     and "chat_flood" not in record.tags):
                     record.tags.append("chat_flood")
+                    # 失效依赖 tags 的缓存，避免后续匹配用到不含新标签的旧文本。
+                    self._invalidate_record_text_caches(record)
                     # 记录刷屏类型到 context 供 LLM 呈现
                     ctx.setdefault("floodTypes", [])
                     if event["flood_type"] not in ctx["floodTypes"]:
@@ -2959,6 +2961,8 @@ class HeuristicReportBuilder:
                 for record, hit_keys in hits:
                     if "chat_abuse" not in (record.tags or []):
                         record.tags.append("chat_abuse")
+                        # 失效依赖 tags 的缓存，避免后续匹配用到不含新标签的旧文本。
+                        self._invalidate_record_text_caches(record)
                     ctx = record.context or {}
                     ctx.setdefault("abuseCategories", [])
                     if category not in ctx["abuseCategories"]:
@@ -3276,14 +3280,20 @@ class HeuristicReportBuilder:
         records: list[ObservationRecord],
         before: int = 2,
         after: int = 2,
+        index_map: dict[str, int] | None = None,
     ) -> list[dict[str, Any]]:
-        try:
-            index = next(
-                i for i, record in enumerate(records)
-                if record is target or record.event_id == target.event_id
-            )
-        except StopIteration:
-            index = -1
+        # 优先用预建的 event_id -> index 映射做 O(1) 查找，避免每次调用线性扫描。
+        index = -1
+        if index_map is not None:
+            index = index_map.get(target.event_id, -1)
+        if index < 0:
+            try:
+                index = next(
+                    i for i, record in enumerate(records)
+                    if record is target or record.event_id == target.event_id
+                )
+            except StopIteration:
+                index = -1
         if index < 0:
             window = [target]
         else:
@@ -3469,6 +3479,11 @@ class HeuristicReportBuilder:
         """
         # 第一步：按玩家聚合聊天记录，统计每个玩家的行为上下文
         all_records_sorted = sorted(chat_records, key=lambda r: r.timestamp or 0)
+        # 预建 event_id -> index 映射，供 _chat_context_items 做 O(1) 查找，
+        # 避免对每条证据样本都线性扫描 all_records_sorted。
+        context_index_map: dict[str, int] = {
+            record.event_id: i for i, record in enumerate(all_records_sorted)
+        }
         player_records: dict[str, list[ObservationRecord]] = defaultdict(list)
         for record in chat_records:
             ctx = record.context or {}
@@ -3530,6 +3545,7 @@ class HeuristicReportBuilder:
                         "context_messages": self._chat_context_items(
                             record,
                             all_records_sorted,
+                            index_map=context_index_map,
                         ),
                     })
                     if len(evidence) >= max_samples:
@@ -3934,6 +3950,18 @@ class HeuristicReportBuilder:
         if self._is_benign_mechanical_record(record, raw_content, text, level):
             score -= 60.0
         return score
+
+    def _invalidate_record_text_caches(self, record: ObservationRecord) -> None:
+        """修改 record.tags 后清除依赖 tags 的缓存，避免缓存与标签不同步。
+
+        _record_text_uncached 会把 tags 拼入文本，因此追加 chat_flood/chat_abuse
+        等标签后必须失效相关缓存，否则后续匹配用的是不含新标签的旧文本。
+        """
+        key = id(record)
+        self._record_text_cache.pop(key, None)
+        self._record_word_cache.pop(key, None)
+        self._benign_mechanical_cache.pop(key, None)
+        self._gate_classification_cache.pop(key, None)
 
     def _record_text(self, record: ObservationRecord) -> str:
         key = id(record)

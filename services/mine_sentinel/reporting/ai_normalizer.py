@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
 from .common import format_locations
 from .sections import normalize_report_sections
+
+logger = logging.getLogger(__name__)
 
 # LLM 产出的自由文本字段最大长度。超过截断，防止 LLM 滥用输出导致
 # 报告膨胀或借机注入大段文本。
@@ -56,13 +59,25 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
     try:
         data = json.loads(text)
         return data if isinstance(data, dict) else None
-    except Exception:
+    except Exception as exc:
+        logger.debug(f"[MineSentinel] parse_json_object 解析失败: {exc}")
         return None
 
 
 def repair_json_object_text(text: str) -> str:
-    match = re.search(r"\{.*\}", text, flags=re.S)
-    return match.group(0) if match else ""
+    # 先尝试非贪婪匹配（适合单层 JSON），失败再回退贪婪匹配（适合嵌套 JSON）。
+    # 仅返回能通过 json.loads 校验的候选，避免截断嵌套对象或吞掉多对象文本。
+    for pattern in (r"\{.*?\}", r"\{.*\}"):
+        match = re.search(pattern, text, flags=re.S)
+        if not match:
+            continue
+        candidate = match.group(0)
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            continue
+    return ""
 
 
 class AIReportNormalizer:

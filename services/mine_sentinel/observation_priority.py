@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import logging
+
 try:
     from mine_sentinel_rs import (
         observation_priority_score as _rs_observation_priority_score,
@@ -17,6 +19,8 @@ except ImportError:  # pragma: no cover - 纯 Python 降级路径
     _HAS_RUST = False
 
 from .models import ObservationRecord
+
+_logger = logging.getLogger(__name__)
 
 # 与 Rust 侧 server_log_priority 的 marker 列表保持一致；
 # 任一命中即给 +4.0 分（仅首个命中，break）。
@@ -59,7 +63,13 @@ def _python_priority_score(record: ObservationRecord) -> float:
 def observation_priority_score(record: ObservationRecord) -> float:
     """Score runtime log records that should survive bounded report sampling."""
     if _HAS_RUST:
-        return _rs_observation_priority_score(record)
+        try:
+            return _rs_observation_priority_score(record)
+        except Exception as exc:  # Rust 运行时异常时降级到纯 Python 实现
+            _logger.debug(
+                "Rust observation_priority_score 调用失败，回退到 Python 实现: %s",
+                exc,
+            )
     return _python_priority_score(record)
 
 

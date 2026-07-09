@@ -125,7 +125,7 @@ class AIReportPromptBuilder:
         ]
         anomaly_evidence = self.anomaly_evidence(records)
         chat_topics = self.compact_chat_topics(fallback.get("chat_topics") or {})
-        vulcan_alerts = fallback.get("vulcan_alerts") or []
+        vulcan_alerts = fallback.get("vulcan_alerts") or {}
         return self.fit_prompt(
             window_minutes,
             fallback_json,
@@ -198,10 +198,10 @@ class AIReportPromptBuilder:
         compact_records: list[dict[str, Any]],
         anomaly_evidence: list[dict[str, Any]],
         chat_topics: dict[str, Any] | None = None,
-        vulcan_alerts: list[dict[str, Any]] | None = None,
+        vulcan_alerts: dict[str, Any] | None = None,
     ) -> str:
         chat_topics_json = json.dumps(chat_topics or {}, ensure_ascii=False)
-        vulcan_alerts_json = json.dumps(vulcan_alerts or [], ensure_ascii=False)
+        vulcan_alerts_json = json.dumps(vulcan_alerts or {}, ensure_ascii=False)
         return (
             "你是 Minecraft 服务器只读旁路监控 MineSentinel 的报告代理。"
             "只输出合法 JSON，不要执行任何管理动作。"

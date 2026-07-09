@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -94,20 +95,28 @@ class AIReportSummarizer:
         prompts = self.issue_reviewer.build_prompts(records, fallback)
         if not prompts:
             return fallback, False
+        # 用 gather 并发评审多个候选 issue，Semaphore 限制 provider 并发度，
+        # 替代逐个串行 await。单个失败返回空串，不影响其余评审。
+        sem = asyncio.Semaphore(4)
+
+        async def review_one(prompt: str) -> str:
+            async with sem:
+                try:
+                    result = await provider.text_chat(
+                        prompt=prompt,
+                        system_prompt=self._SYSTEM_PROMPT,
+                        session_id="minesentinel-issue-review",
+                        persist=False,
+                    )
+                    return getattr(result, "completion_text", None) or ""
+                except Exception as exc:
+                    logger.debug(f"[MineSentinel] AstrBot issue review failed: {exc}")
+                    return ""
+
+        raw_results = await asyncio.gather(*(review_one(prompt) for prompt in prompts))
         decisions: list[dict[str, Any]] = []
         any_response = False
-        for prompt in prompts:
-            try:
-                result = await provider.text_chat(
-                    prompt=prompt,
-                    system_prompt=self._SYSTEM_PROMPT,
-                    session_id="minesentinel-issue-review",
-                    persist=False,
-                )
-                raw = getattr(result, "completion_text", None) or ""
-            except Exception as exc:
-                logger.debug(f"[MineSentinel] AstrBot issue review failed: {exc}")
-                continue
+        for raw in raw_results:
             if not raw:
                 continue
             any_response = True

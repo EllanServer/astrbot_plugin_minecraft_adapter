@@ -81,7 +81,7 @@ class HourlySummaryJob:
     @staticmethod
     def seconds_until_next_hour(now: float | None = None) -> float:
         now = now or time.time()
-        # Align to wall-clock hour boundary in local time.
+        # 按 UTC 整点对齐（time.time() 返回 UTC 时间戳，取模 3600 得到 UTC 整点偏移）。
         return 3600.0 - (now % 3600.0)
 
     async def _loop(self):

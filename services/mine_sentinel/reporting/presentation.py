@@ -91,6 +91,8 @@ def _sample_times(samples: list[Any], anchor_ts: int) -> list[int]:
 def _hms_to_millis(value: str, anchor_ts: int) -> int:
     anchor = time.localtime(anchor_ts / 1000)
     hour, minute, second = (int(part) for part in value.split(":"))
+    # tm_isdst=-1 让系统根据构造的日期/时间自行推断夏令时，避免直接沿用
+    # anchor 时刻的 tm_isdst 在 DST 切换边界产生时间偏移。
     candidate = time.mktime(
         (
             anchor.tm_year,
@@ -101,7 +103,7 @@ def _hms_to_millis(value: str, anchor_ts: int) -> int:
             second,
             anchor.tm_wday,
             anchor.tm_yday,
-            anchor.tm_isdst,
+            -1,
         )
     )
     ts = int(candidate * 1000)

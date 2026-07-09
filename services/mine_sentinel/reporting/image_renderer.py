@@ -196,7 +196,13 @@ class _ReportCanvas:
 
     def output(self) -> BytesIO:
         bottom = min(self.image.height, self.y + self.r.OUTER_PAD)
-        return save_png(self.image.crop((0, 0, self.r.WIDTH, bottom)))
+        # 显式管理 crop 产物与底层 image 的生命周期，避免 Pillow Image 对象泄漏。
+        cropped = self.image.crop((0, 0, self.r.WIDTH, bottom))
+        try:
+            return save_png(cropped)
+        finally:
+            cropped.close()
+            self.image.close()
 
     def header(self, title: str, subtitle: str):
         x = self.r.OUTER_PAD
@@ -470,15 +476,19 @@ class _ReportCanvas:
         value = text
         if self.draw.textlength(value, font=font) > max_w:
             ellipsis = "..."
-            cut = len(value)
-            while cut > 0:
-                candidate = value[:cut].rstrip() + ellipsis
+            # textlength 对前缀长度单调，用二分查找最大前缀 cut 使
+            # value[:cut].rstrip() + ellipsis 不超宽，替代逐字符递减的 O(n) 测量。
+            lo, hi = 0, len(value)
+            best = 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                candidate = value[:mid].rstrip() + ellipsis
                 if self.draw.textlength(candidate, font=font) <= max_w:
-                    value = candidate
-                    break
-                cut -= 1
-            else:
-                value = ellipsis
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            value = value[:best].rstrip() + ellipsis
         self.draw.text((x, y), value, font=font, fill=color)
 
     def _wrap(self, text: str, max_width: int, font) -> list[str]:
@@ -500,9 +510,16 @@ class _ReportCanvas:
                     result.append(line.rstrip())
                     line = token.lstrip()
                 while line and self.draw.textlength(line, font=font) > max_width:
-                    cut = max(1, len(line) - 1)
-                    while cut > 1 and self.draw.textlength(line[:cut], font=font) > max_width:
-                        cut -= 1
+                    # 二分查找最大前缀 cut 使 line[:cut] 不超宽，至少保留 1 字符。
+                    lo, hi = 1, max(1, len(line) - 1)
+                    cut = 1
+                    while lo <= hi:
+                        mid = (lo + hi) // 2
+                        if self.draw.textlength(line[:mid], font=font) <= max_width:
+                            cut = mid
+                            lo = mid + 1
+                        else:
+                            hi = mid - 1
                     result.append(line[:cut].rstrip())
                     line = line[cut:].lstrip()
             if line:

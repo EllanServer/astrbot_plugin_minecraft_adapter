@@ -36,7 +36,11 @@ per-row ``_last_seen_ts`` tracking is active.
 from __future__ import annotations
 
 import bisect
+import logging
+import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class JsonlOffsetIndex:
@@ -206,8 +210,10 @@ class JsonlOffsetIndex:
                     self._offsets.append(off)
         except FileNotFoundError:
             pass
-        except OSError:
-            pass
+        except (OSError, ValueError) as exc:
+            # UnicodeDecodeError 继承 ValueError，不被 OSError 捕获；
+            # 索引文件损坏时按空索引继续（不抛异常），仅记 debug 日志便于排查。
+            logger.debug("加载索引失败，按空索引继续: %s", self.index_path, exc_info=True)
         # Legacy file: no #trust_legacy header → we cannot prove per-row
         # ordering between index entries. When configured conservative,
         # treat as non-monotonic so reads fall back to full scan.
@@ -262,12 +268,23 @@ class JsonlOffsetIndex:
             return
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         if needs_header_rewrite:
-            # Rewrite the entire file with headers. Rare path.
-            with self.index_path.open("w", encoding="utf-8") as handle:
-                handle.write(f"#trust_legacy\t{1 if self._trust_legacy else 0}\n")
-                handle.write(f"#monotonic\t{1 if self._monotonic else 0}\n")
-                for ts, off in zip(self._timestamps, self._offsets):
-                    handle.write(f"{ts}\t{off}\n")
+            # 原子重写：先写临时文件再 os.replace 替换，避免 "w" 直接覆写时
+            # 写入中途崩溃截断索引、导致读路径 seek 到错误偏移或漏记录。
+            # 临时文件 .idx.tmp，replace 后恢复为 .idx。
+            tmp_path = self.index_path.with_suffix(".idx.tmp")
+            try:
+                with tmp_path.open("w", encoding="utf-8") as handle:
+                    handle.write(f"#trust_legacy\t{1 if self._trust_legacy else 0}\n")
+                    handle.write(f"#monotonic\t{1 if self._monotonic else 0}\n")
+                    for ts, off in zip(self._timestamps, self._offsets):
+                        handle.write(f"{ts}\t{off}\n")
+                os.replace(tmp_path, self.index_path)
+            finally:
+                # 写失败或 replace 失败时清理残留临时文件（成功后已不存在）。
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             self._persisted_count = len(self._timestamps)
             self._monotonic_persisted = True
             self._trust_legacy_persisted = True

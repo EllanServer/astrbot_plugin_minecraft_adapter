@@ -83,17 +83,23 @@ class FontProvider:
 
     async def ensure_cached(self):
         self.font_dir.mkdir(parents=True, exist_ok=True)
-        if self.font_path.exists() and self.font_path.stat().st_size > 0:
-            self._resolved_source = str(self.font_path)
-            return
+        # 避免 exists() 与 stat() 之间的 TOCTOU 竞态：直接 stat()，文件被删除
+        # 时抛 FileNotFoundError。
+        try:
+            if self.font_path.stat().st_size > 0:
+                self._resolved_source = str(self.font_path)
+                return
+        except FileNotFoundError:
+            pass
         if aiohttp is None:
             logger.warning("[Renderer] aiohttp 不可用，跳过字体下载")
             return
 
         timeout = aiohttp.ClientTimeout(total=60)
-        for url in self.urls:
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
+        # 复用同一个 ClientSession 跨多个 URL，避免每 URL 新建连接池的开销。
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for url in self.urls:
+                try:
                     async with session.get(url) as resp:
                         if resp.status != 200:
                             continue
@@ -112,32 +118,32 @@ class FontProvider:
                         if data is None:
                             continue
                         data = bytes(data)
-                if len(data) < MIN_FONT_DOWNLOAD_BYTES:
-                    continue
-                # 校验字体头部魔数，挡掉 HTML 错误页/脚本等非字体二进制。
-                if not _is_valid_ttf_header(data):
-                    logger.debug(f"[Renderer] 字体头部魔数非法，跳过: {url}")
-                    continue
-                # 若配置了 SHA-256，强制校验；不匹配则拒绝落盘。
-                if DEFAULT_FONT_SHA256:
-                    digest = _sha256_hex(data)
-                    if digest != DEFAULT_FONT_SHA256:
-                        logger.warning(
-                            f"[Renderer] 字体 SHA-256 不匹配，拒绝落盘: {url} "
-                            f"(expected={DEFAULT_FONT_SHA256[:12]}..., got={digest[:12]}...)"
-                        )
+                    if len(data) < MIN_FONT_DOWNLOAD_BYTES:
                         continue
-                # 原子写：先写临时文件再 rename，避免并发写盘竞态写出损坏字体。
-                tmp_path = self.font_path.with_suffix(self.font_path.suffix + ".tmp")
-                tmp_path.write_bytes(data)
-                tmp_path.replace(self.font_path)
-                logger.info(
-                    f"[Renderer] 已缓存中文字体: {self.font_path.name} ({len(data) // 1024}KB)"
-                )
-                self._resolved_source = str(self.font_path)
-                return
-            except Exception as exc:
-                logger.debug(f"[Renderer] 字体下载失败: {url} -> {exc}")
+                    # 校验字体头部魔数，挡掉 HTML 错误页/脚本等非字体二进制。
+                    if not _is_valid_ttf_header(data):
+                        logger.debug(f"[Renderer] 字体头部魔数非法，跳过: {url}")
+                        continue
+                    # 若配置了 SHA-256，强制校验；不匹配则拒绝落盘。
+                    if DEFAULT_FONT_SHA256:
+                        digest = _sha256_hex(data)
+                        if digest != DEFAULT_FONT_SHA256:
+                            logger.warning(
+                                f"[Renderer] 字体 SHA-256 不匹配，拒绝落盘: {url} "
+                                f"(expected={DEFAULT_FONT_SHA256[:12]}..., got={digest[:12]}...)"
+                            )
+                            continue
+                    # 原子写：先写临时文件再 rename，避免并发写盘竞态写出损坏字体。
+                    tmp_path = self.font_path.with_suffix(self.font_path.suffix + ".tmp")
+                    tmp_path.write_bytes(data)
+                    tmp_path.replace(self.font_path)
+                    logger.info(
+                        f"[Renderer] 已缓存中文字体: {self.font_path.name} ({len(data) // 1024}KB)"
+                    )
+                    self._resolved_source = str(self.font_path)
+                    return
+                except Exception as exc:
+                    logger.debug(f"[Renderer] 字体下载失败: {url} -> {exc}")
         logger.warning("[Renderer] 字体下载失败，将回退到系统字体")
 
     def font(self, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -154,14 +160,19 @@ class FontProvider:
         """Return the best available font source path/name, cached on first use."""
         if self._resolved_source is not None:
             return self._resolved_source
-        if self.font_path.exists() and self.font_path.stat().st_size > 0:
-            self._resolved_source = str(self.font_path)
-            return self._resolved_source
+        # 避免 exists() 与 stat() 之间的 TOCTOU 竞态。
+        try:
+            if self.font_path.stat().st_size > 0:
+                self._resolved_source = str(self.font_path)
+                return self._resolved_source
+        except FileNotFoundError:
+            pass
         try:
             from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
             custom_font = Path(get_astrbot_data_path()) / "font.ttf"
-            if custom_font.exists() and custom_font.stat().st_size > 0:
+            # 直接 stat()，文件不存在时由下方 except 捕获。
+            if custom_font.stat().st_size > 0:
                 self._resolved_source = str(custom_font)
                 return self._resolved_source
         except Exception:

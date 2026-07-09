@@ -119,9 +119,12 @@ class ObservationRecordCodec:
     # ------------------------------------------------------------------
     def read_jsonl(self, path: Path):
         try:
-            with path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    line = line.strip()
+            # 用二进制模式打开并 decode(errors="replace")，与 read_jsonl_window
+            # 对齐：文本模式 + strict 会在遇到非法字节时抛 UnicodeDecodeError
+            # 中断迭代，而 errors="replace" 能容忍损坏字节继续读后续行。
+            with path.open("rb") as handle:
+                for raw_line in handle:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
                     try:
@@ -130,7 +133,7 @@ class ObservationRecordCodec:
                         continue
                     if isinstance(data, dict):
                         yield data
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             return
 
     def read_jsonl_window(

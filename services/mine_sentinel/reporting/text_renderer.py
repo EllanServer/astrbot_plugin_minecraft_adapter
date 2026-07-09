@@ -112,7 +112,7 @@ def format_report(report: dict, total_count: int, dedupe_count: int, unique_play
             lines.append(f"- {line}")
 
     lines.extend(["", "建议处理"])
-    _append_numbered(lines, _action_lines(issues))
+    _append_numbered(lines, _action_lines(issues, incident_groups, observation_groups))
 
     lines.extend(
         [
@@ -955,11 +955,19 @@ def _risk_lines(
     return lines[:MAX_RISK_LINES + 3]
 
 
-def _action_lines(issues: list[dict[str, Any]]) -> list[str]:
+def _action_lines(
+    issues: list[dict[str, Any]],
+    incident_groups: list[IncidentGroup] | None = None,
+    observation_groups: list[IncidentGroup] | None = None,
+) -> list[str]:
     actions: list[str] = []
     seen: set[str] = set()
-    groups = _INCIDENT_GROUPER.group(_ISSUE_POLICY.actionable_issues(issues))
-    incidents, observations = _split_incident_groups(groups)
+    incidents = incident_groups
+    observations = observation_groups
+    if incidents is None or observations is None:
+        # 向后兼容：未传入已计算的分组时回退到重新分组。
+        groups = _INCIDENT_GROUPER.group(_ISSUE_POLICY.actionable_issues(issues))
+        incidents, observations = _split_incident_groups(groups)
     grouped_issues = [issue for group in (incidents + observations) for issue in group.issues]
     ops_subtypes = set(_unique_issue_values(grouped_issues, "ops_subtypes"))
     chat_labels = set(_unique_issue_values(grouped_issues, "chat_labels"))
@@ -1084,7 +1092,11 @@ def _format_attachment(report: dict) -> str:
 def _format_players(players: list[str]) -> str:
     if not players:
         return "未知"
-    shown = [str(player) for player in players[:16] if str(player)]
+    # 先过滤空字符串与纯空白，再切片和计数，避免 "等 N 人" 把空玩家算进去。
+    players = [str(p).strip() for p in players if str(p).strip()]
+    if not players:
+        return "未知"
+    shown = players[:16]
     text = "、".join(shown)
     if len(players) > len(shown):
         text += f" 等 {len(players)} 人"

@@ -19,6 +19,24 @@ class MineSentinelAlertEngine:
         self._alert_cooldowns: dict[str, float] = {}
         self._last_analysis: dict[str, float] = {}
 
+    def _cleanup_dicts(self, now: float) -> None:
+        """清理过期的 cooldown/analysis 条目，避免字典无界增长。
+
+        仅保留最近 2 倍间隔内的条目，已过期 2 倍以上的视为不再活跃可安全移除。
+        """
+        analysis_ttl = self.config.alert.analysis_interval_seconds * 2
+        cooldown_ttl = self.config.alert.cooldown_seconds * 2
+        self._last_analysis = {
+            sid: ts
+            for sid, ts in self._last_analysis.items()
+            if now - ts <= analysis_ttl
+        }
+        self._alert_cooldowns = {
+            key: ts
+            for key, ts in self._alert_cooldowns.items()
+            if now - ts <= cooldown_ttl
+        }
+
     def should_analyze(self, server_id: str) -> bool:
         if not self.config.alert.enabled:
             return False
@@ -28,6 +46,7 @@ class MineSentinelAlertEngine:
             < self.config.alert.analysis_interval_seconds
         ):
             return False
+        self._cleanup_dicts(now)
         self._last_analysis[server_id] = now
         return True
 
@@ -43,6 +62,7 @@ class MineSentinelAlertEngine:
                 < self.config.alert.cooldown_seconds
             ):
                 continue
+            self._cleanup_dicts(now)
             self._alert_cooldowns[key] = now
             signal_count = issue.get("signal_count")
             evidence_count = issue.get("evidence_count")

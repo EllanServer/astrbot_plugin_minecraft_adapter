@@ -210,21 +210,29 @@ class AIIssueReviewer:
             for index, record in enumerate(records)
         }
         content_index: list[tuple[str, int]] = []
+        # 精确匹配字典：normalized content -> 首次出现的 record index，O(1) 命中。
+        content_exact: dict[str, int] = {}
         for index, record in enumerate(records):
             context = record.context or {}
             for value in (context.get("llmCleanText"), record.content):
                 normalized = _normalize_text(str(value or ""))
                 if normalized:
                     content_index.append((normalized, index))
+                    content_exact.setdefault(normalized, index)
 
+        # 子串扫描上限：避免对超大记录列表做 O(n²) 子串匹配。
+        substring_scan_limit = 1000
         for sample in samples:
             for line in _sample_lines(sample):
                 normalized = _normalize_text(line)
                 index = evidence_index.get(normalized)
+                if index is None:
+                    index = content_exact.get(normalized)
                 if index is not None:
                     _append_unique_int(hits, index)
                     continue
-                for content, record_index in content_index:
+                # 精确未命中再对有限记录做子串扫描（双向包含检查）。
+                for content, record_index in content_index[:substring_scan_limit]:
                     if content and (content in normalized or normalized in content):
                         _append_unique_int(hits, record_index)
                         break

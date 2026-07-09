@@ -110,7 +110,8 @@ class LogTemplateMiner:
         self._sim_th = sim_th
         self._max_depth = max_depth
         self._max_children = max_children
-        self._max_namespaces = max_namespaces
+        # M30: clamp 到最小 1，避免 0/负数导致 _resolve_namespace 永远回落 default。
+        self._max_namespaces = max(1, int(max_namespaces))
         # per-server drain3 miners
         self._miners: dict[str, Any] = {}
         # per-server fallback state used when drain3 is unavailable. It keeps
@@ -260,9 +261,9 @@ class LogTemplateMiner:
             params: list[str] = []
             try:
                 params = list(miner.get_parameter_list(line, extract_parameters=True))
-            except Exception:
+            except Exception as exc:
                 # 参数提取失败不影响模板去重
-                pass
+                logger.debug(f"[MineSentinel] parameter extraction failed: {exc}")
 
             return ParsedTemplate(
                 template_id=cluster_id,

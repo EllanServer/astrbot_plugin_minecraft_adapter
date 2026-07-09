@@ -35,6 +35,22 @@ except ImportError:  # pragma: no cover - optional native extension fallback
     _rs_runtime_log_time_parts_batch = None
     _HAS_RUST_RUNTIME_HINTS = False
 
+# M28: Rust 扩展失败时按固定间隔记 WARNING，避免持续降级不可见。
+_rust_fail_logged_at: float = 0.0
+_RUST_FAIL_LOG_INTERVAL = 300.0
+
+
+def _log_rust_fallback_failure(message: str, exc: BaseException) -> None:
+    """Rust 扩展失败时按 5 分钟间隔记 WARNING，间隔内仅记 DEBUG，避免刷屏。"""
+    global _rust_fail_logged_at
+    now = time.time()
+    if now - _rust_fail_logged_at > _RUST_FAIL_LOG_INTERVAL:
+        logger.warning(f"[MineSentinel] {message}: {exc}")
+        _rust_fail_logged_at = now
+    else:
+        logger.debug(f"[MineSentinel] {message}: {exc}")
+
+
 from .models import (
     DEFAULT_DAILY_NOISE_PATTERNS,
     MineSentinelLogSourceConfig,
@@ -444,6 +460,9 @@ class MineSentinelRuntimeLogTailer:
         max_backoff = self._max_backoff_seconds
         consecutive_failures = 0
         while not self._stopping.is_set():
+            # M22: 记录本轮启动时刻；若已稳定运行超过 60 秒后崩溃，视为偶发，
+            # 复位 consecutive_failures 与 backoff，避免长期累计导致永久放弃。
+            start_time = time.monotonic()
             try:
                 await self._run_source_loop(source, log_file)
                 # Normal exit (stopping) — no retry needed.
@@ -451,6 +470,9 @@ class MineSentinelRuntimeLogTailer:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if time.monotonic() - start_time > 60:
+                    consecutive_failures = 0
+                    backoff = self._initial_backoff_seconds
                 consecutive_failures += 1
                 logger.error(
                     f"[MineSentinel] runtime log source {source.server_id} crashed "
@@ -473,9 +495,15 @@ class MineSentinelRuntimeLogTailer:
         state = _SourceState(source=source, log_file=log_file)
         if self.config.backfill_on_start:
             await self._backfill_source(state, self.config.backfill_window_minutes)
+            state.position = await self.io_runner(_file_size, state.log_file) or 0
         elif self.config.initial_lines:
+            # M20: 先记录 initial_size 再读 tail，避免 tail 读取与 position 设置
+            # 之间写入的行被永久跳过。
+            initial_size = await self.io_runner(_file_size, state.log_file)
             await self._emit_initial_tail(state)
-        state.position = await self.io_runner(_file_size, state.log_file) or 0
+            state.position = initial_size or 0
+        else:
+            state.position = await self.io_runner(_file_size, state.log_file) or 0
         while not self._stopping.is_set():
             await asyncio.sleep(max(1, self.config.poll_interval_seconds))
             await self._poll_source(state)
@@ -515,6 +543,9 @@ class MineSentinelRuntimeLogTailer:
             backfill_candidates = await self._backfill_source(
                 state,
                 max(10, self.config.poll_interval_seconds * 3 // 60 + 1),
+                # M21: 轮转路径传入已处理的最大时间戳，跳过此前已 emit 的行，
+                # 避免 backfill 重新扫描 logs_dir 时重复 emit 近窗口日志。
+                skip_before_ms=state.last_timestamp_ms,
             )
             if _path_in_list(state.log_file, backfill_candidates):
                 new_size = await self.io_runner(_file_size, state.log_file)
@@ -567,7 +598,10 @@ class MineSentinelRuntimeLogTailer:
         await self._emit_lines(state, lines, state.log_file)
 
     async def _backfill_source(
-        self, state: _SourceState, window_minutes: int
+        self,
+        state: _SourceState,
+        window_minutes: int,
+        skip_before_ms: int = 0,
     ) -> list[Path]:
         cutoff_ms = int((time.time() - max(1, window_minutes) * 60) * 1000)
         candidates = await self.io_runner(
@@ -587,11 +621,23 @@ class MineSentinelRuntimeLogTailer:
         observations: list[dict[str, Any]] = []
         emitted = 0
         emit_threshold = max(1, self.config.max_lines_per_poll)
+        # M21: skip_before_ms > 0 时（轮转路径），跳过 timestamp 小于该值的行，
+        # 这些行已在之前 poll 中 emit 过。非轮转的 backfill_on_start 不传该参数，
+        # 默认 0 不过滤。
+        filtered_rows = [
+            (line, timestamp_ms, path_text)
+            for line, timestamp_ms, path_text in rows
+            if timestamp_ms >= skip_before_ms
+        ]
+        if not filtered_rows:
+            return candidates
         hints_batch = _runtime_log_hints_batch(
-            [line for line, _timestamp_ms, _path_text in rows],
+            [line for line, _timestamp_ms, _path_text in filtered_rows],
             self.config.max_line_length,
         )
-        for (line, timestamp_ms, path_text), hints in zip(rows, hints_batch, strict=True):
+        for (line, timestamp_ms, path_text), hints in zip(
+            filtered_rows, hints_batch, strict=True
+        ):
             observations.extend(
                 self.loop_filter.process(
                     _build_observation(
@@ -697,6 +743,8 @@ class MineSentinelRuntimeLogTailer:
     async def _emit_observations(self, observations: list[dict[str, Any]]):
         if not observations:
             return
+        # M23: max_lines_per_poll 可能为 0/负数，用 max(1, ...) 保护切片步长与窗口。
+        step = max(1, self.config.max_lines_per_poll)
         by_server: dict[str, list[dict[str, Any]]] = {}
         names: dict[str, str] = {}
         for observation in observations:
@@ -704,8 +752,8 @@ class MineSentinelRuntimeLogTailer:
             by_server.setdefault(server_id, []).append(observation)
             names.setdefault(server_id, str(observation.get("serverName") or server_id))
         for server_id, items in by_server.items():
-            for index in range(0, len(items), max(1, self.config.max_lines_per_poll)):
-                chunk = items[index : index + self.config.max_lines_per_poll]
+            for index in range(0, len(items), step):
+                chunk = items[index : index + step]
                 await self.batch_handler(
                     server_id,
                     {
@@ -1170,7 +1218,8 @@ def _backfill_candidates(
             recent.append(path)
     recent.sort(key=lambda item: _safe_mtime(item), reverse=True)
     recent = recent[: max(1, config.max_backfill_files)]
-    recent.sort(key=lambda item: _safe_mtime(item))
+    # M24: 保持 newest-first（降序），让 _read_backfill_lines 先读最新文件
+    # （latest.log 通常 mtime 最新，排在最前），避免 cap 达到后漏读最新数据。
     return recent
 
 
@@ -1178,12 +1227,17 @@ def _iter_log_file(path: Path):
     try:
         if path.name.lower().endswith(".gz"):
             with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
-                yield from handle
+                # M19: 先全量读入列表再 yield，避免消费方提前 return 时延迟关闭句柄。
+                # .gz 归档通常不大，全量读取可接受。
+                lines = list(handle)
         else:
             with path.open("r", encoding="utf-8", errors="replace") as handle:
-                yield from handle
-    except OSError:
+                lines = list(handle)
+    except (OSError, EOFError):
+        # M18: 截断的 .gz 在读取中途会抛 EOFError，需与 OSError 一并吞掉。
         return
+    for line in lines:
+        yield line
 
 
 def _iter_timestamped_lines(
@@ -1844,7 +1898,7 @@ def _runtime_log_hints(line: str, max_line_length: int) -> dict[str, Any]:
             if isinstance(hints, dict):
                 return hints
         except Exception as exc:  # pragma: no cover - native fallback guard
-            logger.debug(f"[MineSentinel] Rust runtime_log_hints failed: {exc}")
+            _log_rust_fallback_failure("Rust runtime_log_hints failed", exc)
     return _python_runtime_log_hints(line, max_line_length)
 
 
@@ -1860,7 +1914,7 @@ def _runtime_log_hints_batch(lines: list[str], max_line_length: int) -> list[dic
                     for item, line in zip(hints, lines, strict=True)
                 ]
         except Exception as exc:  # pragma: no cover - native fallback guard
-            logger.debug(f"[MineSentinel] Rust runtime_log_hints_batch failed: {exc}")
+            _log_rust_fallback_failure("Rust runtime_log_hints_batch failed", exc)
     if _HAS_RUST_RUNTIME_HINTS and _rs_runtime_log_hints is not None:
         return [_runtime_log_hints(line, max_line_length) for line in lines]
     return [_python_runtime_log_hints(line, max_line_length) for line in lines]
@@ -1888,7 +1942,7 @@ def _runtime_log_time_parts_batch(
             if isinstance(parts, list) and len(parts) == len(lines):
                 return [_coerce_time_parts(item) for item in parts]
         except Exception as exc:  # pragma: no cover - native fallback guard
-            logger.debug(f"[MineSentinel] Rust runtime_log_time_parts_batch failed: {exc}")
+            _log_rust_fallback_failure("Rust runtime_log_time_parts_batch failed", exc)
     return [_python_log_time_parts(line) for line in lines]
 
 
@@ -2383,12 +2437,13 @@ def _clean_for_llm(line: str) -> tuple[str, int, list[str]]:
         (_LONG_TOKEN_RE, "<token>", "redacted_token"),
     ]
     for pattern, replacement, flag in replacements:
-        matches = pattern.findall(text)
-        if matches:
-            redaction_count += len(matches)
+        # M26: 用 subn 一次扫描完成替换+计数，替代 findall+sub 双倍扫描。
+        new_text, count = pattern.subn(replacement, text)
+        if count:
+            redaction_count += count
             if flag not in flags:
                 flags.append(flag)
-            text = pattern.sub(replacement, text)
+            text = new_text
     collapsed = _SPACE_RE.sub(" ", text).strip()
     if collapsed != text.strip():
         flags.append("whitespace_collapsed")

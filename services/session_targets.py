@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from typing import Any
+
+_logger = logging.getLogger(__name__)
 
 
 GROUP_MESSAGE = "GroupMessage"
@@ -217,7 +220,9 @@ def _platform_meta(platform_inst: Any) -> Any:
     if callable(meta):
         try:
             return meta()
-        except Exception:
+        except Exception as exc:
+            # 平台 meta() 调用失败时记录 debug 日志，便于排查而避免静默吞异常。
+            _logger.debug("读取 platform meta 失败: %s", exc)
             return None
     return meta
 

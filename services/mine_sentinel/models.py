@@ -259,22 +259,22 @@ class MineSentinelConfig:
             max(DEFAULT_REPORT_INTERVAL_MINUTES, default_window_minutes, interval_minutes),
         )
         return cls(
-            enabled=data.get("enabled", True),
+            enabled=_as_bool(data.get("enabled"), True),
             retention_minutes=max(retention_minutes, default_window_minutes),
             max_tags_per_record=_positive_int(data.get("max_tags_per_record"), 8),
             max_raw_fields=_positive_int(data.get("max_raw_fields"), 16),
             dedupe_window_seconds=_positive_int(data.get("dedupe_window_seconds"), 120),
             storage=MineSentinelStorageConfig(
-                enabled=bool(storage_data.get("enabled", True)),
+                enabled=_as_bool(storage_data.get("enabled"), True),
                 retention_minutes=max(
                     _positive_int(storage_data.get("retention_minutes"), retention_minutes),
                     default_window_minutes,
                 ),
                 cleanup_interval_seconds=max(
-                    0,
+                    1,
                     _as_int(storage_data.get("cleanup_interval_seconds"), 300),
                 ),
-                include_raw=bool(storage_data.get("include_raw", False)),
+                include_raw=_as_bool(storage_data.get("include_raw"), False),
                 max_content_length=_positive_int(
                     storage_data.get("max_content_length"),
                     4000,
@@ -402,12 +402,12 @@ class MineSentinelConfig:
             ),
             report=MineSentinelReportConfig(
                 default_window_minutes=default_window_minutes,
-                send_to_target_sessions=bool(report_data.get("send_to_target_sessions", True)),
+                send_to_target_sessions=_as_bool(report_data.get("send_to_target_sessions"), True),
                 delivery_targets=_list_values(report_data.get("delivery_targets")),
-                include_evidence_samples=bool(report_data.get("include_evidence_samples", True)),
+                include_evidence_samples=_as_bool(report_data.get("include_evidence_samples"), True),
                 max_evidence_samples=_positive_int(report_data.get("max_evidence_samples"), 5),
                 provider_id=str(report_data.get("provider_id", "")),
-                enabled=bool(report_data.get("enabled", True)),
+                enabled=_as_bool(report_data.get("enabled"), True),
                 interval_minutes=interval_minutes,
                 cooldown_seconds=max(0, _as_int(report_data.get("cooldown_seconds"), 600)),
                 max_ai_records=_positive_int(report_data.get("max_ai_records"), 120),
@@ -423,26 +423,26 @@ class MineSentinelConfig:
                     report_data.get("max_ai_content_length"),
                     240,
                 ),
-                send_full_log_file=bool(report_data.get("send_full_log_file", True)),
-                send_as_image=bool(report_data.get("send_as_image", True)),
+                send_full_log_file=_as_bool(report_data.get("send_full_log_file"), True),
+                send_as_image=_as_bool(report_data.get("send_as_image"), True),
                 export_format=_enum_choice(
                     report_data.get("export_format"),
                     _VALID_EXPORT_FORMATS,
                     "jsonl",
                     "report.export_format",
                 ),
-                export_reuse_existing=bool(
-                    report_data.get("export_reuse_existing", True)
+                export_reuse_existing=_as_bool(
+                    report_data.get("export_reuse_existing"), True
                 ),
             ),
             alert=MineSentinelAlertConfig(
-                enabled=bool(alert_data.get("enabled", False)),
+                enabled=_as_bool(alert_data.get("enabled"), False),
                 min_severity=str(alert_data.get("min_severity", "high")),
                 cooldown_seconds=max(0, _as_int(alert_data.get("cooldown_seconds"), 600)),
                 min_evidence_count=_positive_int(alert_data.get("min_evidence_count"), 3),
                 window_minutes=_positive_int(alert_data.get("window_minutes"), 30),
                 analysis_interval_seconds=max(
-                    0,
+                    1,
                     _as_int(alert_data.get("analysis_interval_seconds"), 60),
                 ),
             ),

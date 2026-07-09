@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import logging
 import threading
 import time
 from contextlib import ExitStack
@@ -23,6 +24,8 @@ from .paths import (
     safe_name,
 )
 from .window import RecentWindowBuilder
+
+logger = logging.getLogger(__name__)
 
 
 class DiskObservationStore:
@@ -53,6 +56,9 @@ class DiskObservationStore:
 
     def add_batch(self, server_id: str, payload: dict[str, Any]) -> int:
         if not self.config.enabled or not self.config.storage.enabled:
+            return 0
+        # 防御 payload 非 dict（None/str 等）：否则下方 payload.get 抛 AttributeError。
+        if not isinstance(payload, dict):
             return 0
 
         observations = payload.get("observations") or []
@@ -112,10 +118,19 @@ class DiskObservationStore:
                         idx.load()
                         indexes[path] = idx
                     idx = indexes[path]
-                    line_offset = handle.tell()
+                    # 先 write 成功再 maybe_index：避免 json_line/encode/write
+                    # 抛异常时索引已记录未写入的位置（指向 EOF 漏记录）。
+                    # line_offset 仍在 write 前 tell()，确保指向本行起始字节。
+                    try:
+                        line_offset = handle.tell()
+                        payload_bytes = self.codec.json_line(record).encode("utf-8")
+                        handle.write(payload_bytes)
+                        handle.write(b"\n")
+                    except Exception:
+                        # 单条序列化/写入失败不中断整个 batch（与 normalize_record 容错一致）。
+                        skipped += 1
+                        continue
                     idx.maybe_index(record.timestamp, line_offset)
-                    handle.write(self.codec.json_line(record).encode("utf-8"))
-                    handle.write(b"\n")
                     written += 1
 
                 # 先 flush 数据句柄，再 flush 索引：避免索引先落盘指向尚未
@@ -124,7 +139,9 @@ class DiskObservationStore:
                     try:
                         handle.flush()
                     except Exception:
-                        pass
+                        # flush 失败破坏"数据先于索引落盘"不变量，但仍不中断
+                        # batch（保持容错）；记 warning 以便可观测、排查落盘问题。
+                        logger.warning("observation 数据 flush 失败", exc_info=True)
                 # Flush all touched indexes so reads can use them immediately.
                 for idx in indexes.values():
                     idx.flush()
@@ -133,6 +150,9 @@ class DiskObservationStore:
             # New observations invalidate the cached window read.
             self._window_cache_key = None
             self._window_cache_value = None
+            # skipped 计数只记日志，不改返回签名（避免影响调用方）。
+            if skipped > 0:
+                logger.warning("add_batch 跳过 %d 条畸形 observation", skipped)
             return written
 
     def recent(
@@ -140,7 +160,9 @@ class DiskObservationStore:
         window_minutes: int,
         server_id: str | None = None,
     ) -> list[ObservationRecord]:
-        return self.recent_window(window_minutes, server_id).records
+        # records 字段为 tuple（M17 不可变约定），此处返回 list 副本以保持
+        # 既定 list[ObservationRecord] 返回契约不变（fresh 副本，无缓存共享风险）。
+        return list(self.recent_window(window_minutes, server_id).records)
 
     def recent_window(
         self,
@@ -149,7 +171,7 @@ class DiskObservationStore:
         max_records: int | None = None,
     ) -> RecentObservationWindow:
         if not self.config.enabled or not self.config.storage.enabled:
-            return RecentObservationWindow([], 0, 0, False, 0)
+            return RecentObservationWindow((), 0, 0, False, 0)
 
         with self._lock:
             cache_key = (window_minutes, server_id)
@@ -160,12 +182,12 @@ class DiskObservationStore:
                 and now - self._window_cache_at < self._window_cache_ttl
                 and max_records is None
             ):
-                # 返回缓存的浅拷贝：records 是可变 list，调用方就地修改会
-                # 污染缓存。RecentObservationWindow 是 frozen，但 list 字段
-                # 本身可变，故复制 list。
+                # 返回缓存的浅拷贝：records 是 tuple（不可变），复制一份新
+                # tuple 返回，避免调用方持有缓存内部对象的引用（即便 tuple
+                # 不可变，仍隔离对象身份，便于调用方安全使用）。
                 cached = self._window_cache_value
                 return RecentObservationWindow(
-                    records=list(cached.records),
+                    records=tuple(cached.records),
                     total_count=cached.total_count,
                     unique_players=cached.unique_players,
                     truncated=cached.truncated,
@@ -204,6 +226,16 @@ class DiskObservationStore:
                 self._window_cache_key = cache_key
                 self._window_cache_value = result
                 self._window_cache_at = now
+                # cache-miss 时缓存与返回若是同一对象，调用方修改 records 会
+                # 污染缓存。存入缓存的用原 result，返回的用副本（与 cache-hit
+                # 路径一致）。
+                return RecentObservationWindow(
+                    records=tuple(result.records),
+                    total_count=result.total_count,
+                    unique_players=result.unique_players,
+                    truncated=result.truncated,
+                    max_records=result.max_records,
+                )
             return result
 
     def _export_suffix(self) -> str:
@@ -271,9 +303,12 @@ class DiskObservationStore:
             return None
 
         with self._lock:
-            now_ts = int(time.time())
-            cutoff_ms = int((now_ts - window_minutes * 60) * 1000)
-            end_ms = int(now_ts * 1000) + 1
+            # 用浮点 time.time() 计算 cutoff_ms/end_ms，与 recent_window 对齐
+            # （recent_window 用 time.time() 浮点秒）。之前用 int(time.time())
+            # 截断到秒级，与 recent_window 的毫秒级窗口边界不一致。
+            now = time.time()
+            cutoff_ms = int((now - window_minutes * 60) * 1000)
+            end_ms = int(now * 1000) + 1
             suffix = self._export_suffix()
             path = export_path(
                 self.export_dir, window_minutes, server_id, label, end_ms, suffix=suffix
@@ -347,6 +382,10 @@ class DiskObservationStore:
                 self.export_dir,
                 self.config.storage.retention_minutes,
             )
+            # cleanup 删除文件后窗口缓存可能指向已不存在的数据，置空失效，
+            # 避免后续 recent_window 命中陈旧缓存返回被删记录。
+            self._window_cache_key = None
+            self._window_cache_value = None
 
     def _record_path(self, record: ObservationRecord) -> Path:
         return record_path(self.observation_dir, record)

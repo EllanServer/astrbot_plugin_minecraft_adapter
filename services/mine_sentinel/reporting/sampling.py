@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 from ..models import ObservationRecord
+
+logger = logging.getLogger(__name__)
 
 try:
     from mine_sentinel_rs import ai_sampling_features_batch as _rs_ai_sampling_features_batch
@@ -349,8 +352,10 @@ def _feature_map(records: list[ObservationRecord]) -> dict[int, _SampleFeature]:
                     id(record): _feature_from_row(row)
                     for record, row in zip(records, rows, strict=True)
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(
+                f"[MineSentinel] Rust 扩展 ai_sampling_features_batch 失败，回退到 Python 实现: {exc}"
+            )
     return {}
 
 
