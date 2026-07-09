@@ -3464,6 +3464,21 @@ class MineSentinelRulesTests(unittest.TestCase):
         # daily 始终在末尾
         self.assertEqual(builder._active_priority[-1], "daily")
 
+    def test_default_report_skips_redundant_category_gate(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        self.assertTrue(builder._all_categories_active)
+
+        def unexpected_gate(_record):
+            self.fail("all-enabled reports should not classify every record twice")
+
+        builder._classify_for_gate = unexpected_gate
+        record = self._make_record(
+            "[Server thread/ERROR]: Could not load plugin ExamplePlugin",
+            level="ERROR",
+        )
+        report = builder.build([record], 60, "survival")
+        self.assertTrue(report["issues"])
+
     # --- PR10: daily_noise 过滤 / Vulcan 检测 / 聊天热点 ---
     def test_daily_noise_record_classified_as_daily(self):
         """打 daily_noise 标签的记录即使含 network/moderation 关键词也归 daily。"""
@@ -3560,6 +3575,27 @@ class MineSentinelRulesTests(unittest.TestCase):
                 any(p.search(line) for p in compiled),
                 f"默认 noise patterns 未匹配预期日志行: {line}",
             )
+
+    def test_combined_daily_noise_matcher_is_equivalent_on_real_fixtures(self):
+        from services.mine_sentinel import runtime_log as runtime_module
+        from services.mine_sentinel.models import DEFAULT_DAILY_NOISE_PATTERNS
+
+        matcher = runtime_module._compile_noise_patterns(DEFAULT_DAILY_NOISE_PATTERNS)
+        self.assertIsNotNone(matcher.combined)
+        for fixture_name in ("mclogs_pbfhCaI.log", "mclogs_v54kwmi.log"):
+            fixture = Path(__file__).parent / "fixtures" / fixture_name
+            for line in fixture.read_text(encoding="utf-8", errors="replace").splitlines():
+                expected = any(pattern.search(line) for pattern in matcher.patterns)
+                actual = runtime_module._match_noise_patterns(line, matcher)
+                self.assertEqual(actual, expected, line)
+
+    def test_daily_noise_matcher_preserves_backreference_semantics(self):
+        from services.mine_sentinel import runtime_log as runtime_module
+
+        matcher = runtime_module._compile_noise_patterns([r"(.)\1"])
+        self.assertIsNone(matcher.combined)
+        self.assertTrue(runtime_module._match_noise_patterns("bookkeeper", matcher))
+        self.assertFalse(runtime_module._match_noise_patterns("abcdef", matcher))
 
     def test_custom_daily_noise_patterns_override_defaults(self):
         """用户配置非空 patterns 时只用用户的，不合并默认。"""
@@ -4326,6 +4362,36 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertEqual(hints.get("logLineKind"), "stacktrace_frame")
         self.assertIn("stacktrace_frame", hints.get("qualityFlags", []))
         self.assertLess(hints.get("llmQualityScore", 100), 90)
+
+    def test_python_runtime_hints_reuse_one_transport_cleaning_pass(self):
+        from services.mine_sentinel import runtime_log as runtime_module
+
+        line = (
+            "\x1b[31m[20:55:00] [Server thread/WARN]: bad\x00 token "
+            "from 192.0.2.10 https://example.invalid/path\x1b[0m"
+        )
+        original = runtime_module._strip_transport_text
+        calls = 0
+
+        def counted(value):
+            nonlocal calls
+            calls += 1
+            return original(value)
+
+        try:
+            runtime_module._strip_transport_text = counted
+            hints = runtime_module._python_runtime_log_hints(line, 2000)
+        finally:
+            runtime_module._strip_transport_text = original
+
+        self.assertEqual(calls, 1)
+        truncated = runtime_module._truncate(line, 2000)
+        self.assertEqual(hints["content"], runtime_module._sanitize_line(truncated))
+        self.assertEqual(hints["fingerprint"], runtime_module._fingerprint(truncated))
+        clean_text, redactions, flags = runtime_module._clean_for_llm(truncated)
+        self.assertEqual(hints["llmCleanText"], clean_text)
+        self.assertEqual(hints["redactionCount"], redactions)
+        self.assertEqual(hints["qualityFlags"], flags)
 
     def test_runtime_log_hints_add_low_risk_plugin_translation_hint(self):
         from services.mine_sentinel import runtime_log as runtime_module

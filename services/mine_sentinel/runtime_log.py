@@ -99,6 +99,14 @@ _TRANSPORT_FORMAT_CHARS = frozenset(
         "\u2060",  # word joiner.
     }
 )
+_TRANSPORT_DELETE_TRANSLATION: dict[int, None] = dict.fromkeys(
+    [
+        *(code for code in range(32) if code not in {9, 10, 13}),
+        127,
+        *(ord(ch) for ch in _TRANSPORT_FORMAT_CHARS),
+    ],
+    None,
+)
 _PREFIX_RE = re.compile(
     r"^\[?\d{2}:\d{2}:\d{2}(?:[.,]\d{1,6})?\]?\s*"
     r"(?:\[[^\]]+\]\s*)?(?:\[[A-Z]+\]\s*)?",
@@ -1342,14 +1350,23 @@ def _skip_parsed_template(content: str, fingerprint: str) -> ParsedTemplate:
     )
 
 
-# daily_noise_patterns 编译缓存：key=tuple(patterns) → list[re.Pattern]。
+# daily_noise_patterns 编译缓存：key=tuple(patterns) → matcher。
 # 避免每条日志都重新编译正则；config 不变时直接复用。
 # 线程安全：首次编译在锁内完成，避免并发首次调用重复编译；后续只读。
-_NOISE_PATTERN_CACHE: dict[tuple[str, ...], list["re.Pattern[str]"]] = {}
+@dataclass(frozen=True, slots=True)
+class _NoisePatternMatcher:
+    patterns: tuple["re.Pattern[str]", ...]
+    combined: "re.Pattern[str] | None" = None
+
+
+_NOISE_PATTERN_CACHE: dict[tuple[str, ...], _NoisePatternMatcher] = {}
 _noise_pattern_cache_lock = _threading.Lock()
+_REGEX_CROSS_BRANCH_REFERENCE_RE = re.compile(
+    r"\\[1-9][0-9]*|\(\?P=|\(\?\(",
+)
 
 
-def _compile_noise_patterns(patterns: list[str]) -> list["re.Pattern[str]"]:
+def _compile_noise_patterns(patterns: list[str] | tuple[str, ...]) -> _NoisePatternMatcher:
     """编译 daily_noise_patterns，缓存结果。无效正则会被忽略并记日志。"""
     key = tuple(patterns)
     # 双检锁：先无锁读，命中直接返回；未命中再加锁编译，避免每次调用
@@ -1363,20 +1380,38 @@ def _compile_noise_patterns(patterns: list[str]) -> list["re.Pattern[str]"]:
         if cached is not None:
             return cached
         compiled: list["re.Pattern[str]"] = []
+        valid_raw: list[str] = []
         for raw in patterns:
             try:
                 compiled.append(re.compile(raw, re.IGNORECASE))
+                valid_raw.append(raw)
             except re.error as exc:
                 logger.warning(
                     f"[MineSentinel] daily_noise_patterns 正则 {raw!r} 编译失败：{exc}，已忽略。"
                 )
-        _NOISE_PATTERN_CACHE[key] = compiled
-        return compiled
+        combined: "re.Pattern[str] | None" = None
+        if valid_raw and not any(
+            _REGEX_CROSS_BRANCH_REFERENCE_RE.search(raw) for raw in valid_raw
+        ):
+            try:
+                combined = re.compile(
+                    "|".join(f"(?:{raw})" for raw in valid_raw),
+                    re.IGNORECASE,
+                )
+            except re.error:
+                # Inline flags or duplicate named groups may be valid alone but
+                # invalid inside an alternation. Keep exact per-pattern semantics.
+                combined = None
+        matcher = _NoisePatternMatcher(tuple(compiled), combined)
+        _NOISE_PATTERN_CACHE[key] = matcher
+        return matcher
 
 
-def _match_noise_patterns(content: str, compiled: list["re.Pattern[str]"]) -> bool:
+def _match_noise_patterns(content: str, compiled: _NoisePatternMatcher) -> bool:
     """检查 content 是否命中任一编译后的噪声正则。"""
-    return any(pattern.search(content) for pattern in compiled)
+    if compiled.combined is not None:
+        return compiled.combined.search(content) is not None
+    return any(pattern.search(content) for pattern in compiled.patterns)
 
 
 def _detect_chat_message(content: str) -> tuple[str, str] | None:
@@ -1958,8 +1993,12 @@ def _detect_log_line_kind(content: str) -> str:
 
 def _python_runtime_log_hints(line: str, max_line_length: int) -> dict[str, Any]:
     truncated = _truncate(line, max_line_length)
-    content = _sanitize_line(truncated)
-    clean_text, redaction_count, quality_flags = _clean_for_llm(truncated)
+    transport_text, control_stripped = _strip_transport_text(truncated)
+    content = _sanitize_transport_text(transport_text)
+    clean_text, redaction_count, quality_flags = _clean_transport_for_llm(
+        transport_text,
+        control_stripped=control_stripped,
+    )
     if len(str(line or "")) > max_line_length:
         quality_flags.append("truncated")
     line_kind = _detect_log_line_kind(content)
@@ -1969,7 +2008,7 @@ def _python_runtime_log_hints(line: str, max_line_length: int) -> dict[str, Any]
         "content": content,
         "level": _detect_level(content),
         "logLineKind": line_kind,
-        "fingerprint": _fingerprint(content),
+        "fingerprint": _fingerprint_sanitized(content),
         "llmCleanText": clean_text,
         "llmCleanHash": _clean_text_hash(clean_text),
         "llmQualityScore": _llm_quality_score(redaction_count, quality_flags),
@@ -2213,7 +2252,7 @@ def _build_observation(
                 patterns = (
                     runtime_config.daily_noise_patterns
                     if runtime_config.daily_noise_patterns
-                    else list(DEFAULT_DAILY_NOISE_PATTERNS)
+                    else DEFAULT_DAILY_NOISE_PATTERNS
                 )
                 if patterns and _match_noise_patterns(content, _compile_noise_patterns(patterns)):
                     tags.append("daily_noise")
@@ -2488,7 +2527,11 @@ def _otel_fields(
 
 
 def _fingerprint(line: str) -> str:
-    text = _sanitize_line(line).lower()
+    return _fingerprint_sanitized(_sanitize_line(line))
+
+
+def _fingerprint_sanitized(line: str) -> str:
+    text = str(line or "").lower()
     text = _PREFIX_RE.sub("", text)
     text = _FULL_TS_RE.sub("", text)
     text = _TIME_RE.sub("", text)
@@ -2503,14 +2546,18 @@ def _fingerprint(line: str) -> str:
 
 
 def _sanitize_line(line: str) -> str:
+    text, _ = _strip_transport_text(line)
+    return _sanitize_transport_text(text)
+
+
+def _strip_transport_text(line: str) -> tuple[str, bool]:
     text = _ANSI_RE.sub("", str(line or ""))
-    text = "".join(
-        ch for ch in text
-        if ch not in _TRANSPORT_FORMAT_CHARS
-        and not (_is_control_char(ch) and ch not in {"\t", "\n", "\r"})
-    )
-    text = _IPV4_RE.sub("<ip>", text)
-    return text.strip()
+    stripped = text.translate(_TRANSPORT_DELETE_TRANSLATION)
+    return stripped, stripped != text
+
+
+def _sanitize_transport_text(text: str) -> str:
+    return _IPV4_RE.sub("<ip>", str(text or "")).strip()
 
 
 def _clean_for_llm(line: str) -> tuple[str, int, list[str]]:
@@ -2522,16 +2569,18 @@ def _clean_for_llm(line: str) -> tuple[str, int, list[str]]:
     ``content``; this cleaned copy is for prompt construction and indexing.
     """
 
-    text = _ANSI_RE.sub("", str(line or ""))
+    text, control_stripped = _strip_transport_text(line)
+    return _clean_transport_for_llm(text, control_stripped=control_stripped)
+
+
+def _clean_transport_for_llm(
+    text: str,
+    *,
+    control_stripped: bool,
+) -> tuple[str, int, list[str]]:
     flags: list[str] = []
-    stripped = "".join(
-        ch for ch in text
-        if ch not in _TRANSPORT_FORMAT_CHARS
-        and not (_is_control_char(ch) and ch not in {"\t", "\n", "\r"})
-    )
-    if stripped != text:
+    if control_stripped:
         flags.append("control_stripped")
-    text = stripped
     redaction_count = 0
     replacements = [
         (_URL_RE, "<url>", "redacted_url"),
@@ -2596,11 +2645,6 @@ def _has_long_repeated_run(value: str, threshold: int) -> bool:
         if run >= threshold:
             return True
     return False
-
-
-def _is_control_char(ch: str) -> bool:
-    code = ord(ch)
-    return code < 32 or code == 127
 
 
 def _is_symbol_heavy(value: str) -> bool:

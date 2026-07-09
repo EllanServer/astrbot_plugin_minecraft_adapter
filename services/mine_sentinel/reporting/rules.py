@@ -1495,6 +1495,7 @@ class HeuristicReportBuilder:
         # 预计算当前生效的分类优先级列表（应用 category_enabled / category_whitelist）。
         # daily 始终兜底，永远保留在末尾。
         self._active_priority: tuple[str, ...] = self._compute_active_priority()
+        self._all_categories_active = self._active_priority == CLASSIFY_PRIORITY
         self._reset_runtime_caches()
 
     def _reset_runtime_caches(self):
@@ -1994,12 +1995,16 @@ class HeuristicReportBuilder:
             flood_events = []
             abuse_events = []
 
-        category_active = self._category_active
-        classify_for_gate = self._classify_for_gate
-        admitted = [
-            record for record in log_records
-            if category_active(classify_for_gate(record))
-        ]
+        if self._all_categories_active:
+            admitted = log_records
+        else:
+            category_active = self._category_active
+            classify_for_gate = self._classify_for_gate
+            admitted = [
+                record
+                for record in log_records
+                if category_active(classify_for_gate(record))
+            ]
         return admitted, flood_events, abuse_events
 
     def _classify_for_gate(self, record: ObservationRecord) -> str:

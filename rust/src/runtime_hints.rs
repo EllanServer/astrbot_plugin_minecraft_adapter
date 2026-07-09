@@ -18,8 +18,9 @@ pub fn runtime_log_hints<'py>(
     max_line_length: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     let truncated = truncate_chars(line, max_line_length);
-    let content = sanitize_line(&truncated);
-    let mut cleaned = clean_for_llm(&truncated);
+    let transport = strip_transport_text(&truncated);
+    let content = sanitize_transport_text(&transport.text);
+    let mut cleaned = clean_transport_for_llm(&transport.text, transport.control_stripped);
     if line.chars().count() > max_line_length {
         cleaned.flags.push("truncated");
     }
@@ -28,7 +29,7 @@ pub fn runtime_log_hints<'py>(
         cleaned.flags.push(kind);
     }
     let level = detect_level(&content);
-    let fingerprint = fingerprint(&content);
+    let fingerprint = fingerprint_sanitized(&content);
     let out = PyDict::new(py);
     out.set_item("content", &content)?;
     out.set_item("level", level)?;
@@ -115,11 +116,29 @@ fn truncate_chars(value: &str, max_length: usize) -> String {
     out
 }
 
-fn sanitize_line(line: &str) -> String {
+struct TransportText {
+    text: String,
+    control_stripped: bool,
+}
+
+fn strip_transport_text(line: &str) -> TransportText {
     let no_ansi = ansi_re().replace_all(line, "");
     let stripped = strip_control_chars(&no_ansi);
-    let redacted = ipv4_re().replace_all(&stripped, "<ip>");
+    let control_stripped = stripped != no_ansi;
+    TransportText {
+        text: stripped,
+        control_stripped,
+    }
+}
+
+fn sanitize_transport_text(text: &str) -> String {
+    let redacted = ipv4_re().replace_all(text, "<ip>");
     redacted.trim().to_string()
+}
+
+fn sanitize_line(line: &str) -> String {
+    let transport = strip_transport_text(line);
+    sanitize_transport_text(&transport.text)
 }
 
 fn extract_time_parts(line: &str) -> (Option<String>, Option<String>, Option<String>) {
@@ -146,14 +165,17 @@ struct CleanedLog {
 }
 
 fn clean_for_llm(line: &str) -> CleanedLog {
-    let no_ansi = ansi_re().replace_all(line, "");
+    let transport = strip_transport_text(line);
+    clean_transport_for_llm(&transport.text, transport.control_stripped)
+}
+
+fn clean_transport_for_llm(text: &str, control_stripped: bool) -> CleanedLog {
     let mut flags = Vec::new();
-    let stripped = strip_control_chars(&no_ansi);
-    if stripped != no_ansi {
+    if control_stripped {
         flags.push("control_stripped");
     }
 
-    let mut text = stripped;
+    let mut text = text.to_string();
     let mut redaction_count = 0usize;
     for (regex, replacement, flag) in [
         (url_re(), "<url>", "redacted_url"),
@@ -257,7 +279,11 @@ fn detect_log_line_kind(content: &str) -> Option<&'static str> {
 }
 
 fn fingerprint(line: &str) -> String {
-    let mut text = sanitize_line(line).to_lowercase();
+    fingerprint_sanitized(&sanitize_line(line))
+}
+
+fn fingerprint_sanitized(line: &str) -> String {
+    let mut text = line.to_lowercase();
     text = prefix_re().replace_all(&text, "").to_string();
     text = full_ts_re().replace_all(&text, "").to_string();
     text = time_re().replace_all(&text, "").to_string();
@@ -1075,6 +1101,21 @@ mod tests {
         assert!(cleaned.flags.contains(&"redacted_token"));
         assert_eq!(clean_text_hash(&cleaned.text).len(), 24);
         assert!(llm_quality_score(cleaned.redaction_count, &cleaned.flags) < 100);
+    }
+
+    #[test]
+    fn one_transport_pass_matches_public_cleaning_helpers() {
+        let line = "\x1b[31m[WARN]: bad\x00 token from 192.0.2.10 https://example.test/a\x1b[0m";
+        let transport = strip_transport_text(line);
+        let content = sanitize_transport_text(&transport.text);
+        let optimized = clean_transport_for_llm(&transport.text, transport.control_stripped);
+        let public = clean_for_llm(line);
+
+        assert_eq!(content, sanitize_line(line));
+        assert_eq!(fingerprint_sanitized(&content), fingerprint(line));
+        assert_eq!(optimized.text, public.text);
+        assert_eq!(optimized.redaction_count, public.redaction_count);
+        assert_eq!(optimized.flags, public.flags);
     }
 
     #[test]
