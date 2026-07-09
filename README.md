@@ -69,6 +69,7 @@ mine_sentinel:
 - runtime hints：日志等级、时间、线程、插件、聊天、Vulcan、Hikari、ops hint 批处理。
 - observation priority：高日志量窗口下的优先级抽样。
 - AI sampling features：prompt 入模前的清洗 key、质量评分、低价值指标过滤。
+- report category features：整窗日志在单次原生调用中生成分类关键词 bitmask，Python 继续负责排除规则、优先级和最终结论。
 
 Rust 与纯 Python 回退共享同一份清洗语义：每行只做一次 ANSI/控制字符 transport pass，再派生脱敏文本、指纹和质量标记；默认 daily-noise 规则合并为单次正则扫描。即使目标平台暂时没有 wheel，高日志量摄取也不会重复清洗同一行。
 

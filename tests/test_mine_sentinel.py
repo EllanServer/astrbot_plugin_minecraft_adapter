@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import gzip
 import importlib
 import json
@@ -1745,6 +1746,99 @@ class MineSentinelRulesTests(unittest.TestCase):
                 ("server",),
             )
         )
+
+    def test_report_category_feature_masks_match_python_key_semantics(self):
+        from services.mine_sentinel.reporting.rules import (
+            CATEGORY_FEATURE_BITS,
+            CATEGORY_FEATURE_GROUPS,
+            CATEGORY_KEYS,
+        )
+        from tests.mine_sentinel_rs_stub import report_category_features_batch_stub
+
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        records = [
+            self._make_record("player can fly now"),
+            self._make_record("butterfly effect is enabled"),
+            self._make_record("玩家fly玩家"),
+            self._make_record("proxy connection timed out"),
+            self._make_record("后端连接超时"),
+            self._make_record("shop balance updated"),
+        ]
+
+        masks = report_category_features_batch_stub(
+            records,
+            CATEGORY_FEATURE_GROUPS,
+        )
+
+        for record, mask in zip(records, masks, strict=True):
+            text = f"{record.content} {' '.join(record.tags or [])}".lower()
+            for category, keys in CATEGORY_KEYS.items():
+                bit = CATEGORY_FEATURE_BITS.get(category)
+                if bit is None:
+                    continue
+                self.assertEqual(
+                    bool(mask & bit),
+                    builder._record_keys_match(record, text, keys),
+                    (record.content, category),
+                )
+
+    def test_category_match_consumes_native_mask_without_python_rescan(self):
+        from services.mine_sentinel.reporting import rules as rules_module
+        from tests.mine_sentinel_rs_stub import report_category_features_batch_stub
+
+        original = rules_module._rs_report_category_features_batch
+        calls = []
+
+        def native_features(records, groups):
+            calls.append(len(records))
+            return report_category_features_batch_stub(records, groups)
+
+        try:
+            rules_module._rs_report_category_features_batch = native_features
+            builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+            record = self._make_record("socket closed by remote peer", level="INFO")
+            builder._prepare_native_category_features([record])
+
+            def unexpected_python_scan(*_args, **_kwargs):
+                self.fail("native category mask should answer the final key match")
+
+            builder._record_keys_match = unexpected_python_scan
+            matched = builder._category_matches_uncached(
+                record,
+                "network",
+                builder._record_text(record),
+                raw_content=builder._record_raw_content(record),
+                level="info",
+                assume_not_benign=True,
+            )
+        finally:
+            rules_module._rs_report_category_features_batch = original
+
+        self.assertTrue(matched)
+        self.assertEqual(calls, [1])
+
+    def test_report_category_feature_failure_falls_back_to_python(self):
+        from services.mine_sentinel.reporting import rules as rules_module
+
+        original = rules_module._rs_report_category_features_batch
+
+        def broken_native_features(_records, _groups):
+            raise RuntimeError("incompatible native wheel")
+
+        try:
+            rules_module._rs_report_category_features_batch = broken_native_features
+            builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+            record = self._make_record(
+                "io.netty connection reset by peer",
+                level="WARN",
+            )
+            report = builder.build([record], 60, "survival")
+        finally:
+            rules_module._rs_report_category_features_batch = original
+
+        self.assertEqual(builder.classify(record), "network")
+        self.assertEqual(report["categories"]["network"][0].split(":", 1)[0], "server_log_network")
+        self.assertEqual(builder._native_category_feature_cache, {})
 
     def test_chat_review_ad_keyword_removed_no_false_positive(self):
         """'ad' 关键词已移除，独立 'ad' 不再触发 chat_review（避免误判）。
@@ -5761,6 +5855,118 @@ class MineSentinelRustPythonEquivalenceTests(unittest.TestCase):
                 },
             },
             raw={},
+        )
+
+    def test_report_category_features_rust_equals_python(self):
+        if not self._has_real_rust():
+            self.skipTest("需要真实 mine_sentinel_rs wheel 才能验证等价性")
+
+        import statistics
+        from mine_sentinel_rs import report_category_features_batch
+        from services.mine_sentinel.reporting.rules import (
+            CATEGORY_FEATURE_BITS,
+            CATEGORY_FEATURE_GROUPS,
+            CATEGORY_KEYS,
+        )
+
+        samples = [
+            self._make_record(),
+            ObservationRecord(
+                event_id="info",
+                kind="SERVER_LOG",
+                timestamp=1700000001000,
+                server_id="survival",
+                content="[INFO]: butterfly plugin loaded",
+                tags=["server_log", "runtime_log"],
+                context={"level": "INFO"},
+            ),
+            ObservationRecord(
+                event_id="feedback",
+                kind="SERVER_LOG",
+                timestamp=1700000002000,
+                server_id="survival",
+                content="玩家建议优化商店功能",
+                tags=["server_log", "runtime_log", "chat_message"],
+                context={"level": "INFO"},
+            ),
+        ]
+        records = [copy.deepcopy(samples[index % len(samples)]) for index in range(6000)]
+
+        native_times = []
+        python_times = []
+        native_masks = []
+        python_masks = []
+        for _ in range(3):
+            started = time.perf_counter()
+            native_masks = report_category_features_batch(
+                records,
+                CATEGORY_FEATURE_GROUPS,
+            )
+            native_times.append((time.perf_counter() - started) * 1000)
+
+            started = time.perf_counter()
+            python_masks = []
+            builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+            for record in records:
+                text = f"{record.content} {' '.join(record.tags or [])}".lower()
+                mask = 0
+                for category, keys in CATEGORY_KEYS.items():
+                    bit = CATEGORY_FEATURE_BITS.get(category)
+                    if bit is not None and builder._record_keys_match(
+                        record,
+                        text,
+                        keys,
+                    ):
+                        mask |= bit
+                python_masks.append(mask)
+            python_times.append((time.perf_counter() - started) * 1000)
+
+        self.assertEqual(native_masks, python_masks)
+        native_median = statistics.median(native_times)
+        python_median = statistics.median(python_times)
+        print(
+            "Rust report category batch: "
+            f"{native_median:.2f}ms vs Python {python_median:.2f}ms "
+            f"({python_median / max(native_median, 0.001):.2f}x)"
+        )
+
+    def test_report_builder_rust_batch_matches_python_on_real_log(self):
+        if not self._has_real_rust():
+            self.skipTest("需要真实 mine_sentinel_rs wheel 才能验证等价性")
+
+        import statistics
+        from services.mine_sentinel.reporting import rules as rules_module
+
+        MineSentinelRealLogV54kwMiTests.setUpClass()
+        native_features = rules_module._rs_report_category_features_batch
+        self.assertIsNotNone(native_features)
+        reports = {}
+        timings = {}
+        try:
+            for name, feature_func in (
+                ("python", None),
+                ("rust", native_features),
+            ):
+                mode_times = []
+                report = None
+                for _ in range(3):
+                    records = copy.deepcopy(MineSentinelRealLogV54kwMiTests.records)
+                    rules_module._rs_report_category_features_batch = feature_func
+                    started = time.perf_counter()
+                    report = HeuristicReportBuilder(
+                        MineSentinelConfig.from_dict({})
+                    ).build(records, 120, "survival")
+                    mode_times.append((time.perf_counter() - started) * 1000)
+                reports[name] = report
+                timings[name] = statistics.median(mode_times)
+        finally:
+            rules_module._rs_report_category_features_batch = native_features
+
+        self.assertEqual(reports["rust"], reports["python"])
+        print(
+            "Rust full report v54kwmi: "
+            f"{timings['rust']:.2f}ms vs Python {timings['python']:.2f}ms "
+            f"({timings['python'] / max(timings['rust'], 0.001):.2f}x)"
         )
 
     def test_codec_rust_equals_python_normalize_and_json(self):

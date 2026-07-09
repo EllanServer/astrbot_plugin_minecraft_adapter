@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import Counter, defaultdict
 from functools import lru_cache
@@ -29,6 +30,16 @@ from typing import Any
 from ..models import MineSentinelConfig, ObservationRecord
 from .common import SEVERITY_RANK, format_locations, location_list
 from .sections import build_report_sections
+
+try:
+    from mine_sentinel_rs import (
+        report_category_features_batch as _rs_report_category_features_batch,
+    )
+except ImportError:  # pragma: no cover - optional native acceleration
+    _rs_report_category_features_batch = None
+
+
+logger = logging.getLogger(__name__)
 
 
 # --- 分类关键词表 ---------------------------------------------------------
@@ -353,6 +364,17 @@ COUNTER_KEY_BY_CATEGORY = {
     "player_feedback": "player_feedback",
     "community_ops": "community_ops",
 }
+
+CATEGORY_FEATURE_BITS = {
+    category: 1 << index
+    for index, (category, keys) in enumerate(CATEGORY_KEYS.items())
+    if keys
+}
+CATEGORY_FEATURE_GROUPS = tuple(
+    (CATEGORY_FEATURE_BITS[category], keys)
+    for category, keys in CATEGORY_KEYS.items()
+    if keys
+)
 # URL/外链信号仅在 chat_message 标签的记录上触发 chat_review。
 # 真实日志验证：QuickShop-Hikari 等插件的更新检查日志
 # （[QuickShop-Hikari] Update here: https://modrinth.com/...）
@@ -1517,6 +1539,7 @@ class HeuristicReportBuilder:
         self._category_match_cache: dict[tuple[int, str], bool] = {}
         self._ops_report_category_cache: dict[int, frozenset[str]] = {}
         self._record_word_cache: dict[int, tuple[str, frozenset[str]]] = {}
+        self._native_category_feature_cache: dict[int, int] = {}
 
     @staticmethod
     def _append_unique(values: list[str], value: str):
@@ -2000,6 +2023,8 @@ class HeuristicReportBuilder:
             flood_events = []
             abuse_events = []
 
+        self._prepare_native_category_features(log_records)
+
         if self._all_categories_active:
             admitted = log_records
         else:
@@ -2011,6 +2036,30 @@ class HeuristicReportBuilder:
                 if category_active(classify_for_gate(record))
             ]
         return admitted, flood_events, abuse_events
+
+    def _prepare_native_category_features(
+        self,
+        records: list[ObservationRecord],
+    ) -> None:
+        if not records or _rs_report_category_features_batch is None:
+            return
+        try:
+            masks = _rs_report_category_features_batch(
+                records,
+                CATEGORY_FEATURE_GROUPS,
+            )
+            if len(masks) != len(records):
+                return
+            self._native_category_feature_cache = {
+                id(record): int(mask)
+                for record, mask in zip(records, masks, strict=True)
+            }
+        except Exception as exc:
+            logger.debug(
+                "[MineSentinel] Rust report category features failed; "
+                "falling back to Python matching: %s",
+                exc,
+            )
 
     def _classify_for_gate(self, record: ObservationRecord) -> str:
         """Classify with the full priority list before category filtering."""
@@ -2641,6 +2690,10 @@ class HeuristicReportBuilder:
             )
             return keys_match(soft_feedback) and keys_match(product_context)
 
+        category_bit = CATEGORY_FEATURE_BITS.get(category)
+        native_mask = self._native_category_feature_cache.get(id(record))
+        if category_bit is not None and native_mask is not None:
+            return bool(native_mask & category_bit)
         return keys_match(keys)
 
     # --- Tag --------------------------------------------------------------
@@ -4205,6 +4258,7 @@ class HeuristicReportBuilder:
         self._record_word_cache.pop(key, None)
         self._benign_mechanical_cache.pop(key, None)
         self._gate_classification_cache.pop(key, None)
+        self._native_category_feature_cache.pop(key, None)
 
     def _record_text(self, record: ObservationRecord) -> str:
         key = id(record)

@@ -43,6 +43,73 @@ pub fn ai_sampling_features_batch<'py>(
     Ok(out)
 }
 
+/// Batch category-key matching for heuristic report classification.
+///
+/// Python owns category definitions and decision priority. Rust receives the
+/// current `(bit, keys)` groups and returns one bitmask per record, avoiding
+/// tens of thousands of repeated Python substring scans without duplicating
+/// business rules in the extension.
+#[pyfunction]
+pub fn report_category_features_batch(
+    records: &Bound<PyAny>,
+    groups: Vec<(u64, Vec<String>)>,
+) -> PyResult<Vec<u64>> {
+    let mut masks = Vec::new();
+    for item in records.try_iter()? {
+        let record = item?;
+        let content = attr_string(&record, "content")?;
+        let tags: Vec<String> = record.getattr("tags")?.extract().unwrap_or_default();
+        let mut text = String::with_capacity(
+            content.len() + tags.iter().map(String::len).sum::<usize>() + tags.len() + 1,
+        );
+        text.push_str(&content.to_lowercase());
+        text.push(' ');
+        for tag in tags {
+            text.push_str(&tag.to_lowercase());
+            text.push(' ');
+        }
+        let mut mask = 0_u64;
+        for (bit, keys) in &groups {
+            if category_keys_match(&text, keys) {
+                mask |= bit;
+            }
+        }
+        masks.push(mask);
+    }
+    Ok(masks)
+}
+
+fn category_keys_match(text: &str, keys: &[String]) -> bool {
+    keys.iter().any(|key| {
+        if is_short_ascii_word(key) {
+            contains_ascii_word(text, key)
+        } else {
+            text.contains(key)
+        }
+    })
+}
+
+fn is_short_ascii_word(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 6 && value.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
+
+fn contains_ascii_word(text: &str, word: &str) -> bool {
+    let bytes = text.as_bytes();
+    for (start, _) in text.match_indices(word) {
+        let end = start + word.len();
+        let left_boundary = start == 0 || !is_ascii_token_byte(bytes[start - 1]);
+        let right_boundary = end == bytes.len() || !is_ascii_token_byte(bytes[end]);
+        if left_boundary && right_boundary {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_ascii_token_byte(value: u8) -> bool {
+    value.is_ascii_lowercase() || value.is_ascii_digit() || value == b'_'
+}
+
 fn server_log_priority(record: &Bound<PyAny>) -> PyResult<f64> {
     let content: String = record.getattr("content")?.extract()?;
     let tags: Vec<String> = record.getattr("tags")?.extract()?;
@@ -270,5 +337,33 @@ fn norm(value: &str) -> String {
 pub fn register(parent: &Bound<PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(observation_priority_score, parent)?)?;
     parent.add_function(wrap_pyfunction!(ai_sampling_features_batch, parent)?)?;
+    parent.add_function(wrap_pyfunction!(report_category_features_batch, parent)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{category_keys_match, contains_ascii_word};
+
+    #[test]
+    fn short_words_require_ascii_token_boundaries() {
+        assert!(contains_ascii_word("player can fly now", "fly"));
+        assert!(!contains_ascii_word("butterfly effect", "fly"));
+        assert!(contains_ascii_word("玩家fly玩家", "fly"));
+        assert!(contains_ascii_word("vl=12", "vl"));
+        assert!(!contains_ascii_word("level=12", "vl"));
+    }
+
+    #[test]
+    fn category_groups_mix_words_phrases_and_unicode() {
+        let keys = vec![
+            "lag".to_string(),
+            "connection timed out".to_string(),
+            "连接超时".to_string(),
+        ];
+        assert!(category_keys_match("server lag detected", &keys));
+        assert!(!category_keys_match("flag plugin enabled", &keys));
+        assert!(category_keys_match("proxy connection timed out", &keys));
+        assert!(category_keys_match("后端连接超时", &keys));
+    }
 }

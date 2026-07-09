@@ -222,6 +222,27 @@ def ai_sampling_features_batch_stub(records):
     return out
 
 
+def report_category_features_batch_stub(records, groups):
+    out = []
+    for record in records:
+        text = f"{record.content} {' '.join(record.tags or [])}".lower()
+        words = frozenset(re.findall(r"[a-z0-9_]+", text))
+        mask = 0
+        for bit, keys in groups:
+            for key in keys:
+                is_word = (
+                    bool(key)
+                    and key.isascii()
+                    and key.isalpha()
+                    and len(key) <= 6
+                )
+                if (key in words if is_word else key in text):
+                    mask |= int(bit)
+                    break
+        out.append(mask)
+    return out
+
+
 def install_mine_sentinel_rs_stub_if_missing() -> bool:
     try:
         import mine_sentinel_rs  # noqa: F401
@@ -231,6 +252,7 @@ def install_mine_sentinel_rs_stub_if_missing() -> bool:
         native_stub.ObservationRecordCodec = ObservationRecordCodecStub
         native_stub.observation_priority_score = observation_priority_score_stub
         native_stub.ai_sampling_features_batch = ai_sampling_features_batch_stub
+        native_stub.report_category_features_batch = report_category_features_batch_stub
         sys.modules["mine_sentinel_rs"] = native_stub
         return True
     return False
