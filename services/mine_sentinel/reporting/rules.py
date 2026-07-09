@@ -465,6 +465,19 @@ def _is_plugin_inventory_text(raw_content: str) -> bool:
     )
 
 
+def _is_warning_banner_decoration(raw_content: str) -> bool:
+    body = raw_content.rsplit("]:", 1)[-1].strip()
+    while body.startswith("[") and "]" in body:
+        body = body.split("]", 1)[1].strip()
+    if not body:
+        return True
+    ascii_words = re.findall(r"[a-z]+", body.lower())
+    if ascii_words and set(ascii_words) <= {"warn", "warning"}:
+        return True
+    compact = "".join(body.split())
+    return not ascii_words and len(compact) >= 2 and len(set(compact)) <= 2
+
+
 def _is_benign_mechanical_record(raw_content: str, text: str, level: str) -> bool:
     is_info = level in {"info", ""}
     is_warn = level in {"warn", "warning"}
@@ -584,10 +597,13 @@ def _is_benign_mechanical_record(raw_content: str, text: str, level: str) -> boo
         "docs.papermc.io/velocity/security",
         "update available",
         "a new version of ",
+        "no rcon password set in server.properties, rcon disabled",
     )
     if is_warn and "legacy plugin " in text and " does not specify an api-version" in text:
         return True
     if is_warn and "hikariconfig" in text and "idletimeout is close to or more than maxlifetime" in text:
+        return True
+    if is_warn and _is_warning_banner_decoration(raw_content):
         return True
     return is_warn and any(marker in text for marker in warn_markers)
 
@@ -724,6 +740,7 @@ CHAT_COMMUNITY_LABELS = {
 
 OPS_ISSUE_LEVELS = {"warn", "warning", "error", "severe", "fatal"}
 OPS_SEVERITY_RANK = {"info": 0, **SEVERITY_RANK}
+ISSUE_CLUSTER_GAP_MS = 5 * 60 * 1000
 OPS_DEFAULT_IMPACT = "需要结合聊天反馈、服务器指标和同时间日志判断影响范围。"
 OPS_LOG_RULES: tuple[dict[str, Any], ...] = (
     {
@@ -871,6 +888,108 @@ OPS_LOG_RULES: tuple[dict[str, Any], ...] = (
     },
     {
         "category": "插件与模组",
+        "subtype": "技能/内容定义错误",
+        "markers": (
+            "configuration error in mechanic",
+            "configuration error: particle",
+            "mechanic line:",
+            "must be a valid mythicmob",
+        ),
+        "requires_issue_level": True,
+        "severity": "medium",
+        "impact": "插件技能、实体或内容定义无效，可能导致对应玩法、技能或自定义实体不可用。",
+        "report_categories": ("plugin",),
+    },
+    {
+        "category": "插件与模组",
+        "subtype": "外部 API 凭据缺失",
+        "markers": (
+            "empty api key",
+            "without api key",
+            "missing api key",
+            "api key is missing",
+            "invalid api key",
+        ),
+        "requires_issue_level": True,
+        "severity": "medium",
+        "impact": "插件外部 API 未配置或凭据无效，相关皮肤、资源生成或同步功能可能被禁用。",
+        "report_categories": ("plugin",),
+    },
+    {
+        "category": "插件与模组",
+        "subtype": "依赖缺失/功能降级",
+        "markers": (
+            "missing dependency",
+            "dependency not found",
+            "required dependency",
+            "worldguard not found",
+        ),
+        "requires_issue_level": True,
+        "severity": "medium",
+        "impact": "插件依赖未安装或未加载，相关模块已关闭或只能以降级模式运行。",
+        "report_categories": ("plugin",),
+    },
+    {
+        "category": "插件与模组",
+        "subtype": "插件不安全模式",
+        "markers": (
+            "enabled \"unsafe mode\"",
+            "this is not supported! use this at your own risk",
+            "websocket server is enabled. this is not recommended for production servers",
+        ),
+        "requires_issue_level": True,
+        "severity": "medium",
+        "impact": "插件正在不受支持的模式下运行，升级、重载或异常恢复时可能出现数据或功能风险。",
+        "report_categories": ("plugin",),
+    },
+    {
+        "category": "插件与模组",
+        "subtype": "外部资源获取失败",
+        "markers": (
+            "could not fetch skin",
+            "unable to fetch skin",
+            "failed to find image from url",
+            "mineskinrequestexception",
+        ),
+        "severity": "medium",
+        "impact": "插件无法访问外部资源服务，相关皮肤、图片或远程资源功能可能失败。",
+        "report_categories": ("plugin",),
+    },
+    {
+        "category": "插件与模组",
+        "subtype": "插件更新检查失败",
+        "markers": (
+            "failed to check for updates",
+            "checkforupdate(",
+            "checkforupdatesandmetrics(",
+        ),
+        "severity": "low",
+        "impact": "插件自动更新检查未完成，通常不影响当前玩法，仅需在维护窗口人工核对版本。",
+        "needs_admin": False,
+        "report_categories": ("plugin",),
+        "ops_observation": True,
+    },
+    {
+        "category": "插件与模组",
+        "subtype": "兼容性/弃用提示",
+        "markers": (
+            "cannot interact with paper-plugins",
+            "running on paper",
+            "deprecated mythicmobs api",
+            "legacy placeholder detected",
+            "notify the plugin author to update",
+            "join my discord",
+            "create an issue on github",
+            "already exists. using alternative",
+        ),
+        "severity": "low",
+        "impact": "插件报告兼容性限制或弃用接口，当前通常可运行，但后续升级前应核对替代方案。",
+        "needs_admin": False,
+        "report_categories": ("plugin",),
+        "ops_observation": True,
+    },
+    {
+        "category": "插件与模组",
         "subtype": "插件加载/启用失败",
         "markers": (
             "could not load plugin",
@@ -896,6 +1015,7 @@ OPS_LOG_RULES: tuple[dict[str, Any], ...] = (
             "failed to load config",
             "could not load config",
             "invalid configuration",
+            "invalidconfigurationexception",
             "configuration error",
             "mapping values are not allowed",
             "yaml",
@@ -960,6 +1080,7 @@ OPS_LOG_RULES: tuple[dict[str, Any], ...] = (
             "task",
             "nullpointerexception",
             "illegalargumentexception",
+            "nosuchelementexception",
             "nosuchmethoderror",
             "classnotfoundexception",
             "cannot invoke",
@@ -1008,6 +1129,7 @@ OPS_LOG_RULES: tuple[dict[str, Any], ...] = (
             "connection reset",
             "connection refused",
             "connection timed out",
+            "sockettimeoutexception",
             "read timed out",
             "broken pipe",
             "socketexception",
@@ -1264,6 +1386,57 @@ OPS_HINT_CLASSIFICATIONS: dict[str, dict[str, Any]] = {
         "severity": "high",
         "impact": "服务器离线或未验证用户名时，需确认是否只允许受控代理接入，否则可能存在冒名登录风险。",
         "report_categories": ("moderation",),
+    },
+    "plugin_content_definition": {
+        "category": "插件与模组",
+        "subtype": "技能/内容定义错误",
+        "severity": "medium",
+        "impact": "插件技能、实体或内容定义无效，可能导致对应玩法、技能或自定义实体不可用。",
+        "report_categories": ("plugin",),
+    },
+    "plugin_api_credentials": {
+        "category": "插件与模组",
+        "subtype": "外部 API 凭据缺失",
+        "severity": "medium",
+        "impact": "插件外部 API 未配置或凭据无效，相关皮肤、资源生成或同步功能可能被禁用。",
+        "report_categories": ("plugin",),
+    },
+    "plugin_dependency": {
+        "category": "插件与模组",
+        "subtype": "依赖缺失/功能降级",
+        "severity": "medium",
+        "impact": "插件依赖未安装或未加载，相关模块已关闭或只能以降级模式运行。",
+        "report_categories": ("plugin",),
+    },
+    "plugin_unsafe_mode": {
+        "category": "插件与模组",
+        "subtype": "插件不安全模式",
+        "severity": "medium",
+        "impact": "插件正在不受支持的模式下运行，升级、重载或异常恢复时可能出现数据或功能风险。",
+        "report_categories": ("plugin",),
+    },
+    "plugin_external_fetch": {
+        "category": "插件与模组",
+        "subtype": "外部资源获取失败",
+        "severity": "medium",
+        "impact": "插件无法访问外部资源服务，相关皮肤、图片或远程资源功能可能失败。",
+        "report_categories": ("plugin",),
+    },
+    "plugin_update_check": {
+        "category": "插件与模组",
+        "subtype": "插件更新检查失败",
+        "severity": "low",
+        "impact": "插件自动更新检查未完成，通常不影响当前玩法，仅需在维护窗口人工核对版本。",
+        "report_categories": ("plugin",),
+        "ops_observation": True,
+    },
+    "plugin_compatibility": {
+        "category": "插件与模组",
+        "subtype": "兼容性/弃用提示",
+        "severity": "low",
+        "impact": "插件报告兼容性限制或弃用接口，当前通常可运行，但后续升级前应核对替代方案。",
+        "report_categories": ("plugin",),
+        "ops_observation": True,
     },
     "plugin_config": {
         "category": "插件与模组",
@@ -1920,13 +2093,18 @@ class HeuristicReportBuilder:
             categories.setdefault(category, [])
             categories[category].append(self._category_line(tag, group))
 
+        issue_buckets: list[tuple[tuple[str, str], list[ObservationRecord]]] = []
+        for key, group in buckets.items():
+            for segment in self._split_issue_group(group, window_minutes):
+                issue_buckets.append((key, segment))
+
         chat_topics = self._build_chat_topics(log_records, flood_events, abuse_events)
         vulcan_alerts = self._build_vulcan_alerts(log_records)
 
         issues = []
         max_severity_rank = 0
         for (category, tag), group in sorted(
-            buckets.items(), key=lambda item: len(item[1]), reverse=True
+            issue_buckets, key=lambda item: len(item[1]), reverse=True
         ):
             severity = self._severity(group)
             chat_infos = [
@@ -2457,6 +2635,43 @@ class HeuristicReportBuilder:
             f"{tag}: {len(group)} 条运行日志，级别 {', '.join(levels)}，"
             f"服务器 {servers or '未知'}。"
         )
+
+    @staticmethod
+    def _split_issue_group(
+        group: list[ObservationRecord],
+        window_minutes: int,
+    ) -> list[list[ObservationRecord]]:
+        """Split short-window tag buckets when evidence goes quiet for five minutes."""
+        timestamps = sorted(record.timestamp for record in group if record.timestamp)
+        if len(timestamps) < 2:
+            return [group]
+        max_segmentable_span_ms = max(120, max(1, int(window_minutes)) * 2) * 60 * 1000
+        if timestamps[-1] - timestamps[0] > max_segmentable_span_ms:
+            return [group]
+
+        ordered = sorted(
+            group,
+            key=lambda record: record.timestamp if record.timestamp else 2**63 - 1,
+        )
+        segments: list[list[ObservationRecord]] = []
+        current: list[ObservationRecord] = []
+        last_timestamp = 0
+        for record in ordered:
+            timestamp = int(record.timestamp or 0)
+            if (
+                current
+                and timestamp
+                and last_timestamp
+                and timestamp - last_timestamp > ISSUE_CLUSTER_GAP_MS
+            ):
+                segments.append(current)
+                current = []
+            current.append(record)
+            if timestamp:
+                last_timestamp = timestamp
+        if current:
+            segments.append(current)
+        return segments or [group]
 
     # --- 严重级别 ---------------------------------------------------------
     def _severity(self, group: list[ObservationRecord]) -> str:
@@ -4047,6 +4262,18 @@ class HeuristicReportBuilder:
         if cached is not None:
             return cached
         value = _is_benign_mechanical_record(raw_content, text, level)
+        ctx = record.context or {}
+        hint_code = str(ctx.get("opsHintCode") or "").strip()
+        if not value and not hint_code:
+            line_kind = str(ctx.get("logLineKind") or "").strip()
+            if line_kind == "stacktrace_frame":
+                value = True
+            elif level in {"warn", "warning"}:
+                quality_flags = {
+                    str(flag)
+                    for flag in (ctx.get("dataQualityFlags") or ctx.get("qualityFlags") or ())
+                }
+                value = "low_signal_repetition" in quality_flags
         self._benign_mechanical_cache[key] = value
         return value
 

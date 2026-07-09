@@ -23,11 +23,16 @@ pub fn runtime_log_hints<'py>(
     if line.chars().count() > max_line_length {
         cleaned.flags.push("truncated");
     }
+    let line_kind = detect_log_line_kind(&content);
+    if let Some(kind) = line_kind {
+        cleaned.flags.push(kind);
+    }
     let level = detect_level(&content);
     let fingerprint = fingerprint(&content);
     let out = PyDict::new(py);
     out.set_item("content", &content)?;
     out.set_item("level", level)?;
+    out.set_item("logLineKind", line_kind.unwrap_or("message"))?;
     out.set_item("fingerprint", fingerprint)?;
     let clean_hash = clean_text_hash(&cleaned.text);
     let quality_score = llm_quality_score(cleaned.redaction_count, &cleaned.flags);
@@ -199,6 +204,7 @@ fn llm_quality_score(redaction_count: usize, flags: &[&str]) -> i32 {
             "empty" => 80,
             "low_signal_repetition" => 35,
             "low_signal_symbols" => 35,
+            "stacktrace_frame" => 18,
             "control_stripped" => 8,
             "truncated" => 8,
             "whitespace_collapsed" => 2,
@@ -240,6 +246,14 @@ fn detect_level(line: &str) -> &'static str {
         return "WARN";
     }
     "INFO"
+}
+
+fn detect_log_line_kind(content: &str) -> Option<&'static str> {
+    let stripped = prefix_re().replace(content, "");
+    let body = stripped.trim_start_matches([' ', ':', '\t']);
+    stacktrace_frame_re()
+        .is_match(body)
+        .then_some("stacktrace_frame")
 }
 
 fn fingerprint(line: &str) -> String {
@@ -339,6 +353,55 @@ fn detect_ops_hint(content: &str, level: &str) -> Option<OpsHint> {
         return Some(OpsHint {
             code: "server_security",
             severity: "high",
+            markers,
+        });
+    }
+    if let Some(markers) = matched_markers(&text, PLUGIN_CONTENT_DEFINITION_MARKERS) {
+        return Some(OpsHint {
+            code: "plugin_content_definition",
+            severity: "medium",
+            markers,
+        });
+    }
+    if let Some(markers) = matched_markers(&text, PLUGIN_API_CREDENTIAL_MARKERS) {
+        return Some(OpsHint {
+            code: "plugin_api_credentials",
+            severity: "medium",
+            markers,
+        });
+    }
+    if let Some(markers) = matched_markers(&text, PLUGIN_DEPENDENCY_MARKERS) {
+        return Some(OpsHint {
+            code: "plugin_dependency",
+            severity: "medium",
+            markers,
+        });
+    }
+    if let Some(markers) = matched_markers(&text, PLUGIN_UNSAFE_MODE_MARKERS) {
+        return Some(OpsHint {
+            code: "plugin_unsafe_mode",
+            severity: "medium",
+            markers,
+        });
+    }
+    if let Some(markers) = matched_markers(&text, PLUGIN_EXTERNAL_FETCH_MARKERS) {
+        return Some(OpsHint {
+            code: "plugin_external_fetch",
+            severity: "medium",
+            markers,
+        });
+    }
+    if let Some(markers) = matched_markers(&text, PLUGIN_UPDATE_CHECK_MARKERS) {
+        return Some(OpsHint {
+            code: "plugin_update_check",
+            severity: "low",
+            markers,
+        });
+    }
+    if let Some(markers) = matched_markers(&text, PLUGIN_COMPATIBILITY_MARKERS) {
+        return Some(OpsHint {
+            code: "plugin_compatibility",
+            severity: "low",
             markers,
         });
     }
@@ -589,6 +652,14 @@ fn prefix_re() -> &'static Regex {
     })
 }
 
+fn stacktrace_frame_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)^(?:at\s+\S+\([^\r\n]*\)(?:\s+~\[[^\]]*\])?|\.\.\.\s+\d+\s+more)$")
+            .expect("stacktrace frame regex")
+    })
+}
+
 fn full_ts_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -655,6 +726,9 @@ const OPS_ISSUE_MARKERS: &[&str] = &[
     "cannot",
     "could not",
     "unable",
+    "deprecated",
+    "legacy placeholder detected",
+    "notify the plugin author",
 ];
 
 const ECONOMY_SHOP_MARKERS: &[&str] = &[
@@ -713,10 +787,63 @@ const SERVER_SECURITY_MARKERS: &[&str] = &[
     "online-mode",
 ];
 
+const PLUGIN_CONTENT_DEFINITION_MARKERS: &[&str] = &[
+    "configuration error in mechanic",
+    "configuration error: particle",
+    "mechanic line:",
+    "must be a valid mythicmob",
+];
+
+const PLUGIN_API_CREDENTIAL_MARKERS: &[&str] = &[
+    "empty api key",
+    "without api key",
+    "missing api key",
+    "api key is missing",
+    "invalid api key",
+];
+
+const PLUGIN_DEPENDENCY_MARKERS: &[&str] = &[
+    "missing dependency",
+    "dependency not found",
+    "required dependency",
+    "worldguard not found",
+];
+
+const PLUGIN_UNSAFE_MODE_MARKERS: &[&str] = &[
+    "enabled \"unsafe mode\"",
+    "this is not supported! use this at your own risk",
+    "websocket server is enabled. this is not recommended for production servers",
+];
+
+const PLUGIN_EXTERNAL_FETCH_MARKERS: &[&str] = &[
+    "could not fetch skin",
+    "unable to fetch skin",
+    "failed to find image from url",
+    "mineskinrequestexception",
+];
+
+const PLUGIN_UPDATE_CHECK_MARKERS: &[&str] = &[
+    "failed to check for updates",
+    "checkforupdate(",
+    "checkforupdatesandmetrics(",
+];
+
+const PLUGIN_COMPATIBILITY_MARKERS: &[&str] = &[
+    "cannot interact with paper-plugins",
+    "running on paper",
+    "deprecated mythicmobs api",
+    "legacy placeholder detected",
+    "notify the plugin author to update",
+    "join my discord",
+    "create an issue on github",
+    "already exists. using alternative",
+];
+
 const PLUGIN_CONFIG_MARKERS: &[&str] = &[
     "failed to load config",
     "could not load config",
     "invalid configuration",
+    "invalidconfigurationexception",
     "configuration error",
     "mapping values are not allowed",
     "json parse",
@@ -745,6 +872,7 @@ const PLUGIN_RUNTIME_MARKERS: &[&str] = &[
     "generated an exception",
     "nullpointerexception",
     "illegalargumentexception",
+    "nosuchelementexception",
     "nosuchmethoderror",
     "classnotfoundexception",
     "cannot invoke",
@@ -752,6 +880,7 @@ const PLUGIN_RUNTIME_MARKERS: &[&str] = &[
 
 const NETWORK_CONNECTION_MARKERS: &[&str] = &[
     "connecttimeoutexception",
+    "sockettimeoutexception",
     "connection reset",
     "connection refused",
     "connection timed out",
@@ -818,6 +947,61 @@ mod tests {
         assert_eq!(hint.code, "server_security");
         assert_eq!(hint.severity, "high");
         assert!(hint.markers.contains(&"offline/insecure mode"));
+    }
+
+    #[test]
+    fn splits_plugin_operational_failures_into_specific_hints() {
+        for (line, code, severity) in [
+            (
+                "[WARN]: [MythicMobs] --| Mechanic Line: summon{mob=x}",
+                "plugin_content_definition",
+                "medium",
+            ),
+            (
+                "[WARN]: [ModelEngine] Unable to activate MineSkin: Empty API Key",
+                "plugin_api_credentials",
+                "medium",
+            ),
+            (
+                "[WARN]: WardrobeManager disabled: WorldGuard not found!",
+                "plugin_dependency",
+                "medium",
+            ),
+            (
+                "[WARN]: [BigDoors] You have enabled \"unsafe mode\"!",
+                "plugin_unsafe_mode",
+                "medium",
+            ),
+            (
+                "[INFO]: WARN: Could not fetch skin: MineSkinRequestException",
+                "plugin_external_fetch",
+                "medium",
+            ),
+            (
+                "[WARN]: [NCCasino] Failed to check for updates: HTTP 403",
+                "plugin_update_check",
+                "low",
+            ),
+            (
+                "[WARN]: [PlugManX] cannot interact with paper-plugins, yet",
+                "plugin_compatibility",
+                "low",
+            ),
+        ] {
+            let hint = detect_ops_hint(line, detect_level(line)).expect("ops hint");
+            assert_eq!(hint.code, code, "{line}");
+            assert_eq!(hint.severity, severity, "{line}");
+        }
+    }
+
+    #[test]
+    fn marks_java_stack_frame_for_data_cleaning() {
+        let line = "[20:55:00] [Server thread/WARN]: \tat java.base/java.net.Socket.connect(Socket.java:668)";
+        assert_eq!(detect_log_line_kind(line), Some("stacktrace_frame"));
+        assert_eq!(
+            detect_log_line_kind("Caused by: java.net.SocketTimeoutException"),
+            None
+        );
     }
 
     #[test]

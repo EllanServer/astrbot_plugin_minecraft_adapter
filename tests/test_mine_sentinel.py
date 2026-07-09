@@ -3033,6 +3033,58 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertEqual(ops_info.get("subtype"), "配置解析异常")
         self.assertEqual(ops_info.get("report_categories"), ["plugin", "bug"])
 
+    def test_plugin_runtime_hints_use_specific_operational_subtypes(self):
+        cases = (
+            ("plugin_content_definition", "技能/内容定义错误", "medium", False),
+            ("plugin_api_credentials", "外部 API 凭据缺失", "medium", False),
+            ("plugin_dependency", "依赖缺失/功能降级", "medium", False),
+            ("plugin_unsafe_mode", "插件不安全模式", "medium", False),
+            ("plugin_external_fetch", "外部资源获取失败", "medium", False),
+            ("plugin_update_check", "插件更新检查失败", "low", True),
+            ("plugin_compatibility", "兼容性/弃用提示", "low", True),
+        )
+
+        for code, subtype, severity, observation in cases:
+            with self.subTest(code=code):
+                builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+                record = self._make_record(
+                    f"[Server thread/WARN]: structured hint {code}",
+                    level="WARN",
+                    context={
+                        "opsHintCode": code,
+                        "opsHintSeverity": severity,
+                        "opsHintMarkers": [code],
+                    },
+                )
+                self.assertEqual(builder.classify(record), "plugin")
+                expected_tag = (
+                    "server_log_plugin_observation"
+                    if observation
+                    else "server_log_plugin"
+                )
+                self.assertEqual(builder.tag(record), expected_tag)
+                ops_info = record.context.get("opsClassification") or {}
+                self.assertEqual(ops_info.get("subtype"), subtype)
+                self.assertEqual(ops_info.get("severity"), severity)
+                self.assertEqual(bool(ops_info.get("opsObservation")), observation)
+
+    def test_unattributed_stack_frame_and_warning_banner_are_context_only(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        stack_frame = self._make_record(
+            "[20:55:00] [Server thread/WARN]: "
+            "\tat java.base/java.net.Socket.connect(Socket.java:668)",
+            level="WARN",
+            context={"logLineKind": "stacktrace_frame"},
+        )
+        banner = self._make_record(
+            "[20:52:56] [Server thread/WARN]: [PlugManX] "
+            "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~",
+            level="WARN",
+        )
+
+        self.assertEqual(builder.classify(stack_frame), "daily")
+        self.assertEqual(builder.classify(banner), "daily")
+
     def test_offline_insecure_mode_is_auth_security_risk(self):
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         record = self._make_record(
@@ -3259,7 +3311,7 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertIn("一般观察", text)
         self.assertIn("插件加载失败与数据库连接超时", text)
         self.assertIn("短时间重复/无意义聊天内容", text)
-        self.assertIn("等级：Low", text)
+        self.assertIn("等级：低", text)
         self.assertIn("社区活动与普通问答", text)
         self.assertNotIn("事故级问题", text)
 
@@ -3290,6 +3342,65 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertNotIn("318 分钟", text)
         self.assertEqual(report["window_start_ts"], base_ts)
         self.assertEqual(report["window_end_ts"], base_ts + 318 * 60 * 1000)
+
+    def test_issue_builder_splits_same_tag_after_five_quiet_minutes(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Server thread/ERROR]: Could not load plugin Alpha",
+                level="ERROR",
+                timestamp=base_ts,
+            ),
+            self._make_record(
+                "[Server thread/ERROR]: Could not load plugin Beta",
+                level="ERROR",
+                timestamp=base_ts + 10 * 60 * 1000,
+            ),
+        ]
+
+        report = builder.build(records, 60, "survival")
+        plugin_issues = [
+            issue for issue in report["issues"] if issue.get("category") == "plugin"
+        ]
+        self.assertEqual(len(plugin_issues), 2)
+        self.assertTrue(
+            all(issue["first_seen_ts"] == issue["last_seen_ts"] for issue in plugin_issues)
+        )
+
+    def test_text_report_treats_offline_mode_as_server_security_risk(self):
+        from services.mine_sentinel.reporting.text_renderer import format_report
+
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        lines = (
+            "**** SERVER IS RUNNING IN OFFLINE/INSECURE MODE!",
+            "The server will make no attempt to authenticate usernames. Beware.",
+            'To change this, set "online-mode" to "true".',
+        )
+        markers = ("offline/insecure mode", "authenticate usernames", "online-mode")
+        records = [
+            self._make_record(
+                f"[Server thread/WARN]: {line}",
+                level="WARN",
+                timestamp=base_ts + index * 1000,
+                context={
+                    "opsHintCode": "server_security",
+                    "opsHintSeverity": "high",
+                    "opsHintMarkers": [markers[index]],
+                },
+            )
+            for index, line in enumerate(lines)
+        ]
+
+        report = builder.build(records, 60, "survival")
+        text = format_report(report, len(records), 0, 0)
+
+        self.assertIn("服务器离线模式与身份认证风险", text)
+        self.assertIn("服务端明确输出的认证配置风险，不是玩家聊天反馈", text)
+        self.assertIn("后端端口不可被公网直连", text)
+        self.assertNotIn("这是玩家侧反馈", text)
+        self.assertNotIn("复核聊天上下文", text)
 
     def test_key_evidence_filters_low_value_info_lifecycle_lines(self):
         from services.mine_sentinel.reporting.text_renderer import _incident_key_evidence
@@ -4148,6 +4259,74 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
                 self.assertEqual(hints.get("opsHintSeverity"), "high")
                 self.assertIn(marker, hints.get("opsHintMarkers", []))
 
+    def test_runtime_log_hints_split_plugin_operational_failures(self):
+        from services.mine_sentinel import runtime_log as runtime_module
+
+        cases = (
+            (
+                "[WARN]: [MythicMobs] --| Mechanic Line: summon{mob=SkeletalMinion}",
+                "plugin_content_definition",
+                "mechanic line:",
+                "medium",
+            ),
+            (
+                "[WARN]: [ModelEngine] Unable to activate MineSkin: Empty API Key",
+                "plugin_api_credentials",
+                "empty api key",
+                "medium",
+            ),
+            (
+                "[WARN]: [nwFurnitureShow] WardrobeManager disabled: WorldGuard not found!",
+                "plugin_dependency",
+                "worldguard not found",
+                "medium",
+            ),
+            (
+                "[WARN]: [BigDoors] You have enabled \"unsafe mode\"!",
+                "plugin_unsafe_mode",
+                "enabled \"unsafe mode\"",
+                "medium",
+            ),
+            (
+                "[INFO]: WARN: Could not fetch skin: MineSkinRequestException",
+                "plugin_external_fetch",
+                "could not fetch skin",
+                "medium",
+            ),
+            (
+                "[WARN]: [NCCasino] Failed to check for updates: HTTP 403",
+                "plugin_update_check",
+                "failed to check for updates",
+                "low",
+            ),
+            (
+                "[WARN]: [PlugManX] cannot interact with paper-plugins, yet",
+                "plugin_compatibility",
+                "cannot interact with paper-plugins",
+                "low",
+            ),
+        )
+
+        for line, code, marker, severity in cases:
+            with self.subTest(code=code):
+                hints = runtime_module._python_runtime_log_hints(line, 2000)
+                self.assertEqual(hints.get("opsHintCode"), code)
+                self.assertEqual(hints.get("opsHintSeverity"), severity)
+                self.assertIn(marker, hints.get("opsHintMarkers", []))
+
+    def test_runtime_log_hints_mark_java_stack_frame_for_data_cleaning(self):
+        from services.mine_sentinel import runtime_log as runtime_module
+
+        hints = runtime_module._python_runtime_log_hints(
+            "[20:55:00] [Server thread/WARN]: "
+            "\tat java.base/java.net.Socket.connect(Socket.java:668)",
+            2000,
+        )
+
+        self.assertEqual(hints.get("logLineKind"), "stacktrace_frame")
+        self.assertIn("stacktrace_frame", hints.get("qualityFlags", []))
+        self.assertLess(hints.get("llmQualityScore", 100), 90)
+
     def test_runtime_log_hints_add_low_risk_plugin_translation_hint(self):
         from services.mine_sentinel import runtime_log as runtime_module
 
@@ -4227,6 +4406,22 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertEqual(ctx.get("opsHintSeverity"), "high")
         self.assertIn("offline/insecure mode", ctx.get("opsHintMarkers", []))
         self.assertEqual(ctx["otel"]["attributes"]["ops.hint_code"], "server_security")
+
+    def test_build_observation_exposes_stack_frame_kind(self):
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+
+        obs = self._build(
+            "[20:55:00] [Server thread/WARN]: "
+            "\tat java.base/java.net.Socket.connect(Socket.java:668)",
+            MineSentinelRuntimeLogConfig(),
+        )
+        ctx = obs["context"]
+        self.assertEqual(ctx.get("logLineKind"), "stacktrace_frame")
+        self.assertIn("stacktrace_frame", ctx.get("dataQualityFlags", []))
+        self.assertEqual(
+            ctx["otel"]["attributes"]["log.line_kind"],
+            "stacktrace_frame",
+        )
 
     def test_build_observation_adds_plugin_translation_hint_context(self):
         from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
@@ -7282,6 +7477,88 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
         for record in malformed_records[:8]:
             ops_info = record.context.get("opsClassification") or {}
             self.assertEqual(ops_info.get("subtype"), "配置解析异常")
+
+    def test_real_plugin_failures_use_specific_subtypes(self):
+        builder = HeuristicReportBuilder(self.config)
+        expected = {
+            "plugin_content_definition": (10, "技能/内容定义错误"),
+            "plugin_api_credentials": (2, "外部 API 凭据缺失"),
+            "plugin_dependency": (1, "依赖缺失/功能降级"),
+            "plugin_unsafe_mode": (3, "插件不安全模式"),
+            "plugin_external_fetch": (1, "外部资源获取失败"),
+        }
+
+        for code, (minimum, subtype) in expected.items():
+            with self.subTest(code=code):
+                records = [
+                    record
+                    for record in self.records
+                    if record.context.get("opsHintCode") == code
+                ]
+                self.assertGreaterEqual(len(records), minimum)
+                for record in records:
+                    self.assertEqual(builder.classify(record), "plugin")
+                    ops_info = record.context.get("opsClassification") or {}
+                    self.assertEqual(ops_info.get("subtype"), subtype)
+                    self.assertNotEqual(builder.classify(record), "bug")
+
+    def test_real_update_and_compatibility_warnings_are_observations(self):
+        builder = HeuristicReportBuilder(self.config)
+        records = [
+            record
+            for record in self.records
+            if record.context.get("opsHintCode")
+            in {"plugin_update_check", "plugin_compatibility"}
+        ]
+        self.assertGreaterEqual(len(records), 11)
+
+        for record in records:
+            self.assertEqual(builder.classify(record), "plugin")
+            self.assertEqual(builder.tag(record), "server_log_plugin_observation")
+            ops_info = record.context.get("opsClassification") or {}
+            self.assertTrue(ops_info.get("opsObservation"))
+            self.assertFalse(ops_info.get("needs_admin"))
+
+        issue_text = json.dumps(self.report["issues"], ensure_ascii=False)
+        self.assertNotIn("Failed to check for updates", issue_text)
+        self.assertNotIn("join my discord", issue_text)
+        self.assertNotIn("create an issue on GitHub", issue_text)
+
+    def test_real_stack_frames_are_context_not_independent_bugs(self):
+        builder = HeuristicReportBuilder(self.config)
+        context_frames = [
+            record
+            for record in self.records
+            if record.context.get("logLineKind") == "stacktrace_frame"
+            and not record.context.get("opsHintCode")
+        ]
+        self.assertGreaterEqual(len(context_frames), 25)
+        self.assertEqual(
+            {builder.classify(record) for record in context_frames},
+            {"daily"},
+        )
+
+        bug_records = [
+            record for record in self.records if builder.classify(record) == "bug"
+        ]
+        self.assertLessEqual(len(bug_records), 55)
+        self.assertTrue(
+            all(record.context.get("opsHintCode") for record in bug_records),
+            "every remaining bug record should carry a structured root-cause hint",
+        )
+
+    def test_real_text_report_is_clear_and_surfaces_low_risk_observations(self):
+        from services.mine_sentinel.reporting.text_renderer import format_report
+
+        text = format_report(self.report, len(self.records), 0, 5)
+
+        self.assertIn("服务器离线模式与身份认证风险", text)
+        self.assertIn("插件低风险观察 25 条", text)
+        self.assertIn("性能旁证 1 条", text)
+        self.assertIn("补充：除上述事件外", text)
+        self.assertNotIn("6. 除上述事件外", text)
+        self.assertNotIn("这是玩家侧反馈", text)
+        self.assertNotIn("出现管理员求助或投诉内容", text)
 
     def test_real_report_has_five_sections_and_bounded_prompt(self):
         from services.mine_sentinel.reporting.ai_prompt import AIReportPromptBuilder

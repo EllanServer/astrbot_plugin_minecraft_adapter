@@ -39,7 +39,10 @@ def incident_time_text(group: IncidentGroup) -> str:
     start = as_millis(group.start_ts)
     end = as_millis(group.end_ts)
     if start and end and start != end:
-        return f"{format_millis(start)} ~ {format_millis(end)} 左右"
+        start_text = format_millis(start)
+        end_text = format_millis(end)
+        if start_text != end_text:
+            return f"{start_text} ~ {end_text} 左右"
     if start or end:
         return f"{format_millis(start or end)} 左右"
     return "本窗口内"

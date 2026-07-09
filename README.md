@@ -39,11 +39,13 @@ raw log line
 - `player_problems`：玩家问题/投诉识别，例如卡顿反馈、进服失败、功能不可用。
 - `risk_actions`：风险、处置建议和下一步动作。
 
+文本与图片报告共用 5 分钟事故窗口：同一作用域内连续证据会合并，超过 5 分钟无新证据则拆成新事件；安静窗口作为补充说明，不占用事件编号。插件更新检查、兼容性、本地化和轻微调度延迟会在“聊天与社区观察”中汇总展示，但不会抬高重点事件数量。
+
 ## 智能分类
 
 内置分类包括 `daily`、`complaint`、`bug`、`network`、`plugin`、`economy`、`community`、`chat_review`、`player_feedback`、`community_ops`、`moderation`、`cross_server`、`suggestion`。
 
-分类优先使用结构化 runtime hints 和 ops hints，再回退到关键词、上下文、日志等级、线程、插件名和事故聚合。真实样本 `tests/fixtures/mclogs_pbfhCaI.log` 来自 [mclo.gs/pbfhCaI](https://mclo.gs/pbfhCaI)，用于验证 QuickShop/经济异常、数据库异常、插件异常、网络异常、离线模式/认证绕过风险会进入正确分类；Malformed JSON、JSON/NBT 转换失败会归入插件配置/数据解析异常，而不是泛化 Java bug。同时 Hikari 生命周期日志、AstrbotAdapter/CMI 正常代理握手不会误报为管理事件；插件本地化资源键缺失、单个插件任务调度延迟等低风险 WARN 会进入观察分类，不升级为管理事件。
+分类优先使用结构化 runtime hints 和 ops hints，再回退到关键词、上下文、日志等级、线程、插件名和事故聚合。真实样本 `tests/fixtures/mclogs_pbfhCaI.log` 来自 [mclo.gs/pbfhCaI](https://mclo.gs/pbfhCaI)，用于验证 QuickShop/经济异常、数据库异常、插件异常、网络异常、离线模式/认证绕过风险会进入正确分类；Malformed JSON、JSON/NBT 转换失败会归入插件配置/数据解析异常，MythicMobs 内容定义、插件依赖、外部 API 凭据、外部资源获取和不安全运行模式会给出独立运维子类型，而不是泛化 Java bug。同时 Hikari 生命周期日志、AstrbotAdapter/CMI 正常代理握手不会误报为管理事件；Java 纯堆栈帧和装饰横幅只作为上下文，插件更新检查、兼容性/弃用、本地化资源键缺失、单个插件任务调度延迟等低风险 WARN 会进入观察分类，不升级为管理事件。
 
 可用配置控制分类入口：
 

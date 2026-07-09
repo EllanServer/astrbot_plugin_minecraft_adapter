@@ -104,6 +104,10 @@ _PREFIX_RE = re.compile(
     r"(?:\[[^\]]+\]\s*)?(?:\[[A-Z]+\]\s*)?",
     re.IGNORECASE,
 )
+_STACKTRACE_FRAME_RE = re.compile(
+    r"(?:at\s+\S+\([^\r\n]*\)(?:\s+~\[[^\]]*\])?|\.\.\.\s+\d+\s+more)",
+    re.IGNORECASE,
+)
 _ERROR_WORDS = (
     "error",
     "exception",
@@ -1698,6 +1702,9 @@ _OPS_ISSUE_MARKERS = (
     "cannot",
     "could not",
     "unable",
+    "deprecated",
+    "legacy placeholder detected",
+    "notify the plugin author",
 )
 _OPS_HINT_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
@@ -1755,12 +1762,86 @@ _OPS_HINT_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "plugin_content_definition",
+        "medium",
+        (
+            "configuration error in mechanic",
+            "configuration error: particle",
+            "mechanic line:",
+            "must be a valid mythicmob",
+        ),
+    ),
+    (
+        "plugin_api_credentials",
+        "medium",
+        (
+            "empty api key",
+            "without api key",
+            "missing api key",
+            "api key is missing",
+            "invalid api key",
+        ),
+    ),
+    (
+        "plugin_dependency",
+        "medium",
+        (
+            "missing dependency",
+            "dependency not found",
+            "required dependency",
+            "worldguard not found",
+        ),
+    ),
+    (
+        "plugin_unsafe_mode",
+        "medium",
+        (
+            "enabled \"unsafe mode\"",
+            "this is not supported! use this at your own risk",
+            "websocket server is enabled. this is not recommended for production servers",
+        ),
+    ),
+    (
+        "plugin_external_fetch",
+        "medium",
+        (
+            "could not fetch skin",
+            "unable to fetch skin",
+            "failed to find image from url",
+            "mineskinrequestexception",
+        ),
+    ),
+    (
+        "plugin_update_check",
+        "low",
+        (
+            "failed to check for updates",
+            "checkforupdate(",
+            "checkforupdatesandmetrics(",
+        ),
+    ),
+    (
+        "plugin_compatibility",
+        "low",
+        (
+            "cannot interact with paper-plugins",
+            "running on paper",
+            "deprecated mythicmobs api",
+            "legacy placeholder detected",
+            "notify the plugin author to update",
+            "join my discord",
+            "create an issue on github",
+            "already exists. using alternative",
+        ),
+    ),
+    (
         "plugin_config",
         "medium",
         (
             "failed to load config",
             "could not load config",
             "invalid configuration",
+            "invalidconfigurationexception",
             "configuration error",
             "mapping values are not allowed",
             "json parse",
@@ -1800,6 +1881,7 @@ _OPS_HINT_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "generated an exception",
             "nullpointerexception",
             "illegalargumentexception",
+            "nosuchelementexception",
             "nosuchmethoderror",
             "classnotfoundexception",
             "cannot invoke",
@@ -1810,6 +1892,7 @@ _OPS_HINT_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "medium",
         (
             "connecttimeoutexception",
+            "sockettimeoutexception",
             "connection reset",
             "connection refused",
             "connection timed out",
@@ -1866,15 +1949,26 @@ def _detect_ops_hint(content: str, level: str) -> dict[str, Any] | None:
     return None
 
 
+def _detect_log_line_kind(content: str) -> str:
+    body = _PREFIX_RE.sub("", str(content or "")).lstrip(" :\t")
+    if _STACKTRACE_FRAME_RE.fullmatch(body):
+        return "stacktrace_frame"
+    return "message"
+
+
 def _python_runtime_log_hints(line: str, max_line_length: int) -> dict[str, Any]:
     truncated = _truncate(line, max_line_length)
     content = _sanitize_line(truncated)
     clean_text, redaction_count, quality_flags = _clean_for_llm(truncated)
     if len(str(line or "")) > max_line_length:
         quality_flags.append("truncated")
+    line_kind = _detect_log_line_kind(content)
+    if line_kind == "stacktrace_frame":
+        quality_flags.append("stacktrace_frame")
     hints: dict[str, Any] = {
         "content": content,
         "level": _detect_level(content),
+        "logLineKind": line_kind,
         "fingerprint": _fingerprint(content),
         "llmCleanText": clean_text,
         "llmCleanHash": _clean_text_hash(clean_text),
@@ -2156,6 +2250,7 @@ def _build_observation(
         if str(flag)
     ][:12]
     redaction_count = _as_millis(hints.get("redactionCount"))
+    log_line_kind = str(hints.get("logLineKind") or "message").strip() or "message"
     ops_hint_code = str(hints.get("opsHintCode") or "").strip()
     ops_hint_severity = str(hints.get("opsHintSeverity") or "").strip().lower()
     ops_hint_markers = [
@@ -2167,6 +2262,7 @@ def _build_observation(
         "source": "astrbot_runtime_log",
         "logFile": str(log_file),
         "level": level,
+        "logLineKind": log_line_kind,
         "fingerprint": fingerprint,
         "llmCleanText": llm_clean_text,
         "llmCleanHash": llm_clean_hash,
@@ -2197,6 +2293,7 @@ def _build_observation(
                 "template.id": template_id,
                 "template.size": parsed.cluster_size,
                 "fingerprint": fingerprint,
+                "log.line_kind": log_line_kind,
                 "llm.clean_text": llm_clean_text,
                 "llm.clean_hash": llm_clean_hash,
                 "llm.quality_score": llm_quality_score,
@@ -2474,6 +2571,8 @@ def _llm_quality_score(redaction_count: int, flags: list[str]) -> int:
             score -= 80
         elif flag in {"low_signal_repetition", "low_signal_symbols"}:
             score -= 35
+        elif flag == "stacktrace_frame":
+            score -= 18
         elif flag in {"control_stripped", "truncated"}:
             score -= 8
         elif flag == "whitespace_collapsed":

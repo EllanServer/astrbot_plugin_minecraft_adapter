@@ -52,7 +52,7 @@ class MineSentinelReportImageRenderer:
         self._labels = DEFAULT_LABELS
         self._presentation_builder = ReportPresentationBuilder(
             issue_policy=IssuePolicy(),
-            incident_grouper=IncidentGrouper(merge_window_ms=60 * 60 * 1000),
+            incident_grouper=IncidentGrouper(),
         )
 
     async def render(
@@ -96,12 +96,18 @@ class MineSentinelReportImageRenderer:
         incident_groups, observation_groups = text_report._split_incident_groups(
             presentation.incidents
         )
+        category_observations = text_report._category_observation_lines(report)
         canvas.stats(
             [
                 ("重点事件", str(len(incident_groups)), "#fff7ed", self.AMBER),
                 ("高风险事件", str(text_report._high_risk_count(incident_groups)), "#fef2f2", self.RED),
                 ("待人工复核", str(text_report._manual_review_count(incident_groups)), "#eff6ff", self.BLUE),
-                ("一般观察", str(len(observation_groups)), "#ecfdf5", self.GREEN),
+                (
+                    "一般观察",
+                    str(len(observation_groups) + len(category_observations)),
+                    "#ecfdf5",
+                    self.GREEN,
+                ),
             ]
         )
         player_count = text_report._player_count(report, presentation.unique_players)
@@ -130,8 +136,10 @@ class MineSentinelReportImageRenderer:
         if observation_groups:
             for index, group in enumerate(observation_groups[:6], 1):
                 canvas.incident_card(index, group, label="观察", observation=True)
+            if category_observations:
+                canvas.bullet_list(category_observations)
         else:
-            canvas.info_note("本窗口未识别到需要单独记录的低风险聊天或社区观察。")
+            canvas.bullet_list(text_report._observation_lines(report, []))
 
         canvas.section_title("玩家问题/投诉识别")
         canvas.bullet_list(text_report._player_problem_lines(presentation.issues, incident_groups + observation_groups))
@@ -147,12 +155,11 @@ class MineSentinelReportImageRenderer:
                 observation_groups,
             )
         )
-
-        canvas.section_title("建议处理")
+        canvas.paragraph("处置顺序", size=26, color=self.TEXT)
         canvas.numbered_list(text_report._action_lines(presentation.issues))
 
         canvas.footer(f"证据：共 {presentation.total_count} 条观察，涉及玩家 {player_count} 人。")
-        canvas.footer(f"本次总结由 AI 根据完整{_format_duration(report)}聊天上下文、玩家事件和服务器指标生成。")
+        canvas.footer(f"本报告基于完整{_format_duration(report)}运行日志、玩家事件和结构化分类生成。")
         return canvas.output()
 
     async def _ensure_assets(self):
