@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+import random
 
 from ..models import ObservationRecord
 from ..observation_priority import observation_priority_score
@@ -23,6 +24,10 @@ class RecentWindowBuilder:
         self.reservoir_records: list[ObservationRecord] = []
         self.identities: set[str] = set()
         self.total_count = 0
+        # Per-builder RNG so sampling is independent across concurrent window
+        # reads. Not seeded: window sampling does not require reproducibility
+        # (total_count is always reported separately from kept records).
+        self._rng = random.Random()
 
     def add(self, record: ObservationRecord):
         self.total_count += 1
@@ -62,9 +67,16 @@ class RecentWindowBuilder:
             self.reservoir_records.append(record)
             return
 
-        # Deterministic reservoir-style replacement: bounded memory while still
-        # sampling across the whole time window instead of keeping only the head.
-        index = (self.total_count * 1103515245 + 12345) % self.total_count
+        # Standard reservoir sampling (Algorithm R): for the n-th record (n
+        # already incremented in total_count), pick a random index in [0, n).
+        # If it falls within the reservoir, replace that slot. This gives every
+        # record an equal probability of being kept, sampling across the whole
+        # time window instead of only the head.
+        #
+        # Previous implementation used ``(n * a + b) % n`` which is mathematically
+        # equal to ``b % n`` (since n*a % n == 0), causing the replacement index
+        # to collapse to a constant and overwrite a single slot repeatedly.
+        index = self._rng.randrange(self.total_count)
         if index < self.reservoir_limit:
             self.reservoir_records[index] = record
 

@@ -443,11 +443,26 @@ class HourlySummarizer:
     def _normalize_cycle_report(
         self, parsed: dict[str, Any], fallback: dict[str, Any]
     ) -> dict[str, Any]:
+        # LLM 可能返回字符串而非 list（如 key_issues="..."），list("abc")
+        # 会拆成字符列表，后续 .get 崩溃。先 isinstance 校验，非 list
+        # 一律回退到 fallback。
+        raw_issues = parsed.get("key_issues")
+        if not isinstance(raw_issues, list):
+            raw_issues = fallback.get("issues") or []
+        raw_timeline = parsed.get("timeline")
+        if not isinstance(raw_timeline, list):
+            raw_timeline = fallback.get("timeline") or []
         return {
             "server_id": fallback.get("server_id"),
             "summary": str(parsed.get("summary") or fallback.get("summary", ""))[:3000],
-            "key_issues": list(parsed.get("key_issues") or fallback.get("issues") or [])[:50],
-            "timeline": list(parsed.get("timeline") or fallback.get("timeline") or [])[:24],
+            # 仅保留 dict 元素，避免字符串/数字元素在 format_cycle_report
+            # 里调用 .get 崩溃。
+            "key_issues": [
+                issue for issue in raw_issues[:50] if isinstance(issue, dict)
+            ],
+            "timeline": [
+                entry for entry in raw_timeline[:24] if isinstance(entry, dict)
+            ],
             "recommendations": [
                 str(r) for r in (parsed.get("recommendations") or [])
             ][:10],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import threading
 import time
 from contextlib import ExitStack
 from collections.abc import Callable
@@ -36,6 +37,12 @@ class DiskObservationStore:
         self.observation_dir.mkdir(parents=True, exist_ok=True)
         self.export_dir.mkdir(parents=True, exist_ok=True)
         self._last_cleanup_at: float | None = None
+        # 全局写/读锁：DiskObservationStore 的 add_batch / recent_window /
+        # export_recent / cleanup 会并发操作同一组磁盘文件与内存缓存，
+        # io_workers>0 时通过 to_thread 并发调用可达竞态。用一把可重入锁
+        # 串行化所有公共方法，保证缓存/索引/JSONL 写入的一致性。可重入
+        # 允许 cleanup_if_due 在 add_batch 持锁时安全调用。
+        self._lock = threading.RLock()
         # Short-lived cache for the most recent window read, so that an alert
         # triggered right after a periodic report (or vice versa) does not scan
         # disk twice for the same window. Key: (window_minutes, server_id).
@@ -57,65 +64,76 @@ class DiskObservationStore:
         batch_server_id = str(payload.get("serverId") or server_id)
         batch_server_name = str(payload.get("serverName") or batch_server_id)
 
-        written = 0
-        handles: dict[Path, Any] = {}
-        indexes: dict[Path, JsonlOffsetIndex] = {}
-        with ExitStack() as stack:
-            for item in observations:
-                if not isinstance(item, dict):
-                    continue
-                record = ObservationRecord.from_dict(
-                    item,
-                    batch_server_id,
-                    batch_server_name,
-                )
-                if record.kind.upper() != "SERVER_LOG":
-                    continue
-                if not record.server_id:
-                    record.server_id = batch_server_id
-                if record.timestamp and record.timestamp < cutoff_ms:
-                    continue
-                self.codec.normalize_record(record)
-                path = self._record_path(record)
-                handle = handles.get(path)
-                if handle is None:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    # PR9 hotfix v3: 用二进制 append 模式打开。
-                    # 文本模式的 tell() 返回 TextIO cookie，不应被当作
-                    # 二进制 byte offset 用于 read_jsonl_window 的 seek()。
-                    # UTF-8 中文日志、不同换行处理、缓冲状态下 cookie 与
-                    # raw byte offset 不一致，会导致 seek 到错误位置，
-                    # 轻则读到半截 JSON 行被 JSONDecodeError 跳过，
-                    # 重则窗口报告漏日志。
-                    handle = stack.enter_context(path.open("ab"))
-                    handles[path] = handle
-                    # Load or create the offset index sidecar for this file.
-                    idx = JsonlOffsetIndex.for_jsonl(
-                        path,
-                        trust_legacy_index=self.config.storage.trust_legacy_index,
-                    )
-                    idx.load()
-                    indexes[path] = idx
-                idx = indexes[path]
-                # Record the byte offset of this line's start before writing.
-                # binary handle.tell() 返回真实 byte offset，与
-                # read_jsonl_window 的 binary seek 一致。
-                line_offset = handle.tell()
-                idx.maybe_index(record.timestamp, line_offset)
-                # 写入 UTF-8 编码的 JSON 行 + 换行。
-                handle.write(self.codec.json_line(record).encode("utf-8"))
-                handle.write(b"\n")
-                written += 1
+        with self._lock:
+            written = 0
+            skipped = 0
+            handles: dict[Path, Any] = {}
+            indexes: dict[Path, JsonlOffsetIndex] = {}
+            with ExitStack() as stack:
+                for item in observations:
+                    if not isinstance(item, dict):
+                        continue
+                    # 单条容错：畸形 observation 不再中断整个 batch。
+                    # from_dict 已对 context/raw/player 做类型防御，但
+                    # normalize_record/codec 仍可能对极端输入抛异常。
+                    try:
+                        record = ObservationRecord.from_dict(
+                            item,
+                            batch_server_id,
+                            batch_server_name,
+                        )
+                    except Exception:
+                        skipped += 1
+                        continue
+                    if record.kind.upper() != "SERVER_LOG":
+                        continue
+                    if not record.server_id:
+                        record.server_id = batch_server_id
+                    if record.timestamp and record.timestamp < cutoff_ms:
+                        continue
+                    try:
+                        self.codec.normalize_record(record)
+                    except Exception:
+                        skipped += 1
+                        continue
+                    path = self._record_path(record)
+                    handle = handles.get(path)
+                    if handle is None:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        # PR9 hotfix v3: 用二进制 append 模式打开。
+                        # 文本模式的 tell() 返回 TextIO cookie，不应被当作
+                        # 二进制 byte offset 用于 read_jsonl_window 的 seek()。
+                        handle = stack.enter_context(path.open("ab"))
+                        handles[path] = handle
+                        idx = JsonlOffsetIndex.for_jsonl(
+                            path,
+                            trust_legacy_index=self.config.storage.trust_legacy_index,
+                        )
+                        idx.load()
+                        indexes[path] = idx
+                    idx = indexes[path]
+                    line_offset = handle.tell()
+                    idx.maybe_index(record.timestamp, line_offset)
+                    handle.write(self.codec.json_line(record).encode("utf-8"))
+                    handle.write(b"\n")
+                    written += 1
 
-            # Flush all touched indexes so reads can use them immediately.
-            for idx in indexes.values():
-                idx.flush()
+                # 先 flush 数据句柄，再 flush 索引：避免索引先落盘指向尚未
+                # 写入的数据行，导致并发读取方 seek 到 EOF 漏记录。
+                for handle in handles.values():
+                    try:
+                        handle.flush()
+                    except Exception:
+                        pass
+                # Flush all touched indexes so reads can use them immediately.
+                for idx in indexes.values():
+                    idx.flush()
 
-        self.cleanup_if_due(now)
-        # New observations invalidate the cached window read.
-        self._window_cache_key = None
-        self._window_cache_value = None
-        return written
+            self.cleanup_if_due(now)
+            # New observations invalidate the cached window read.
+            self._window_cache_key = None
+            self._window_cache_value = None
+            return written
 
     def recent(
         self,
@@ -133,51 +151,60 @@ class DiskObservationStore:
         if not self.config.enabled or not self.config.storage.enabled:
             return RecentObservationWindow([], 0, 0, False, 0)
 
-        cache_key = (window_minutes, server_id)
-        now = time.time()
-        if (
-            self._window_cache_key == cache_key
-            and self._window_cache_value is not None
-            and now - self._window_cache_at < self._window_cache_ttl
-            and max_records is None
-        ):
-            return self._window_cache_value
-
-        cutoff_ms = int((now - window_minutes * 60) * 1000)
-        # window end bound = now; lets read_jsonl_window stop scanning a file
-        # once it encounters records beyond the window upper bound.
-        # +1ms 余量：read_jsonl_window 的 end_ms 是右开边界（ts >= end_ms break），
-        # 当前时刻写入的记录 timestamp == int(now*1000) 不应被排除。
-        end_ms = int(now * 1000) + 1
-        limit = max(1, max_records or self.config.report.max_records_in_memory)
-        builder = RecentWindowBuilder(limit)
-        with self._dedupe_tracker() as seen:
-            for path in self._candidate_files(server_id, cutoff_ms):
-                # 加载 .idx 偏移索引，让 read_jsonl_window 从 cutoff 附近 seek。
-                idx = JsonlOffsetIndex.for_jsonl(
-                    path,
-                    trust_legacy_index=self.config.storage.trust_legacy_index,
+        with self._lock:
+            cache_key = (window_minutes, server_id)
+            now = time.time()
+            if (
+                self._window_cache_key == cache_key
+                and self._window_cache_value is not None
+                and now - self._window_cache_at < self._window_cache_ttl
+                and max_records is None
+            ):
+                # 返回缓存的浅拷贝：records 是可变 list，调用方就地修改会
+                # 污染缓存。RecentObservationWindow 是 frozen，但 list 字段
+                # 本身可变，故复制 list。
+                cached = self._window_cache_value
+                return RecentObservationWindow(
+                    records=list(cached.records),
+                    total_count=cached.total_count,
+                    unique_players=cached.unique_players,
+                    truncated=cached.truncated,
+                    max_records=cached.max_records,
                 )
-                idx.load()
-                for row in self.codec.read_jsonl_window(
-                    path, cutoff_ms, end_ms, index=idx
-                ):
-                    record = ObservationRecord.from_dict(row)
-                    if record.timestamp < cutoff_ms:
-                        continue
-                    if record.timestamp > end_ms:
-                        continue
-                    key = self.codec.dedupe_key(record)
-                    if seen.seen_or_add(key):
-                        continue
-                    builder.add(record)
-        result = builder.build()
 
-        if max_records is None:
-            self._window_cache_key = cache_key
-            self._window_cache_value = result
-            self._window_cache_at = now
-        return result
+            cutoff_ms = int((now - window_minutes * 60) * 1000)
+            end_ms = int(now * 1000) + 1
+            limit = max(1, max_records or self.config.report.max_records_in_memory)
+            builder = RecentWindowBuilder(limit)
+            with self._dedupe_tracker() as seen:
+                for path in self._candidate_files(server_id, cutoff_ms):
+                    idx = JsonlOffsetIndex.for_jsonl(
+                        path,
+                        trust_legacy_index=self.config.storage.trust_legacy_index,
+                    )
+                    idx.load()
+                    for row in self.codec.read_jsonl_window(
+                        path, cutoff_ms, end_ms, index=idx
+                    ):
+                        try:
+                            record = ObservationRecord.from_dict(row)
+                        except Exception:
+                            continue
+                        if record.timestamp < cutoff_ms:
+                            continue
+                        if record.timestamp > end_ms:
+                            continue
+                        key = self.codec.dedupe_key(record)
+                        if seen.seen_or_add(key):
+                            continue
+                        builder.add(record)
+            result = builder.build()
+
+            if max_records is None:
+                self._window_cache_key = cache_key
+                self._window_cache_value = result
+                self._window_cache_at = now
+            return result
 
     def _export_suffix(self) -> str:
         """Return the file suffix for exports based on config."""
@@ -186,8 +213,15 @@ class DiskObservationStore:
         return ".jsonl"
 
     def _open_export(self, path: Path, mode: str = "w"):
-        """Open an export file, using gzip when the suffix is ``.jsonl.gz``."""
-        if path.name.endswith(".gz"):
+        """Open an export file, using gzip when the suffix is ``.jsonl.gz``.
+
+        识别时先剥离原子写阶段追加的 ``.tmp`` 后缀，避免临时文件名
+        ``foo.jsonl.gz.tmp`` 被误判为普通文本文件。
+        """
+        name = path.name
+        if name.endswith(".tmp"):
+            name = name[: -len(".tmp")]
+        if name.endswith(".gz"):
             return gzip.open(path, mode + "t", encoding="utf-8")
         return path.open(mode, encoding="utf-8")
 
@@ -201,22 +235,30 @@ class DiskObservationStore:
     ) -> Path | None:
         if not records:
             return None
-        # PR9 hotfix v5: 用毫秒级时间戳，配合 window_export_stem 的毫秒级精度。
-        # end_ms 可选：周期报告 retry 时传固定的 scheduled_window_end_ms 使
-        # 多次重试命中同一文件名以复用；手动 report now 不传，用当前时间。
-        now = int(time.time() * 1000) if end_ms is None else end_ms
-        suffix = self._export_suffix()
-        path = export_path(
-            self.export_dir, window_minutes, server_id, label, now, suffix=suffix
-        )
-        # 同窗口复用：如果文件已存在且复用开启，直接返回
-        if self.config.report.export_reuse_existing and path.exists():
+        with self._lock:
+            now = int(time.time() * 1000) if end_ms is None else end_ms
+            suffix = self._export_suffix()
+            path = export_path(
+                self.export_dir, window_minutes, server_id, label, now, suffix=suffix
+            )
+            # 同窗口复用：如果文件已存在且复用开启，直接返回
+            if self.config.report.export_reuse_existing and path.exists():
+                return path
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            try:
+                with self._open_export(tmp_path) as handle:
+                    for record in records:
+                        handle.write(self.codec.json_line(record))
+                        handle.write("\n")
+                # 原子 rename：避免中途异常留下截断文件被 reuse_existing 复用。
+                tmp_path.replace(path)
+            except Exception:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
             return path
-        with self._open_export(path) as handle:
-            for record in records:
-                handle.write(self.codec.json_line(record))
-                handle.write("\n")
-        return path
 
     def export_recent(
         self,
@@ -228,70 +270,83 @@ class DiskObservationStore:
         if not self.config.enabled or not self.config.storage.enabled:
             return None
 
-        now_ts = int(time.time())
-        cutoff_ms = int((now_ts - window_minutes * 60) * 1000)
-        # +1ms 余量：read_jsonl_window 的 end_ms 是右开边界（ts >= end_ms break），
-        # 当前时刻写入的记录不应被排除。
-        end_ms = int(now_ts * 1000) + 1
-        suffix = self._export_suffix()
-        # PR9 hotfix v5: 传毫秒级 end_ms 给 export_path，配合毫秒级文件名精度。
-        path = export_path(
-            self.export_dir, window_minutes, server_id, label, end_ms, suffix=suffix
-        )
+        with self._lock:
+            now_ts = int(time.time())
+            cutoff_ms = int((now_ts - window_minutes * 60) * 1000)
+            end_ms = int(now_ts * 1000) + 1
+            suffix = self._export_suffix()
+            path = export_path(
+                self.export_dir, window_minutes, server_id, label, end_ms, suffix=suffix
+            )
 
-        # 同窗口复用：如果文件已存在且复用开启，直接返回
-        if self.config.report.export_reuse_existing and path.exists():
+            # 同窗口复用：如果文件已存在且复用开启，直接返回
+            if self.config.report.export_reuse_existing and path.exists():
+                return path
+
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            written = 0
+            try:
+                with self._dedupe_tracker() as seen:
+                    with self._open_export(tmp_path) as handle:
+                        for source_path in self._candidate_files(server_id, cutoff_ms):
+                            idx = JsonlOffsetIndex.for_jsonl(
+                                source_path,
+                                trust_legacy_index=self.config.storage.trust_legacy_index,
+                            )
+                            idx.load()
+                            for row in self.codec.read_jsonl_window(
+                                source_path, cutoff_ms, end_ms, index=idx
+                            ):
+                                try:
+                                    record = ObservationRecord.from_dict(row)
+                                except Exception:
+                                    continue
+                                if record.timestamp < cutoff_ms:
+                                    continue
+                                if record.timestamp > end_ms:
+                                    continue
+                                key = self.codec.dedupe_key(record)
+                                if seen.seen_or_add(key):
+                                    continue
+                                if predicate is not None and not predicate(record):
+                                    continue
+                                handle.write(self.codec.json_line(record))
+                                handle.write("\n")
+                                written += 1
+                if not written:
+                    tmp_path.unlink(missing_ok=True)
+                    return None
+                # 原子 rename：避免中途异常留下截断文件被 reuse_existing 复用。
+                tmp_path.replace(path)
+            except Exception:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
             return path
 
-        written = 0
-        with self._dedupe_tracker() as seen:
-            with self._open_export(path) as handle:
-                for source_path in self._candidate_files(server_id, cutoff_ms):
-                    idx = JsonlOffsetIndex.for_jsonl(
-                        source_path,
-                        trust_legacy_index=self.config.storage.trust_legacy_index,
-                    )
-                    idx.load()
-                    for row in self.codec.read_jsonl_window(
-                        source_path, cutoff_ms, end_ms, index=idx
-                    ):
-                        record = ObservationRecord.from_dict(row)
-                        if record.timestamp < cutoff_ms:
-                            continue
-                        if record.timestamp > end_ms:
-                            continue
-                        key = self.codec.dedupe_key(record)
-                        if seen.seen_or_add(key):
-                            continue
-                        if predicate is not None and not predicate(record):
-                            continue
-                        handle.write(self.codec.json_line(record))
-                        handle.write("\n")
-                        written += 1
-        if not written:
-            path.unlink(missing_ok=True)
-            return None
-        return path
-
     def cleanup_if_due(self, now: float | None = None) -> bool:
-        current = time.time() if now is None else now
-        interval = max(0, self.config.storage.cleanup_interval_seconds)
-        if (
-            interval > 0
-            and self._last_cleanup_at is not None
-            and current - self._last_cleanup_at < interval
-        ):
-            return False
-        self.cleanup()
-        self._last_cleanup_at = current
-        return True
+        with self._lock:
+            current = time.time() if now is None else now
+            interval = max(0, self.config.storage.cleanup_interval_seconds)
+            if (
+                interval > 0
+                and self._last_cleanup_at is not None
+                and current - self._last_cleanup_at < interval
+            ):
+                return False
+            self.cleanup()
+            self._last_cleanup_at = current
+            return True
 
     def cleanup(self):
-        cleanup_old_files(
-            self.observation_dir,
-            self.export_dir,
-            self.config.storage.retention_minutes,
-        )
+        with self._lock:
+            cleanup_old_files(
+                self.observation_dir,
+                self.export_dir,
+                self.config.storage.retention_minutes,
+            )
 
     def _record_path(self, record: ObservationRecord) -> Path:
         return record_path(self.observation_dir, record)

@@ -440,8 +440,19 @@ class MineSentinelService:
         # Check whether the cycle is complete.
         hours_per_cycle = self.config.hourly_summary.hours_per_cycle
         if len(buf) >= hours_per_cycle:
-            await self._finalize_hourly_cycle(server_id, buf, cycle_start)
-            # Reset the cycle for the next window.
+            try:
+                await self._finalize_hourly_cycle(server_id, buf, cycle_start)
+            except Exception as exc:
+                # 周期收尾失败不应阻塞下一周期：build_cycle_report /
+                # format_cycle_report 对 LLM 畸形输出可能抛异常，若不捕获，
+                # buf 与 cycle_start 不会重置，下一小时再次满足
+                # len(buf) >= hours_per_cycle 会用不断增长的 buf 反复失败，
+                # 造成内存增长与告警静默。
+                logger.warning(
+                    f"[MineSentinel] hourly 周期收尾失败，重置缓冲区继续: {exc}"
+                )
+                self.last_error = f"hourly 周期收尾失败: {exc}"
+            # 无论成功失败都重置周期，避免无限重试 + 内存增长。
             self._hourly_cycle_buffers[server_id] = []
             self._hourly_cycle_starts[server_id] = 0
             # Cleanup old persisted summaries beyond retention.

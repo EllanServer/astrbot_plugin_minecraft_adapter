@@ -505,11 +505,22 @@ class MineSentinelRuntimeLogTailer:
                 )
                 state.partial_line = b""
                 state.partial = ""
-            await self._backfill_source(
+            # 轮转后 position 设置需区分 backfill 是否已读取新 latest.log：
+            # - backfill 候选包含 state.log_file 时，新文件已有内容已被 emit，
+            #   position 设为新文件大小，避免下一轮 _read_appended_lines 从头
+            #   重读相同字节产生重复 observation。
+            # - 否则（如 source 未配置 logs_dir/log_file，仅 state.log_file
+            #   被外部指定），backfill 未读取该文件，position 必须归零，否则
+            #   下一轮从 EOF 开始会漏读新文件已写入的行。
+            backfill_candidates = await self._backfill_source(
                 state,
                 max(10, self.config.poll_interval_seconds * 3 // 60 + 1),
             )
-            state.position = 0
+            if _path_in_list(state.log_file, backfill_candidates):
+                new_size = await self.io_runner(_file_size, state.log_file)
+                state.position = new_size or 0
+            else:
+                state.position = 0
             if had_pending:
                 logger.info(
                     f"[MineSentinel] runtime log {state.source.server_id} "
@@ -555,16 +566,24 @@ class MineSentinelRuntimeLogTailer:
         )
         await self._emit_lines(state, lines, state.log_file)
 
-    async def _backfill_source(self, state: _SourceState, window_minutes: int):
+    async def _backfill_source(
+        self, state: _SourceState, window_minutes: int
+    ) -> list[Path]:
         cutoff_ms = int((time.time() - max(1, window_minutes) * 60) * 1000)
-        rows = await self.io_runner(
-            _read_backfill_lines,
+        candidates = await self.io_runner(
+            _backfill_candidates,
             state.source,
             self.config,
             cutoff_ms,
         )
+        rows = await self.io_runner(
+            _read_backfill_lines,
+            candidates,
+            self.config,
+            cutoff_ms,
+        )
         if not rows:
-            return
+            return candidates
         observations: list[dict[str, Any]] = []
         emitted = 0
         emit_threshold = max(1, self.config.max_lines_per_poll)
@@ -597,6 +616,7 @@ class MineSentinelRuntimeLogTailer:
             f"[MineSentinel] runtime log backfilled {emitted} record(s) "
             f"for {state.source.server_id}"
         )
+        return candidates
 
     async def _emit_lines(
         self,
@@ -872,12 +892,12 @@ def _read_tail_lines(path: Path, line_count: int, max_line_length: int) -> list[
 
 
 def _read_backfill_lines(
-    source: MineSentinelLogSourceConfig,
+    candidates: list[Path],
     config: MineSentinelRuntimeLogConfig,
     cutoff_ms: int,
 ) -> list[tuple[str, int, str]]:
     rows: list[tuple[str, int, str]] = []
-    for path in _backfill_candidates(source, config, cutoff_ms):
+    for path in candidates:
         for line, timestamp_ms in _iter_timestamped_lines(
             path,
             config.max_line_length,
@@ -896,21 +916,28 @@ def _read_backfill_lines(
 # 命中时直接复用上次结果。latest.log 不缓存（实时增长）。
 # PR9 hotfix: 改用 OrderedDict 实现 LRU 淘汰，命中时移到末尾（最近使用），
 # 上限超过时弹出最旧（最久未用）条目，替代原来按 key 字典序保留的粗略策略。
+# 线程安全：read_hour_log_lines 通过 io_runner 在专用线程池执行，多个
+# hourly job 可并发调用，OrderedDict.move_to_end + popitem 序列非原子，
+# 用锁保护避免丢条目或 LRU 状态不一致。
+import threading as _threading
+
 from collections import OrderedDict as _OrderedDict
 
 _GZ_SCAN_CACHE_MAX_ENTRIES = 64
 _gz_scan_cache: _OrderedDict[tuple[str, int, int], list[tuple[str, int, str]]] = _OrderedDict()
+_gz_scan_cache_lock = _threading.Lock()
 
 
 def _gz_scan_cache_get(
     path: Path, mtime: int, hour_start_ms: int
 ) -> list[tuple[str, int, str]] | None:
     key = (str(path), mtime, hour_start_ms)
-    value = _gz_scan_cache.get(key)
-    if value is not None:
-        # LRU: 命中时移到末尾（最近使用）。
-        _gz_scan_cache.move_to_end(key)
-    return value
+    with _gz_scan_cache_lock:
+        value = _gz_scan_cache.get(key)
+        if value is not None:
+            # LRU: 命中时移到末尾（最近使用）。
+            _gz_scan_cache.move_to_end(key)
+        return value
 
 
 def _gz_scan_cache_put(
@@ -920,15 +947,16 @@ def _gz_scan_cache_put(
     rows: list[tuple[str, int, str]],
 ) -> None:
     key = (str(path), mtime, hour_start_ms)
-    if key in _gz_scan_cache:
-        # 已存在：更新值并移到末尾。
+    with _gz_scan_cache_lock:
+        if key in _gz_scan_cache:
+            # 已存在：更新值并移到末尾。
+            _gz_scan_cache[key] = rows
+            _gz_scan_cache.move_to_end(key)
+            return
+        while len(_gz_scan_cache) >= _GZ_SCAN_CACHE_MAX_ENTRIES:
+            # LRU 淘汰：弹出最旧（最久未用）的条目。
+            _gz_scan_cache.popitem(last=False)
         _gz_scan_cache[key] = rows
-        _gz_scan_cache.move_to_end(key)
-        return
-    while len(_gz_scan_cache) >= _GZ_SCAN_CACHE_MAX_ENTRIES:
-        # LRU 淘汰：弹出最旧（最久未用）的条目。
-        _gz_scan_cache.popitem(last=False)
-    _gz_scan_cache[key] = rows
 
 
 def _file_date_overlaps_hour(
@@ -1079,6 +1107,26 @@ def build_hour_observations(
         if len(observations) >= max_records:
             break
     return observations
+
+
+def _path_in_list(target: Path, candidates: list[Path]) -> bool:
+    """判断 target 是否在候选路径列表中。
+
+    比较时优先用 resolve() 规范化以容忍相对路径/符号链接差异；resolve
+    失败（如路径不存在）时回退到原始字符串比较。
+    """
+    try:
+        target_resolved = str(target.resolve())
+    except OSError:
+        target_resolved = str(target)
+    for cand in candidates:
+        try:
+            if str(cand.resolve()) == target_resolved:
+                return True
+        except OSError:
+            if str(cand) == str(target):
+                return True
+    return False
 
 
 def _backfill_candidates(
@@ -1240,25 +1288,34 @@ def _skip_parsed_template(content: str, fingerprint: str) -> ParsedTemplate:
 
 # daily_noise_patterns 编译缓存：key=tuple(patterns) → list[re.Pattern]。
 # 避免每条日志都重新编译正则；config 不变时直接复用。
+# 线程安全：首次编译在锁内完成，避免并发首次调用重复编译；后续只读。
 _NOISE_PATTERN_CACHE: dict[tuple[str, ...], list["re.Pattern[str]"]] = {}
+_noise_pattern_cache_lock = _threading.Lock()
 
 
 def _compile_noise_patterns(patterns: list[str]) -> list["re.Pattern[str]"]:
     """编译 daily_noise_patterns，缓存结果。无效正则会被忽略并记日志。"""
     key = tuple(patterns)
+    # 双检锁：先无锁读，命中直接返回；未命中再加锁编译，避免每次调用
+    # 都获取锁（热路径）。
     cached = _NOISE_PATTERN_CACHE.get(key)
     if cached is not None:
         return cached
-    compiled: list["re.Pattern[str]"] = []
-    for raw in patterns:
-        try:
-            compiled.append(re.compile(raw, re.IGNORECASE))
-        except re.error as exc:
-            logger.warning(
-                f"[MineSentinel] daily_noise_patterns 正则 {raw!r} 编译失败：{exc}，已忽略。"
-            )
-    _NOISE_PATTERN_CACHE[key] = compiled
-    return compiled
+    with _noise_pattern_cache_lock:
+        # 再次检查，防止并发首次调用重复编译。
+        cached = _NOISE_PATTERN_CACHE.get(key)
+        if cached is not None:
+            return cached
+        compiled: list["re.Pattern[str]"] = []
+        for raw in patterns:
+            try:
+                compiled.append(re.compile(raw, re.IGNORECASE))
+            except re.error as exc:
+                logger.warning(
+                    f"[MineSentinel] daily_noise_patterns 正则 {raw!r} 编译失败：{exc}，已忽略。"
+                )
+        _NOISE_PATTERN_CACHE[key] = compiled
+        return compiled
 
 
 def _match_noise_patterns(content: str, compiled: list["re.Pattern[str]"]) -> bool:

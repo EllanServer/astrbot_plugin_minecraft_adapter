@@ -150,6 +150,21 @@ class LogTemplateMiner:
                 return server_id
             return "default"
 
+    def _persistence_path_for(self, server_id: str) -> str | None:
+        """返回指定 namespace 的独立持久化路径。
+
+        每个 server_id 使用独立文件，避免多 namespace 共享同一
+        ``_persistence_path`` 时后写覆盖先写、模板持久化互相丢失。
+        """
+        if not self._persistence_path:
+            return None
+        # 用 safe_name 规范化 server_id，防止路径穿越（虽然 server_id
+        # 来自配置，保持与 storage/paths.py 一致的防御）。
+        from .storage.paths import safe_name
+
+        suffix = safe_name(server_id)
+        return f"{self._persistence_path}.{suffix}"
+
     def _get_or_create_miner(self, server_id: str) -> Any:
         """获取或创建指定 server_id 的 drain3 miner。
 
@@ -160,8 +175,6 @@ class LogTemplateMiner:
 
         if len(self._miners) >= self._max_namespaces and server_id != "default":
             # 超出上限：复用 "default" miner，不再创建新 namespace。
-            # 注意：调用方应通过 _resolve_namespace 已经把 server_id 归一到 "default"，
-            # 这里保留兜底逻辑以防直接调用。
             logger.warning(
                 f"[MineSentinel] template miner namespaces 达到上限 "
                 f"{self._max_namespaces}，server_id={server_id} 将复用 default namespace。"
@@ -175,11 +188,12 @@ class LogTemplateMiner:
         config.parametric_name = True
 
         persistence = None
-        if self._persistence_path:
+        namespace_path = self._persistence_path_for(server_id)
+        if namespace_path:
             try:
                 from drain3.file_persistence import FilePersistence
 
-                persistence = FilePersistence(self._persistence_path)
+                persistence = FilePersistence(namespace_path)
             except ImportError:
                 logger.warning(
                     "[MineSentinel] drain3 FilePersistence 不可用，回退到内存模式。"
@@ -188,9 +202,9 @@ class LogTemplateMiner:
         miner = TemplateMiner(config=config, persistence_handler=persistence)
         if persistence:
             try:
-                miner.load_state(self._persistence_path)
+                miner.load_state(namespace_path)
                 logger.info(
-                    f"[MineSentinel] 模板树已从 {self._persistence_path} 加载，"
+                    f"[MineSentinel] 模板树已从 {namespace_path} 加载，"
                     f"共 {len(miner.drain.id_to_cluster)} 个模板簇。"
                 )
             except Exception as exc:
@@ -352,8 +366,12 @@ class LogTemplateMiner:
         for server_id, miner in items:
             lock = self._lock_for(server_id)
             with lock:
+                # 每个 namespace 存到独立文件，避免互相覆盖。
+                namespace_path = self._persistence_path_for(server_id)
+                if not namespace_path:
+                    continue
                 try:
-                    miner.save_state(self._persistence_path)
+                    miner.save_state(namespace_path)
                 except Exception as exc:
                     logger.warning(f"[MineSentinel] 模板树存盘失败: {exc}")
                     success = False

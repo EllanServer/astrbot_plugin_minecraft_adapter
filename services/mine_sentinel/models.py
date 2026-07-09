@@ -692,7 +692,17 @@ class ObservationRecord:
     def from_dict(
         cls, data: dict[str, Any], batch_server_id: str = "", batch_server_name: str = ""
     ) -> "ObservationRecord":
-        player = data.get("player") or {}
+        player = data.get("player")
+        if not isinstance(player, dict):
+            player = {}
+        # 防御非 dict 的 context/raw：外部上报或磁盘读回的畸形数据可能是
+        # 字符串/列表，直接 dict(...) 会抛 ValueError 中断整批解析。
+        context = data.get("context")
+        if not isinstance(context, dict):
+            context = {}
+        raw = data.get("raw")
+        if not isinstance(raw, dict):
+            raw = {}
         return cls(
             event_id=str(data.get("eventId") or ""),
             kind=str(data.get("kind") or ""),
@@ -705,8 +715,8 @@ class ObservationRecord:
             player_uuid_hash=str(player.get("uuidHash") or ""),
             content=str(data.get("content") or ""),
             tags=[str(t) for t in data.get("tags", []) if t is not None],
-            context=dict(data.get("context") or {}),
-            raw=dict(data.get("raw") or {}),
+            context=context,
+            raw=raw,
         )
 
     @property

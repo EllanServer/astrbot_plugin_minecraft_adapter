@@ -15,12 +15,52 @@ except Exception:  # pragma: no cover - minimal test environments may omit aioht
 
 
 DEFAULT_FONT_FILENAME = "LXGWWenKaiGB-Regular.ttf"
+# 可选的字体 SHA-256 校验值。留空表示不校验哈希（仍会校验字体头部魔数与
+# 体积上限）。若运维通过环境变量 MINESENTINEL_FONT_SHA256 设置了正确哈希，
+# 下载内容必须匹配才落盘，防止第三方 CDN 被劫持投递恶意字体经 freetype
+# 原生解析触发 RCE。
+import os as _os
+
+DEFAULT_FONT_SHA256 = (_os.environ.get("MINESENTINEL_FONT_SHA256") or "").lower()
 DEFAULT_FONT_URLS = [
-    "https://ghproxy.net/https://raw.githubusercontent.com/lxgw/LxgwWenkaiGB/main/fonts/TTF/LXGWWenKaiGB-Regular.ttf",
-    "https://jsd.cdn.zzko.cn/gh/lxgw/LxgwWenkaiGB@main/fonts/TTF/LXGWWenKaiGB-Regular.ttf",
     "https://raw.githubusercontent.com/lxgw/LxgwWenkaiGB/main/fonts/TTF/LXGWWenKaiGB-Regular.ttf",
     "https://cdn.jsdelivr.net/gh/lxgw/LxgwWenkaiGB@main/fonts/TTF/LXGWWenKaiGB-Regular.ttf",
+    "https://ghproxy.net/https://raw.githubusercontent.com/lxgw/LxgwWenkaiGB/main/fonts/TTF/LXGWWenKaiGB-Regular.ttf",
+    "https://jsd.cdn.zzko.cn/gh/lxgw/LxgwWenkaiGB@main/fonts/TTF/LXGWWenKaiGB-Regular.ttf",
 ]
+# 字体下载体积上限（字节）。LXGW WenKai GB Regular TTF 约 8-12MB，设 32MB
+# 余量。超过即拒绝并中止下载，防止恶意服务器返回超大响应耗尽内存。
+MAX_FONT_DOWNLOAD_BYTES = 32 * 1024 * 1024
+# 小于此值视为无效字体文件。
+MIN_FONT_DOWNLOAD_BYTES = 100 * 1024
+
+
+def _sha256_hex(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def _is_valid_ttf_header(data: bytes) -> bool:
+    """快速校验下载内容是否为合法 TrueType/OpenType 字体头部。
+
+    TTF/OTF 文件以 sfnt 版本魔数开头：
+    - TrueType: 0x00010000 或 'true'
+    - OpenType (CFF): 'OTTO'
+    - TTC: 'ttcf'
+    这一层校验无法替代完整 freetype 解析，但能在落盘前挡掉明显非字体
+    二进制（如 HTML 错误页、脚本），缩小攻击面。
+    """
+    if len(data) < 4:
+        return False
+    head = data[:4]
+    return head in (
+        b"\x00\x01\x00\x00",  # TTF v1
+        b"true",  # TTF (Apple variant)
+        b"OTTO",  # OTF (CFF)
+        b"ttcf",  # TTC collection
+        b"typ1",  # PostScript Type 1
+    )
 
 
 class FontProvider:
@@ -57,10 +97,40 @@ class FontProvider:
                     async with session.get(url) as resp:
                         if resp.status != 200:
                             continue
-                        data = await resp.read()
-                if len(data) < 100 * 1024:
+                        # 流式下载到内存并强制上限，防止恶意服务器返回
+                        # 超大响应耗尽内存（DoS/OOM）。
+                        data = bytearray()
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            data.extend(chunk)
+                            if len(data) > MAX_FONT_DOWNLOAD_BYTES:
+                                logger.debug(
+                                    f"[Renderer] 字体下载超过上限 "
+                                    f"{MAX_FONT_DOWNLOAD_BYTES} 字节，中止: {url}"
+                                )
+                                data = None
+                                break
+                        if data is None:
+                            continue
+                        data = bytes(data)
+                if len(data) < MIN_FONT_DOWNLOAD_BYTES:
                     continue
-                self.font_path.write_bytes(data)
+                # 校验字体头部魔数，挡掉 HTML 错误页/脚本等非字体二进制。
+                if not _is_valid_ttf_header(data):
+                    logger.debug(f"[Renderer] 字体头部魔数非法，跳过: {url}")
+                    continue
+                # 若配置了 SHA-256，强制校验；不匹配则拒绝落盘。
+                if DEFAULT_FONT_SHA256:
+                    digest = _sha256_hex(data)
+                    if digest != DEFAULT_FONT_SHA256:
+                        logger.warning(
+                            f"[Renderer] 字体 SHA-256 不匹配，拒绝落盘: {url} "
+                            f"(expected={DEFAULT_FONT_SHA256[:12]}..., got={digest[:12]}...)"
+                        )
+                        continue
+                # 原子写：先写临时文件再 rename，避免并发写盘竞态写出损坏字体。
+                tmp_path = self.font_path.with_suffix(self.font_path.suffix + ".tmp")
+                tmp_path.write_bytes(data)
+                tmp_path.replace(self.font_path)
                 logger.info(
                     f"[Renderer] 已缓存中文字体: {self.font_path.name} ({len(data) // 1024}KB)"
                 )
