@@ -3033,6 +3033,27 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertEqual(ops_info.get("subtype"), "配置解析异常")
         self.assertEqual(ops_info.get("report_categories"), ["plugin", "bug"])
 
+    def test_offline_insecure_mode_is_auth_security_risk(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/WARN]: **** SERVER IS RUNNING IN OFFLINE/INSECURE MODE!",
+            level="WARN",
+            context={
+                "opsHintCode": "server_security",
+                "opsHintSeverity": "high",
+                "opsHintMarkers": ["offline/insecure mode"],
+            },
+        )
+
+        self.assertEqual(builder.classify(record), "moderation")
+        self.assertEqual(builder.tag(record), "server_log_auth")
+        ops_info = record.context.get("opsClassification") or {}
+        self.assertEqual(ops_info.get("category"), "认证与接入安全")
+        self.assertEqual(ops_info.get("subtype"), "离线模式/认证绕过风险")
+        self.assertEqual(ops_info.get("severity"), "high")
+        self.assertTrue(ops_info.get("needs_admin"))
+        self.assertEqual(ops_info.get("report_categories"), ["moderation"])
+
     def test_plugin_translation_warning_is_low_risk_observation(self):
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         record = self._make_record(
@@ -4099,6 +4120,34 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertEqual(hints.get("opsHintSeverity"), "medium")
         self.assertIn("jsonsyntaxexception", hints.get("opsHintMarkers", []))
 
+    def test_runtime_log_hints_add_ops_hint_for_offline_security(self):
+        from services.mine_sentinel import runtime_log as runtime_module
+
+        cases = [
+            (
+                "[20:53:20] [Server thread/WARN]: "
+                "**** SERVER IS RUNNING IN OFFLINE/INSECURE MODE!",
+                "offline/insecure mode",
+            ),
+            (
+                "[20:53:20] [Server thread/WARN]: "
+                "The server will make no attempt to authenticate usernames. Beware.",
+                "authenticate usernames",
+            ),
+            (
+                "[20:53:20] [Server thread/WARN]: "
+                'To change this, set "online-mode" to "true" in the server.properties file.',
+                "online-mode",
+            ),
+        ]
+
+        for line, marker in cases:
+            with self.subTest(marker=marker):
+                hints = runtime_module._python_runtime_log_hints(line, 2000)
+                self.assertEqual(hints.get("opsHintCode"), "server_security")
+                self.assertEqual(hints.get("opsHintSeverity"), "high")
+                self.assertIn(marker, hints.get("opsHintMarkers", []))
+
     def test_runtime_log_hints_add_low_risk_plugin_translation_hint(self):
         from services.mine_sentinel import runtime_log as runtime_module
 
@@ -4164,6 +4213,20 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertEqual(ctx.get("opsHintSeverity"), "high")
         self.assertIn("quickshop", ctx.get("opsHintMarkers", []))
         self.assertEqual(ctx["otel"]["attributes"]["ops.hint_code"], "economy_shop")
+
+    def test_build_observation_adds_security_hint_context(self):
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+
+        obs = self._build(
+            "[20:53:20] [Server thread/WARN]: "
+            "**** SERVER IS RUNNING IN OFFLINE/INSECURE MODE!",
+            MineSentinelRuntimeLogConfig(),
+        )
+        ctx = obs["context"]
+        self.assertEqual(ctx.get("opsHintCode"), "server_security")
+        self.assertEqual(ctx.get("opsHintSeverity"), "high")
+        self.assertIn("offline/insecure mode", ctx.get("opsHintMarkers", []))
+        self.assertEqual(ctx["otel"]["attributes"]["ops.hint_code"], "server_security")
 
     def test_build_observation_adds_plugin_translation_hint_context(self):
         from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
@@ -7053,7 +7116,7 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
         self.assertIn("plugin", issue_categories)
         self.assertIn("network", issue_categories)
         self.assertIn("economy", issue_categories)
-        self.assertNotIn("moderation", issue_categories)
+        self.assertIn("moderation", issue_categories)
         self.assertNotIn("community", issue_categories)
         self.assertNotIn("player_feedback", issue_categories)
         self.assertNotIn("cross_server", issue_categories)
@@ -7067,6 +7130,7 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
             "ConnectTimeoutException",
             "Unknown system variable 'WSREP_ON'",
             "Failed to move old config file",
+            "OFFLINE/INSECURE MODE",
         ):
             self.assertIn(marker, issue_text)
         for marker in (
@@ -7081,6 +7145,44 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
             "No failed migration detected",
         ):
             self.assertNotIn(marker, issue_text)
+
+    def test_real_offline_mode_warning_is_auth_risk_not_generic_bug(self):
+        security_records = [
+            record
+            for record in self.records
+            if (
+                "OFFLINE/INSECURE MODE" in record.content
+                or "authenticate usernames" in record.content
+                or "online-mode" in record.content
+            )
+        ]
+        self.assertEqual(len(security_records), 3)
+
+        builder = HeuristicReportBuilder(self.config)
+        for record in security_records:
+            self.assertEqual(builder.classify(record), "moderation")
+            self.assertEqual(builder.tag(record), "server_log_auth")
+            ops_info = record.context.get("opsClassification") or {}
+            self.assertEqual(ops_info.get("category"), "认证与接入安全")
+            self.assertEqual(ops_info.get("subtype"), "离线模式/认证绕过风险")
+            self.assertTrue(ops_info.get("needs_admin"))
+
+        auth_issues = [
+            issue for issue in self.report["issues"]
+            if issue.get("category") == "moderation"
+        ]
+        self.assertTrue(auth_issues, "expected offline auth risk issue")
+        auth_text = json.dumps(auth_issues, ensure_ascii=False)
+        self.assertIn("OFFLINE/INSECURE MODE", auth_text)
+        bug_text = json.dumps(
+            [
+                issue for issue in self.report["issues"]
+                if issue.get("category") == "bug"
+            ],
+            ensure_ascii=False,
+        )
+        self.assertNotIn("OFFLINE/INSECURE MODE", bug_text)
+        self.assertNotIn("authenticate usernames", bug_text)
 
     def test_report_promotes_economy_asset_failures_from_real_log(self):
         economy_issues = [

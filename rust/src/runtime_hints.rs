@@ -335,6 +335,13 @@ fn detect_ops_hint(content: &str, level: &str) -> Option<OpsHint> {
             });
         }
     }
+    if let Some(markers) = matched_markers(&text, SERVER_SECURITY_MARKERS) {
+        return Some(OpsHint {
+            code: "server_security",
+            severity: "high",
+            markers,
+        });
+    }
     if let Some(markers) = matched_markers(&text, PLUGIN_CONFIG_MARKERS) {
         return Some(OpsHint {
             code: "plugin_config",
@@ -700,6 +707,12 @@ const DATABASE_CONNECTION_MARKERS: &[&str] = &[
 
 const DATABASE_CONNECTION_NEGATIVE_MARKERS: &[&str] = DATABASE_TIMEOUT_NEGATIVE_MARKERS;
 
+const SERVER_SECURITY_MARKERS: &[&str] = &[
+    "offline/insecure mode",
+    "authenticate usernames",
+    "online-mode",
+];
+
 const PLUGIN_CONFIG_MARKERS: &[&str] = &[
     "failed to load config",
     "could not load config",
@@ -793,6 +806,18 @@ mod tests {
         assert_eq!(hint.code, "plugin_config");
         assert_eq!(hint.severity, "medium");
         assert!(hint.markers.contains(&"jsonsyntaxexception"));
+    }
+
+    #[test]
+    fn detects_offline_mode_as_security_hint() {
+        let hint = detect_ops_hint(
+            "[Server thread/WARN]: **** SERVER IS RUNNING IN OFFLINE/INSECURE MODE!",
+            "WARN",
+        )
+        .expect("ops hint");
+        assert_eq!(hint.code, "server_security");
+        assert_eq!(hint.severity, "high");
+        assert!(hint.markers.contains(&"offline/insecure mode"));
     }
 
     #[test]

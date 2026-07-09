@@ -265,7 +265,10 @@ CATEGORY_KEYS = {
         "logged out",
         "premium",
         "offline mode",
+        "offline/insecure mode",
         "online mode",
+        "online-mode",
+        "authenticate usernames",
         "uuid",
         "session",
         "白名单",
@@ -854,6 +857,19 @@ OPS_LOG_RULES: tuple[dict[str, Any], ...] = (
         "report_categories": ("bug", "economy"),
     },
     {
+        "category": "认证与接入安全",
+        "subtype": "离线模式/认证绕过风险",
+        "markers": (
+            "offline/insecure mode",
+            "authenticate usernames",
+            "online-mode",
+        ),
+        "requires_issue_level": True,
+        "severity": "high",
+        "impact": "服务器离线或未验证用户名时，需确认是否只允许受控代理接入，否则可能存在冒名登录风险。",
+        "report_categories": ("moderation",),
+    },
+    {
         "category": "插件与模组",
         "subtype": "插件加载/启用失败",
         "markers": (
@@ -1215,6 +1231,7 @@ OPS_CATEGORY_REPORT_MAP: dict[str, tuple[str, ...]] = {
     "数据库与存储": ("bug", "economy"),
     "经济与资产": ("economy",),
     "权限与命令": ("moderation", "plugin"),
+    "认证与接入安全": ("moderation",),
     "安全与反作弊": ("community",),
     "备份与恢复": ("bug",),
     "指标观察": (),
@@ -1240,6 +1257,13 @@ OPS_HINT_CLASSIFICATIONS: dict[str, dict[str, Any]] = {
         "severity": "high",
         "impact": "可能导致依赖数据库的插件读写失败或状态不同步。",
         "report_categories": ("bug", "economy"),
+    },
+    "server_security": {
+        "category": "认证与接入安全",
+        "subtype": "离线模式/认证绕过风险",
+        "severity": "high",
+        "impact": "服务器离线或未验证用户名时，需确认是否只允许受控代理接入，否则可能存在冒名登录风险。",
+        "report_categories": ("moderation",),
     },
     "plugin_config": {
         "category": "插件与模组",

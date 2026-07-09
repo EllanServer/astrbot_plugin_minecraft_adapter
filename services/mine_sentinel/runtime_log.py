@@ -1748,6 +1748,15 @@ _OPS_HINT_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "server_security",
+        "high",
+        (
+            "offline/insecure mode",
+            "authenticate usernames",
+            "online-mode",
+        ),
+    ),
+    (
         "plugin_config",
         "medium",
         (
