@@ -139,5 +139,12 @@ def cleanup_old_files(
 
 
 def safe_name(value: str) -> str:
+    # 防止路径穿越：剥离前导点号、折叠连续点号为下划线，并拒绝 "."/".."。
+    # 仅靠字符类 [^A-Za-z0-9_.-] 不足，因为 "." 和 ".." 都是合法字符，
+    # 直接拼入路径会逃逸到父目录。
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    safe = re.sub(r"\.{2,}", "_", safe)  # 折叠 "..."、".." 等
+    safe = safe.lstrip(".")  # 剥离前导点号，避免 ".hidden" 类名
+    if safe in {"", ".", ".."}:
+        return "unknown"
     return safe[:80] or "unknown"
