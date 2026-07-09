@@ -714,6 +714,16 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
         self.assertIn("template", ctx)
         self.assertIn("templateSize", ctx)
 
+    def test_runtime_hints_marks_diagnostic_detail(self):
+        from services.mine_sentinel import runtime_log as runtime_module
+
+        line = "[20:57:06] [Server thread/INFO]:   » Connect timed out"
+        hints = runtime_module._runtime_log_hints(line, 1000)
+
+        self.assertEqual(hints["logLineKind"], "diagnostic_detail")
+        self.assertIn("diagnostic_detail", hints["qualityFlags"])
+        self.assertLess(hints["llmQualityScore"], 100)
+
     def test_build_observation_includes_otel_fields(self):
         """_build_observation 应当在 context.otel 写入 OTel Logs Data Model 字段。"""
         from services.mine_sentinel.models import MineSentinelLogSourceConfig
@@ -896,6 +906,86 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
             self.assertEqual(evidence, [])
         finally:
             ad_module._global_detector = old_global
+
+    def test_anomaly_evidence_filters_low_score_noise_and_generic_templates(self):
+        from services.mine_sentinel.models import ObservationRecord
+        from services.mine_sentinel.reporting import ai_prompt as prompt_module
+
+        class Detector:
+            @staticmethod
+            def snapshot():
+                return {
+                    "anomalies": [
+                        {
+                            "server_id": "srv",
+                            "template_id": "LOW_SCORE",
+                            "template": "connection reset",
+                            "level": "WARN",
+                            "current_score": 0.3,
+                        },
+                        {
+                            "server_id": "srv",
+                            "template_id": "GENERIC",
+                            "template": "<*> [Server thread/WARN]: <*> <*>",
+                            "level": "WARN",
+                            "current_score": 1.0,
+                        },
+                        {
+                            "server_id": "srv",
+                            "template_id": "ACTIONABLE",
+                            "template": "<*> connection reset",
+                            "level": "WARN",
+                            "current_score": 0.9,
+                            "reason": "ewma_spike",
+                        },
+                    ]
+                }
+
+        def record(template_id, content, level, ops):
+            return ObservationRecord(
+                event_id=template_id + content,
+                kind="SERVER_LOG",
+                timestamp=1700000000000,
+                server_id="srv",
+                server_name="Srv",
+                content=content,
+                tags=["server_log", level.lower()],
+                context={
+                    "templateId": template_id,
+                    "level": level,
+                    "opsClassification": ops,
+                },
+            )
+
+        low_ops = {
+            "category": "启动与关闭",
+            "subtype": "常规运行信息",
+            "severity": "info",
+            "needs_admin": False,
+        }
+        actionable_ops = {
+            "category": "网络与代理",
+            "subtype": "网络连接异常",
+            "severity": "high",
+            "needs_admin": True,
+        }
+        records = [
+            record("LOW_SCORE", "low score warning", "WARN", actionable_ops),
+            record("GENERIC", "database unavailable", "WARN", actionable_ops),
+            record("ACTIONABLE", "healthy startup", "INFO", low_ops),
+            record("ACTIONABLE", "connection reset by peer", "WARN", actionable_ops),
+        ]
+        old_get = prompt_module.get_anomaly_detector
+        try:
+            prompt_module.get_anomaly_detector = lambda: Detector()
+            evidence = prompt_module.AIReportPromptBuilder(
+                MineSentinelConfig.from_dict({})
+            ).anomaly_evidence(records)
+        finally:
+            prompt_module.get_anomaly_detector = old_get
+
+        self.assertEqual([item["template_id"] for item in evidence], ["ACTIONABLE"])
+        self.assertEqual(evidence[0]["samples"], ["connection reset by peer"])
 
     def test_ai_prompt_compact_record_prefers_clean_text(self):
         from services.mine_sentinel.reporting.ai_prompt import AIReportPromptBuilder
@@ -1820,6 +1910,48 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertTrue(matched)
         self.assertEqual(calls, [1])
 
+    def test_native_category_batch_skips_direct_classification_paths(self):
+        from services.mine_sentinel.reporting import rules as rules_module
+        from tests.mine_sentinel_rs_stub import report_category_features_batch_stub
+
+        original = rules_module._rs_report_category_features_batch
+        original_min_records = rules_module.NATIVE_CATEGORY_BATCH_MIN_RECORDS
+        captured = []
+
+        def native_features(records, groups):
+            captured.extend(record.event_id for record in records)
+            return report_category_features_batch_stub(records, groups)
+
+        records = [
+            self._make_record("generic socket text", level="INFO"),
+            self._make_record(
+                "[Vulcan] Steve failed Fly",
+                tags=["server_log", "anticheat_vulcan"],
+            ),
+            self._make_record(
+                "database connection failed",
+                level="WARN",
+                context={"opsHintCode": "database_connection"},
+            ),
+            self._make_record(
+                "at java.base/java.lang.Thread.run(Thread.java:1)",
+                level="WARN",
+                context={"logLineKind": "stacktrace_frame"},
+            ),
+        ]
+        records[0].event_id = "generic"
+        try:
+            rules_module._rs_report_category_features_batch = native_features
+            rules_module.NATIVE_CATEGORY_BATCH_MIN_RECORDS = 1
+            builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+            builder._prepare_native_category_features(records)
+        finally:
+            rules_module._rs_report_category_features_batch = original
+            rules_module.NATIVE_CATEGORY_BATCH_MIN_RECORDS = original_min_records
+
+        self.assertEqual(captured, ["generic"])
+        self.assertEqual(set(builder._native_category_feature_cache), {id(records[0])})
+
     def test_report_category_feature_failure_falls_back_to_python(self):
         from services.mine_sentinel.reporting import rules as rules_module
 
@@ -2051,7 +2183,11 @@ class MineSentinelRulesTests(unittest.TestCase):
             level="INFO",
         )
         self.assertEqual(builder.classify(record), "player_feedback")
-        self.assertEqual(builder.tag(record), "server_log_player_feedback")
+        self.assertEqual(
+            builder.tag(record),
+            "server_log_player_feedback_observation",
+        )
+        self.assertEqual(builder.build([record], 60)["issues"], [])
 
     def test_player_feedback_does_not_alert(self):
         """player_feedback 通常不告警。"""
@@ -2083,7 +2219,11 @@ class MineSentinelRulesTests(unittest.TestCase):
             level="INFO",
         )
         self.assertEqual(builder.classify(record), "community_ops")
-        self.assertEqual(builder.tag(record), "server_log_community_ops")
+        self.assertEqual(
+            builder.tag(record),
+            "server_log_community_ops_observation",
+        )
+        self.assertEqual(builder.build([record], 60)["issues"], [])
 
     def test_community_ops_severe_raises_to_high(self):
         """community_ops 命中事故关键词应提级 high 并告警。"""
@@ -2229,8 +2369,8 @@ class MineSentinelRulesTests(unittest.TestCase):
         report = builder.build([record], window_minutes=60)
         self.assertEqual(report["max_severity"], "high")
 
-    def test_severity_critical_for_extreme_anomaly(self):
-        """异常分数 >= 0.8 应当直接提级 critical。"""
+    def test_extreme_anomaly_without_critical_semantics_caps_at_high(self):
+        """频率突增不能在缺少崩溃语义时单独制造 critical。"""
         config = MineSentinelConfig.from_dict({})
         builder = HeuristicReportBuilder(config)
         record = self._make_record(
@@ -2239,7 +2379,75 @@ class MineSentinelRulesTests(unittest.TestCase):
             context={"anomalyScore": 0.9, "anomalyReason": "ewma_spike: ratio=8.0"},
         )
         report = builder.build([record], window_minutes=60)
-        self.assertEqual(report["max_severity"], "critical")
+        self.assertEqual(report["max_severity"], "high")
+
+    def test_healthy_info_anomaly_remains_context_not_issue(self):
+        """正常 INFO 的统计突增不能单独制造紧急事件。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/INFO]: [ezAuctions] Enabling ezAuctions v2.4.4",
+            level="INFO",
+            context={
+                "anomalyScore": 1.0,
+                "anomalyReason": "ewma_spike: count=20 baseline=1.0 ratio=20.0",
+            },
+        )
+
+        report = builder.build([record], window_minutes=60)
+
+        self.assertEqual(builder.classify(record), "economy")
+        self.assertEqual(report["issues"], [])
+        self.assertEqual(report["max_severity"], "low")
+
+    def test_healthy_info_does_not_inflate_actionable_evidence(self):
+        """同类健康 INFO 只作上下文，不计入故障证据数或严重度。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        records = [
+            self._make_record(
+                "[Server thread/INFO]: [Vault] Enabling Vault v1.7.3",
+                level="INFO",
+                timestamp=1_000,
+                context={"anomalyScore": 1.0},
+            ),
+            self._make_record(
+                "[Server thread/WARN]: [QuickShop] Connect timed out",
+                level="WARN",
+                timestamp=2_000,
+            ),
+            self._make_record(
+                "[Server thread/ERROR]: [QuickShop] Economy request failed",
+                level="ERROR",
+                timestamp=3_000,
+            ),
+        ]
+
+        report = builder.build(records, window_minutes=60)
+        economy_issues = [
+            issue for issue in report["issues"] if issue["category"] == "economy"
+        ]
+
+        self.assertEqual(len(economy_issues), 1)
+        self.assertEqual(economy_issues[0]["evidence_count"], 2)
+        self.assertEqual(economy_issues[0]["severity"], "high")
+        self.assertEqual(report["max_severity"], "high")
+
+    def test_filtered_daily_anomaly_does_not_set_report_max_severity(self):
+        """被判为堆栈上下文的记录不能污染报告最高风险。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "at java.base/sun.net.NetworkClient.doConnect(NetworkClient.java:166)",
+            level="WARN",
+            context={
+                "logLineKind": "stacktrace_frame",
+                "anomalyScore": 1.0,
+            },
+        )
+
+        report = builder.build([record], window_minutes=60)
+
+        self.assertEqual(builder.classify(record), "daily")
+        self.assertEqual(report["issues"], [])
+        self.assertEqual(report["max_severity"], "low")
 
     # --- 检查项目开关 / 过滤 ---
     def test_category_enabled_disables_specific_category(self):
@@ -3376,6 +3584,8 @@ class MineSentinelRulesTests(unittest.TestCase):
         )
 
     def test_player_feedback_permission_chat_keeps_players(self):
+        from services.mine_sentinel.reporting.text_renderer import format_report
+
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         base_ts = 1700000000000
         records = [
@@ -3400,6 +3610,48 @@ class MineSentinelRulesTests(unittest.TestCase):
 
         self.assertEqual(issue["players"], ["LilyFairy_uwu", "_Dawnstar_"])
         self.assertTrue(any("没权限" in sample for sample in issue["evidence_samples"]))
+        text = format_report(report, len(records), 0, 2)
+        self.assertIn("玩家权限异常反馈（待核实）", text)
+        self.assertIn("尚未看到权限插件侧的拒绝日志", text)
+
+    def test_player_feedback_partitions_semantics_and_keeps_suggestion_low(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Async Chat Thread/INFO]: <Builder> 建议加个雕像",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Builder", "chatMessage": "建议加个雕像"},
+                timestamp=base_ts,
+            ),
+            self._make_record(
+                "[Async Chat Thread/INFO]: <Alex> ./hat没权限",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Alex", "chatMessage": "./hat没权限"},
+                timestamp=base_ts + 1000,
+            ),
+            self._make_record(
+                "[Async Chat Thread/INFO]: <Mia> 管理员能查一下吗",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Mia", "chatMessage": "管理员能查一下吗"},
+                timestamp=base_ts + 2000,
+            ),
+        ]
+
+        report = builder.build(records, 60, "survival")
+        feedback_issues = [
+            issue for issue in report["issues"] if issue["category"] == "player_feedback"
+        ]
+        evidence = " ".join(
+            sample
+            for issue in feedback_issues
+            for sample in issue["evidence_samples"]
+        )
+
+        self.assertEqual(len(feedback_issues), 2)
+        self.assertNotIn("建议加个雕像", evidence)
+        self.assertTrue(any("权限异常" in issue["chat_labels"] for issue in feedback_issues))
+        self.assertTrue(any("管理员求助" in issue["chat_labels"] for issue in feedback_issues))
 
     def test_short_repeat_chat_is_not_flood(self):
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
@@ -3992,6 +4244,71 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertIn("新手提问", classification["labels"])
         self.assertFalse(classification["needs_admin"])
         self.assertEqual(report["issues"], [])
+
+    def test_chat_admin_identity_discussion_is_not_admin_help_request(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Async Chat Thread/INFO]: <TestLuna> 你是管理，我是玩家，我需要知道你是谁",
+            tags=["server_log", "chat_message"],
+            context={
+                "chatPlayer": "TestLuna",
+                "chatMessage": "你是管理，我是玩家，我需要知道你是谁",
+            },
+        )
+
+        report = builder.build([record], 60, "survival")
+        classification = record.context["chatClassification"]
+
+        self.assertNotIn("管理员求助", classification["labels"])
+        self.assertFalse(classification["needs_admin"])
+        self.assertEqual(report["issues"], [])
+
+    def test_chat_generic_can_use_question_is_not_plugin_failure(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Async Chat Thread/INFO]: <TestLuna> 不知道能不能用",
+            tags=["server_log", "chat_message"],
+            context={"chatPlayer": "TestLuna", "chatMessage": "不知道能不能用"},
+        )
+
+        report = builder.build([record], 60, "survival")
+        classification = record.context["chatClassification"]
+
+        self.assertNotIn("插件功能异常", classification["labels"])
+        self.assertFalse(classification["needs_admin"])
+        self.assertEqual(report["issues"], [])
+
+    def test_server_and_chat_complaints_form_separate_issues(self):
+        from services.mine_sentinel.reporting.incidents import IncidentGrouper, issue_family
+
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Server thread/WARN]: Steve moved wrongly!, (1.42)",
+                level="WARN",
+                timestamp=base_ts,
+            ),
+            self._make_record(
+                "[Async Chat Thread/INFO]: <Alex> 我传送后卡住了",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Alex", "chatMessage": "我传送后卡住了"},
+                timestamp=base_ts + 1000,
+            ),
+        ]
+
+        report = builder.build(records, 60, "survival")
+        complaint_issues = [
+            issue for issue in report["issues"] if issue["category"] == "complaint"
+        ]
+
+        self.assertEqual(len(complaint_issues), 2)
+        self.assertEqual(
+            sorted(bool(issue["players"]) for issue in complaint_issues),
+            [False, True],
+        )
+        self.assertEqual({issue_family(issue) for issue in complaint_issues}, {"operations"})
+        self.assertEqual(len(IncidentGrouper().group(complaint_issues)), 1)
 
     def test_chat_three_layer_does_not_treat_turn_off_as_disconnect(self):
         config = MineSentinelConfig.from_dict({})
@@ -5212,6 +5529,30 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertEqual(timestamps[0], expected_first)
         self.assertEqual(timestamps[1], expected_second)
         self.assertEqual(timestamps[2], expected_second)
+
+    def test_log_time_parser_accepts_bom_and_zero_width_prefix(self):
+        from datetime import date
+        from services.mine_sentinel import runtime_log as runtime_module
+
+        lines = [
+            "\ufeff[20:51:49] [ServerMain/INFO]: first line",
+            "\u200b[20:51:50] [ServerMain/INFO]: second line",
+        ]
+
+        self.assertEqual(
+            runtime_module._python_log_time_parts(lines[0]),
+            (None, "20:51:49", None),
+        )
+        self.assertEqual(
+            runtime_module._runtime_log_time_parts_batch(lines),
+            [(None, "20:51:49", None), (None, "20:51:50", None)],
+        )
+        timestamps = runtime_module._parse_log_timestamps_batch(
+            lines,
+            date(2026, 7, 8),
+            now_ms=1783472400000,
+        )
+        self.assertEqual(timestamps[1] - timestamps[0], 1_000)
 
     def test_runtime_log_time_parts_batch_uses_native(self):
         from services.mine_sentinel import runtime_log as runtime_module
@@ -7422,22 +7763,32 @@ class MineSentinelPr9HotfixV3Tests(unittest.TestCase):
     def test_anomaly_evidence_uses_server_template_key(self):
         """AI 异常证据应按 (server_id, template_id) 匹配样本，不串 server。"""
         _install_astrbot_stubs()
-        from services.mine_sentinel.reporting.ai_prompt import AIReportPromptBuilder
-        import services.mine_sentinel.anomaly_detector as ad_mod
-        from services.mine_sentinel.anomaly_detector import get_anomaly_detector
-        # 重置全局检测器
-        ad_mod._global_detector = None
-        detector = get_anomaly_detector(max_templates_per_server=100, inactive_template_ttl_hours=1, cleanup_interval=99999)
-        # 两个 server，相同的 template_id（Drain3 cluster id 从 1 开始）
-        # 模拟 observe：survival template_id=T1，creative template_id=T1
-        # 先制造足够多的计数触发 baseline
-        for _ in range(10):
-            detector.observe("survival", "T1", "survival error line", "ERROR")
-        for _ in range(10):
-            detector.observe("creative", "T1", "creative different error", "ERROR")
-        # 突增 survival T1
-        for _ in range(50):
-            detector.observe("survival", "T1", "survival error line", "ERROR")
+        from services.mine_sentinel.reporting import ai_prompt as prompt_module
+
+        class Detector:
+            @staticmethod
+            def snapshot():
+                return {
+                    "anomalies": [
+                        {
+                            "server_id": "survival",
+                            "template_id": "T1",
+                            "template": "survival error line",
+                            "level": "ERROR",
+                            "current_score": 0.9,
+                            "reason": "ewma_spike",
+                        },
+                        {
+                            "server_id": "creative",
+                            "template_id": "T1",
+                            "template": "creative different error",
+                            "level": "ERROR",
+                            "current_score": 0.8,
+                            "reason": "ewma_spike",
+                        },
+                    ]
+                }
+
         # 构造 records：survival 和 creative 都有 templateId=T1
         from services.mine_sentinel.models import ObservationRecord
         survival_rec = ObservationRecord.from_dict({
@@ -7453,8 +7804,14 @@ class MineSentinelPr9HotfixV3Tests(unittest.TestCase):
             "context": {"templateId": "T1", "level": "ERROR"},
         })
         cfg = MineSentinelConfig.from_dict({})
-        builder = AIReportPromptBuilder(cfg)
-        evidence = builder.anomaly_evidence([survival_rec, creative_rec])
+        old_get = prompt_module.get_anomaly_detector
+        try:
+            prompt_module.get_anomaly_detector = lambda: Detector()
+            evidence = prompt_module.AIReportPromptBuilder(cfg).anomaly_evidence(
+                [survival_rec, creative_rec]
+            )
+        finally:
+            prompt_module.get_anomaly_detector = old_get
         # 找 survival 的异常证据
         survival_ev = [e for e in evidence if e.get("server_id") == "survival"]
         self.assertTrue(survival_ev, "应有 survival 异常证据")
@@ -7462,9 +7819,6 @@ class MineSentinelPr9HotfixV3Tests(unittest.TestCase):
         for sample in survival_ev[0].get("samples", []):
             self.assertIn("survival", sample.lower())
             self.assertNotIn("creative", sample.lower())
-        # 清理全局
-        import services.mine_sentinel.anomaly_detector as ad_mod
-        ad_mod._global_detector = None
 
     def test_export_filename_includes_second_precision_end_timestamp(self):
         """PR9 hotfix v5: 同秒内两次 export 应生成不同文件名（毫秒级 end_timestamp 不同）。"""
@@ -7754,6 +8108,8 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
         self.assertEqual(self.line_count, 4413)
         self.assertGreater(len(self.records), 4300)
         self.assertLessEqual(len(self.records), self.line_count)
+        timestamps = [record.timestamp for record in self.records if record.timestamp]
+        self.assertLess(max(timestamps) - min(timestamps), 60 * 60 * 1000)
         source_files = {
             Path(str(record.context.get("logFile") or "")).name
             for record in self.records
@@ -7840,6 +8196,12 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
             if issue.get("category") == "economy"
         ]
         self.assertTrue(economy_issues, "expected structured economy issue")
+        self.assertEqual(self.report["max_severity"], "high")
+        self.assertEqual(sum(issue["evidence_count"] for issue in economy_issues), 6)
+        self.assertTrue(
+            all(issue["severity"] == "high" for issue in economy_issues),
+            "healthy INFO anomaly spikes must not turn economy failures critical",
+        )
         economy_text = json.dumps(economy_issues, ensure_ascii=False)
         self.assertIn("经济/商店异常", economy_text)
         self.assertIn("QuickShop", economy_text)
@@ -7913,6 +8275,22 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
         issue_text = json.dumps(self.report["issues"], ensure_ascii=False)
         self.assertNotIn("The session ticker", issue_text)
 
+    def test_real_diagnostic_detail_is_context_not_player_problem(self):
+        detail_records = [
+            record
+            for record in self.records
+            if "» Connect timed out" in record.content
+        ]
+        self.assertEqual(len(detail_records), 1)
+        record = detail_records[0]
+        self.assertEqual(record.context.get("logLineKind"), "diagnostic_detail")
+        self.assertEqual(
+            HeuristicReportBuilder(self.config).classify(record),
+            "daily",
+        )
+        issue_text = json.dumps(self.report["issues"], ensure_ascii=False)
+        self.assertNotIn("» Connect timed out", issue_text)
+
     def test_real_malformed_json_roots_are_plugin_config_not_generic_bug(self):
         malformed_records = [
             record
@@ -7956,6 +8334,20 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
                     ops_info = record.context.get("opsClassification") or {}
                     self.assertEqual(ops_info.get("subtype"), subtype)
                     self.assertNotEqual(builder.classify(record), "bug")
+
+        mixed_issue = max(
+            (
+                issue
+                for issue in self.report["issues"]
+                if issue.get("category") == "plugin"
+                and len(issue.get("ops_subtypes") or []) > 2
+            ),
+            key=lambda issue: issue["evidence_count"],
+        )
+        self.assertEqual(
+            mixed_issue["ops_subtypes"][:2],
+            ["配置解析异常", "技能/内容定义错误"],
+        )
 
     def test_real_update_and_compatibility_warnings_are_observations(self):
         builder = HeuristicReportBuilder(self.config)
@@ -8007,6 +8399,10 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
 
         text = format_report(self.report, len(self.records), 0, 5)
 
+        self.assertIn("过去 49 分钟内", text)
+        self.assertIn("高风险事件 5 个", text)
+        self.assertIn("基于完整 49 分钟运行日志", text)
+        self.assertNotIn("过去49 分钟", text)
         self.assertIn("服务器离线模式与身份认证风险", text)
         self.assertIn("插件低风险观察 25 条", text)
         self.assertIn("性能旁证 1 条", text)
@@ -8109,6 +8505,33 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
         """fixture 应加载出大量真实日志记录。"""
         self.assertGreater(len(self.records), 9000, "应加载出 9000+ 条真实日志")
 
+    def test_frequency_spikes_do_not_create_critical_or_vulcan_incidents(self):
+        from services.mine_sentinel.reporting.ai_prompt import AIReportPromptBuilder
+
+        config = MineSentinelConfig.from_dict({})
+        report = HeuristicReportBuilder(config).build(
+            self.records,
+            120,
+            "survival",
+        )
+
+        self.assertEqual(report["max_severity"], "high")
+        self.assertFalse(
+            any(issue["severity"] == "critical" for issue in report["issues"])
+        )
+        incidents_text = " ".join(report["report_sections"][1]["bullets"])
+        community_text = " ".join(report["report_sections"][2]["bullets"])
+        self.assertNotIn("Vulcan", incidents_text)
+        self.assertNotIn("崩溃报告", incidents_text)
+        self.assertIn("Vulcan 反作弊：4202 条告警", community_text)
+        self.assertIn("涉及 2 名玩家", community_text)
+
+        ai_fallback = AIReportPromptBuilder(config).fallback_for_ai(report)
+        self.assertNotIn(
+            "server_log_anticheat_vulcan",
+            {issue.get("tag") for issue in ai_fallback["issues"]},
+        )
+
     def test_real_category_filter_chat_review_ignores_chat_surface(self):
         config = MineSentinelConfig.from_dict(
             {"runtime_log": {"category_enabled": {"chat_review": False}}}
@@ -8177,7 +8600,9 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
         self.assertNotIn("cross_server", issue_categories)
         self.assertNotIn("chat_review", issue_categories)
         self.assertNotIn("server_log_info", issue_tags)
-        self.assertLessEqual(len(report["issues"]), 8)
+        issue_text = json.dumps(report["issues"], ensure_ascii=False)
+        self.assertNotIn("机械/生命周期噪声", issue_text)
+        self.assertNotIn("常规运行信息", issue_text)
 
     def test_real_vulcan_alerts_aggregated_for_massive_alerts(self):
         """海量 Vulcan 告警（4202 条）应被聚合统计而非全列。

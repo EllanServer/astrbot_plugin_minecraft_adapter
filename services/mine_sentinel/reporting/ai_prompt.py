@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections import Counter
 from typing import Any
 
 from ..anomaly_detector import get_anomaly_detector
 from ..models import MineSentinelConfig, ObservationRecord
+from .incidents import is_passive_issue
 from .sampling import even_sample, sample_records_for_ai
 
 
@@ -24,6 +26,17 @@ MAX_CONTEXT_KEY_CHARS = 64
 MAX_CONTEXT_DEPTH = 2
 
 LOW_VALUE_ANOMALY_CATEGORIES = {"启动与关闭", "指标观察"}
+ANOMALY_GENERIC_TEMPLATE_TOKENS = {
+    "server",
+    "thread",
+    "main",
+    "info",
+    "warn",
+    "warning",
+    "error",
+    "fatal",
+    "severe",
+}
 LOW_VALUE_ANOMALY_LIFECYCLE_MARKERS = (
     "successfully loaded",
     "has been successfully loaded",
@@ -117,11 +130,12 @@ class AIReportPromptBuilder:
         window_minutes: int,
         fallback: dict[str, Any],
     ) -> str:
-        fallback_json = json.dumps(self.compact_fallback(fallback), ensure_ascii=False)
+        ai_fallback = self.fallback_for_ai(fallback)
+        fallback_json = json.dumps(self.compact_fallback(ai_fallback), ensure_ascii=False)
         timeline = self.timeline_chunks(records)
         compact_records = [
             self.compact_record(record)
-            for record in self.sample_for_ai(records, fallback)
+            for record in self.sample_for_ai(records, ai_fallback)
         ]
         anomaly_evidence = self.anomaly_evidence(records)
         chat_topics = self.compact_chat_topics(fallback.get("chat_topics") or {})
@@ -212,12 +226,13 @@ class AIReportPromptBuilder:
             "evidence_count,signal_count,ops_categories,ops_subtypes,ops_impacts,suggested_action),"
             "chat_summary,vulcan_alerts,ops_notes,"
             "report_sections(id,title,bullets)。"
-            "异常检测已由模板解析（Drain3）+ EWMA/分位数突增检测 + 关键词规则完成，"
+            "异常候选已由模板解析（Drain3）+ EWMA/分位数突增检测 + 关键词规则预计算，"
             "你的职责是解释异常证据、判断可能原因、给出排查建议，而不是重新检测异常。"
             "输入里的'异常证据'是预计算的结构化异常列表，每条含 template_id、score、"
-            "reason（ewma_spike/percentile_spike/new_template）、baseline、current_count、"
-            "代表样本；score>=0.5 表示突增告警，>=0.8 表示极端突增。"
-            "应优先把高 score 异常归入对应 issue 并提级 severity，"
+            "reason（ewma_spike/percentile_spike）、baseline、current_count、代表样本；"
+            "score>=0.5 表示出现频率偏离基线，>=0.8 仅表示频率偏离很大，不代表事件已达 critical。"
+            "只有同时间存在可操作 WARN/ERROR、管理员级结构化分类或明确故障语义时，"
+            "才能把高 score 作为提级旁证；禁止仅凭 anomaly score 判定 critical。"
             "在 suggested_action 中给出针对该模板的具体排查步骤。"
             "输入里的启发式初稿来自完整窗口记录；分段时间线也是完整窗口的压缩统计；"
             "当前输入只来自 AstrBot 直接读取的 Minecraft 运行日志 SERVER_LOG。"
@@ -288,6 +303,8 @@ class AIReportPromptBuilder:
             "你必须在 vulcan_alerts 字段输出面向管理员的告警摘要：先说总数和涉及玩家，"
             "再按玩家列出告警数和主要检查类型（如 dxe_explode 3020 条告警，主要是 Ground/Step/Strafe），"
             "最后给出时间范围；用于管理员快速定位作弊嫌疑玩家。无告警时输出空对象。"
+            "Vulcan 计数必须放在第三段聊天与社区观察，不得作为第二段服务器运行事故，"
+            "不得因告警数量大而推断服务器 critical、崩溃或需要回滚。"
             "正常登录/断开/UUID 分配/LuckPerms 常规日志已被 daily_noise 过滤，"
             "不要把它们当作异常事件输出。"
             f"时间窗口: 最近 {window_minutes} 分钟。\n"
@@ -331,17 +348,28 @@ class AIReportPromptBuilder:
                 records_by_template.setdefault(key, []).append(record)
 
         evidence: list[dict[str, Any]] = []
-        for anomaly in anomalies[:MAX_ANOMALY_EVIDENCE]:
+        for anomaly in anomalies:
+            if len(evidence) >= MAX_ANOMALY_EVIDENCE:
+                break
+            score = _as_float(anomaly.get("current_score"), 0.0)
+            template = str(anomaly.get("template") or "")
+            if score < 0.5 or self._overgeneralized_anomaly_template(template):
+                continue
             tid = anomaly.get("template_id") or ""
             server_id = str(anomaly.get("server_id") or "")
             samples = records_by_template.get((server_id, tid), [])
             if not samples:
                 continue
-            if all(self._low_value_anomaly_sample(record) for record in samples):
+            actionable_samples = [
+                record
+                for record in samples
+                if not self._low_value_anomaly_sample(record)
+            ]
+            if not actionable_samples:
                 continue
             # 取最近几条作为代表样本
             sample_texts: list[str] = []
-            for record in samples[-MAX_ANOMALY_SAMPLES:]:
+            for record in actionable_samples[-MAX_ANOMALY_SAMPLES:]:
                 ctx = record.context or {}
                 text = truncate(
                     str(ctx.get("llmCleanText") or record.content),
@@ -352,9 +380,9 @@ class AIReportPromptBuilder:
             evidence.append(
                 {
                     "template_id": tid,
-                    "template": truncate(str(anomaly.get("template") or ""), 200),
+                    "template": truncate(template, 200),
                     "level": anomaly.get("level", "INFO"),
-                    "score": anomaly.get("current_score", 0.0),
+                    "score": score,
                     "reason": anomaly.get("reason", ""),
                     "baseline": anomaly.get("ewma_count", 0.0),
                     "total_count": anomaly.get("total_count", 0),
@@ -377,13 +405,37 @@ class AIReportPromptBuilder:
             severity = str(ops.get("severity") or "").lower()
             needs_admin = bool(ops.get("needs_admin"))
             if (
+                bool(ops.get("opsObservation"))
+                and not needs_admin
+                and severity in {"", "info", "low"}
+            ):
+                return True
+            if (
                 not needs_admin
                 and severity in {"", "info", "low"}
                 and category in LOW_VALUE_ANOMALY_CATEGORIES
             ):
                 return True
+            level = str(ctx.get("level") or "").lower()
+            if level in {"", "info"} and not needs_admin and severity in {
+                "",
+                "info",
+                "low",
+            }:
+                return True
         text = str(record.content or "").lower()
         return any(marker in text for marker in LOW_VALUE_ANOMALY_LIFECYCLE_MARKERS)
+
+    @staticmethod
+    def _overgeneralized_anomaly_template(template: str) -> bool:
+        if template.count("<*>") < 2:
+            return False
+        fixed_text = template.replace("<*>", " ").lower()
+        tokens = re.findall(r"[a-z0-9_\u4e00-\u9fff]+", fixed_text)
+        return not any(
+            token not in ANOMALY_GENERIC_TEMPLATE_TOKENS and not token.isdigit()
+            for token in tokens
+        )
 
     @staticmethod
     def trim_anomaly_samples(evidence: list[dict[str, Any]]) -> bool:
@@ -461,6 +513,16 @@ class AIReportPromptBuilder:
                 for note in (fallback.get("ops_notes") or [])[:8]
             ],
         }
+
+    @staticmethod
+    def fallback_for_ai(fallback: dict[str, Any]) -> dict[str, Any]:
+        compact_source = dict(fallback)
+        compact_source["issues"] = [
+            issue
+            for issue in (fallback.get("issues") or [])
+            if isinstance(issue, dict) and not is_passive_issue(issue)
+        ]
+        return compact_source
 
     @staticmethod
     def compact_chat_topics(chat_topics: dict[str, Any]) -> dict[str, Any]:

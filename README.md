@@ -39,13 +39,15 @@ raw log line
 - `player_problems`：玩家问题/投诉识别，例如卡顿反馈、进服失败、功能不可用。
 - `risk_actions`：风险、处置建议和下一步动作。
 
-文本与图片报告共用 5 分钟事故窗口：同一作用域内连续证据会合并，超过 5 分钟无新证据则拆成新事件；安静窗口作为补充说明，不占用事件编号。插件更新检查、兼容性、本地化和轻微调度延迟会在“聊天与社区观察”中汇总展示，但不会抬高重点事件数量。
+文本与图片报告默认使用 5 分钟事故窗口；玩家反馈按聊天主类先分流，再使用 15 分钟对话窗口，避免把普通建议、权限异常、传送问题和管理求助压成同一个全天事件。服务器 WARN/ERROR 与同时间玩家技术反馈仍会按共同根因关联。安静窗口作为补充说明，不占用事件编号；插件更新检查、兼容性、本地化、普通建议和社区活动会进入观察摘要，不抬高重点事件数量。
 
 ## 智能分类
 
 内置分类包括 `daily`、`complaint`、`bug`、`network`、`plugin`、`economy`、`community`、`chat_review`、`player_feedback`、`community_ops`、`moderation`、`cross_server`、`suggestion`。
 
-分类优先使用结构化 runtime hints 和 ops hints，再回退到关键词、上下文、日志等级、线程、插件名和事故聚合。真实样本 `tests/fixtures/mclogs_pbfhCaI.log` 来自 [mclo.gs/pbfhCaI](https://mclo.gs/pbfhCaI)，用于验证 QuickShop/经济异常、数据库异常、插件异常、网络异常、离线模式/认证绕过风险会进入正确分类；Malformed JSON、JSON/NBT 转换失败会归入插件配置/数据解析异常，MythicMobs 内容定义、插件依赖、外部 API 凭据、外部资源获取和不安全运行模式会给出独立运维子类型，而不是泛化 Java bug。同时 Hikari 生命周期日志、AstrbotAdapter/CMI 正常代理握手不会误报为管理事件；Java 纯堆栈帧和装饰横幅只作为上下文，插件更新检查、兼容性/弃用、本地化资源键缺失、单个插件任务调度延迟等低风险 WARN 会进入观察分类，不升级为管理事件。
+分类优先使用结构化 runtime hints 和 ops hints，再回退到关键词、上下文、日志等级、线程、插件名和事故聚合。真实样本 `tests/fixtures/mclogs_pbfhCaI.log` 来自 [mclo.gs/pbfhCaI](https://mclo.gs/pbfhCaI)，用于验证 QuickShop/经济异常、数据库异常、插件异常、网络异常、离线模式/认证绕过风险会进入正确分类；Malformed JSON、JSON/NBT 转换失败会归入插件配置/数据解析异常，MythicMobs 内容定义、插件依赖、外部 API 凭据、外部资源获取和不安全运行模式会给出独立运维子类型，而不是泛化 Java bug。同时 Hikari 生命周期日志、AstrbotAdapter/CMI 正常代理握手不会误报为管理事件；Java 纯堆栈帧、诊断续行和装饰横幅只作为上下文，插件更新检查、兼容性/弃用、本地化资源键缺失、普通建议和单个插件任务调度延迟等低风险信号会进入观察分类，不升级为管理事件。
+
+统计异常只表示模板出现频率偏离 EWMA/分位数基线，最多把有真实故障语义的事件提升到 `high`；`critical` 必须来自崩溃、OOM、watchdog、服务停止等确定性语义或结构化紧急分类。健康 `INFO` 即使获得高 anomaly score 也不会制造事件或虚增证据数。Vulcan 海量告警按玩家和检查类型聚合到第三段“聊天与社区观察”，不会被误写成服务器崩溃事故或回滚建议。
 
 可用配置控制分类入口：
 
@@ -66,10 +68,10 @@ mine_sentinel:
 `mine_sentinel_rs` 是可选 PyO3 扩展，不安装也能用纯 Python 路径完整运行。安装后会加速热路径：
 
 - JSONL codec：`normalize_record`、`record_to_json`、`json_line`、`dedupe_key`。
-- runtime hints：日志等级、时间、线程、插件、聊天、Vulcan、Hikari、ops hint 批处理。
+- runtime hints：日志等级、时间、线程、插件、聊天、Vulcan、Hikari、ops hint 批处理；支持剥离 UTF-8 BOM/零宽传输字符并标记诊断续行。
 - observation priority：高日志量窗口下的优先级抽样。
 - AI sampling features：prompt 入模前的清洗 key、质量评分、低价值指标过滤。
-- report category features：高日志量窗口（默认至少 8000 条）通过 Aho-Corasick 与 ASCII token 单次扫描生成分类 bitmask；普通窗口保留惰性 Python 分类，Python 始终负责排除规则、优先级和最终结论。
+- report category features：高日志量窗口（默认至少 8000 条）先跳过 Vulcan、daily noise、堆栈/诊断续行和已有 ops hint 的直达记录，再通过 Aho-Corasick 与 ASCII token 单次扫描为其余候选生成分类 bitmask；普通窗口保留惰性 Python 分类，Python 始终负责排除规则、优先级和最终结论。
 
 Rust 与纯 Python 回退共享同一份清洗语义：每行只做一次 ANSI/控制字符 transport pass，再派生脱敏文本、指纹和质量标记；默认 daily-noise 规则合并为单次正则扫描。即使目标平台暂时没有 wheel，高日志量摄取也不会重复清洗同一行。
 
@@ -285,7 +287,7 @@ mine_sentinel:
 
 规则报告在首次分类时同步生成运维计数，不再二次扫描整窗关键词。`ERROR/WARN` 以解析后的日志级别为准（级别缺失时回退结构化标签），`PERFORMANCE/NETWORK/PLUGIN/聊天审查` 等以最终主分类为准；单条聊天违规词只作为审查线索，达到玩家级重复行为阈值后才进入聊天审查事件计数。
 
-玩家级刷屏检测使用单调时间窗和一次编辑以内的线性相似度判断，高聊天量窗口不会反复扫描窗口外消息。事件证据会归一化动态计数并优先保留不同错误/反作弊类型；五段式结构化输出统一使用中文事件标题、风险等级、聚合证据数、影响范围和处理建议，不暴露内部 `server_log_*` 标签。
+玩家级刷屏检测使用单调时间窗和一次编辑以内的线性相似度判断，高聊天量窗口不会反复扫描窗口外消息。事件证据会剔除健康 INFO、归一化动态计数，并按证据频次排序结构化子类型；五段式结构化输出统一使用中文事件标题、风险等级、聚合证据数、影响范围和处理建议，不暴露内部 `server_log_*` 标签。10k 行真实样本中，Rust 分类只扫描需要 fallback 的候选记录，避免对 Vulcan 与 ops hint 直达记录做无效预计算。
 
 ## 开发与验证
 
@@ -302,9 +304,10 @@ cargo check --manifest-path rust/Cargo.toml
 
 ```bash
 python -m unittest tests.test_mine_sentinel.MineSentinelRealLogPbfhCaITests
+python -m unittest tests.test_mine_sentinel.MineSentinelRealLogV54kwMiTests
 ```
 
-该测试会确认显式 `log_file` 只读取指定文件，pbfhCaI 样本能识别 `bug`、`plugin`、`network`、`economy`，五段式 section id 稳定，并过滤 Hikari/AstrbotAdapter/CMI 生命周期噪声。
+这些测试会确认显式 `log_file` 只读取指定文件，pbfhCaI 样本能识别 `bug`、`plugin`、`network`、`economy`，五段式 section id 稳定，并过滤 Hikari/AstrbotAdapter/CMI 生命周期噪声；v54kwmi 样本用于验证 10k 行窗口、4202 条 Vulcan 聚合、连接池 WARN、玩家反馈语义分流和统计异常严重度上限。
 
 ## 迁移说明
 

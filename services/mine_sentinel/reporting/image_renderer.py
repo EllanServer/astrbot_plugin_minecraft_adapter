@@ -159,7 +159,11 @@ class MineSentinelReportImageRenderer:
         canvas.numbered_list(text_report._action_lines(presentation.issues))
 
         canvas.footer(f"证据：共 {presentation.total_count} 条观察，涉及玩家 {player_count} 人。")
-        canvas.footer(f"本报告基于完整{_format_duration(report)}运行日志、玩家事件和结构化分类生成。")
+        duration = _format_duration(report)
+        canvas.footer(
+            f"本报告基于{text_report._duration_with_prefix('完整', duration)}"
+            "运行日志、玩家事件和结构化分类生成。"
+        )
         return canvas.output()
 
     async def _ensure_assets(self):

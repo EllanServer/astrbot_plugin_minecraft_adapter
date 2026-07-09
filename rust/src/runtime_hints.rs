@@ -144,7 +144,10 @@ fn sanitize_line(line: &str) -> String {
 
 fn extract_time_parts(line: &str) -> (Option<String>, Option<String>, Option<String>) {
     let no_ansi = ansi_re().replace_all(line, "");
-    let text = no_ansi.trim();
+    let text = no_ansi
+        .trim()
+        .trim_start_matches(is_transport_format_char)
+        .trim_start();
     if let Some(caps) = full_ts_re().captures(text) {
         let date_text = caps.name("date").map(|m| m.as_str().to_string());
         let time_text = caps.name("time").map(|m| m.as_str().to_string());
@@ -229,6 +232,7 @@ fn llm_quality_score(redaction_count: usize, flags: &[&str]) -> i32 {
             "low_signal_repetition" => 35,
             "low_signal_symbols" => 35,
             "stacktrace_frame" => 18,
+            "diagnostic_detail" => 10,
             "control_stripped" => 8,
             "truncated" => 8,
             "whitespace_collapsed" => 2,
@@ -275,9 +279,12 @@ fn detect_level(line: &str) -> &'static str {
 fn detect_log_line_kind(content: &str) -> Option<&'static str> {
     let stripped = prefix_re().replace(content, "");
     let body = stripped.trim_start_matches([' ', ':', '\t']);
-    stacktrace_frame_re()
+    if stacktrace_frame_re().is_match(body) {
+        return Some("stacktrace_frame");
+    }
+    diagnostic_detail_re()
         .is_match(body)
-        .then_some("stacktrace_frame")
+        .then_some("diagnostic_detail")
 }
 
 #[cfg(test)]
@@ -689,6 +696,11 @@ fn stacktrace_frame_re() -> &'static Regex {
     })
 }
 
+fn diagnostic_detail_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[»›▶→]\s*\S").expect("diagnostic detail regex"))
+}
+
 fn full_ts_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -1031,6 +1043,10 @@ mod tests {
             detect_log_line_kind("Caused by: java.net.SocketTimeoutException"),
             None
         );
+        assert_eq!(
+            detect_log_line_kind("[20:57:06] [Server thread/INFO]:   » Connect timed out"),
+            Some("diagnostic_detail")
+        );
     }
 
     #[test]
@@ -1134,6 +1150,10 @@ mod tests {
         assert_eq!(
             extract_time_parts("[14:00:02] [Server thread/INFO]: hello"),
             (None, Some("14:00:02".to_string()), None)
+        );
+        assert_eq!(
+            extract_time_parts("\u{feff}\u{200b}[14:00:03] [Server thread/INFO]: hello"),
+            (None, Some("14:00:03".to_string()), None)
         );
         assert_eq!(extract_time_parts("no timestamp"), (None, None, None));
     }

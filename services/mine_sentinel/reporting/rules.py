@@ -376,6 +376,7 @@ CATEGORY_FEATURE_GROUPS = tuple(
     if keys
 )
 NATIVE_CATEGORY_BATCH_MIN_RECORDS = 8000
+NATIVE_CATEGORY_CANDIDATE_MIN_RECORDS = 1024
 # URL/外链信号仅在 chat_message 标签的记录上触发 chat_review。
 # 真实日志验证：QuickShop-Hikari 等插件的更新检查日志
 # （[QuickShop-Hikari] Update here: https://modrinth.com/...）
@@ -405,6 +406,27 @@ CRITICAL_MARKERS = (
     "can't keep up! is the server overloaded",
     "崩溃",
     "内存溢出",
+)
+# INFO is useful as timeline context, but a keyword-only INFO line must not inflate
+# an incident. These markers retain mislabeled failures emitted at INFO level.
+ISSUE_ACTIONABLE_INFO_MARKERS = (
+    *CRITICAL_MARKERS,
+    *ERROR_MARKERS,
+    *WARN_MARKERS,
+    "could not",
+    "cannot",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection refused",
+    "unavailable",
+    "denied",
+    "invalid",
+    "mismatch",
+    "无法",
+    "拒绝",
+    "不可用",
+    "不一致",
 )
 # chat_review 中的敏感词：命中即提级 high 并强制告警
 CHAT_SENSITIVE_MARKERS = (
@@ -666,7 +688,28 @@ CHAT_LABEL_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("建设协作", "红石机器", ("红石", "机器", "自动机")),
     ("建设协作", "刷怪塔", ("刷怪塔", "刷怪场")),
 
-    ("管理请求", "管理员求助", ("管理员", "管理", "op", "服主", "查一下", "处理一下", "帮忙看", "求助")),
+    (
+        "管理请求",
+        "管理员求助",
+        (
+            "管理员在吗",
+            "管理在吗",
+            "管理员来一下",
+            "管理来一下",
+            "管理员帮",
+            "管理帮",
+            "找管理处理",
+            "找管理员处理",
+            "问管理",
+            "找服主",
+            "服主在吗",
+            "查一下",
+            "处理一下",
+            "帮忙看",
+            "求助",
+            "admin help",
+        ),
+    ),
     ("管理请求", "权限请求", ("给权限", "开权限", "申请权限", "权限请求")),
     ("管理请求", "投诉", ("投诉", "申诉", "不公平")),
     ("管理请求", "举报", ("举报", "疑似外挂", "疑似飞行", "疑似透视", "有人开挂", "有人破坏", "有人偷")),
@@ -688,7 +731,7 @@ CHAT_LABEL_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("数据与插件异常", "世界切换异常", ("切换世界", "换世界", "世界切换")),
     ("数据与插件异常", "命令异常", ("命令用不了", "指令用不了", "命令异常", "指令异常")),
     ("数据与插件异常", "权限异常", ("没权限", "没有权限", "权限不够", "权限异常")),
-    ("数据与插件异常", "插件功能异常", ("插件异常", "插件坏", "插件用不了", "功能坏了", "功能异常", "不能用")),
+    ("数据与插件异常", "插件功能异常", ("插件异常", "插件坏", "插件用不了", "功能坏了", "功能异常")),
     ("数据与插件异常", "区块加载异常", ("区块", "加载不出来", "区块加载")),
 
     ("经济与物品", "商店异常", ("商店异常", "商店坏", "商店用不了", "商店扣", "shop error", "quickshop")),
@@ -772,6 +815,7 @@ CHAT_COMMUNITY_LABELS = {
 OPS_ISSUE_LEVELS = {"warn", "warning", "error", "severe", "fatal"}
 OPS_SEVERITY_RANK = {"info": 0, **SEVERITY_RANK}
 ISSUE_CLUSTER_GAP_MS = 5 * 60 * 1000
+PLAYER_FEEDBACK_CLUSTER_GAP_MS = 15 * 60 * 1000
 OPS_DEFAULT_IMPACT = "需要结合聊天反馈、服务器指标和同时间日志判断影响范围。"
 OPS_LOG_RULES: tuple[dict[str, Any], ...] = (
     {
@@ -2047,16 +2091,27 @@ class HeuristicReportBuilder:
             or _rs_report_category_features_batch is None
         ):
             return
+        candidates = [
+            record
+            for record in records
+            if self._needs_native_category_features(record)
+        ]
+        candidate_min = min(
+            NATIVE_CATEGORY_CANDIDATE_MIN_RECORDS,
+            NATIVE_CATEGORY_BATCH_MIN_RECORDS,
+        )
+        if len(candidates) < candidate_min:
+            return
         try:
             masks = _rs_report_category_features_batch(
-                records,
+                candidates,
                 CATEGORY_FEATURE_GROUPS,
             )
-            if len(masks) != len(records):
+            if len(masks) != len(candidates):
                 return
             self._native_category_feature_cache = {
                 id(record): int(mask)
-                for record, mask in zip(records, masks, strict=True)
+                for record, mask in zip(candidates, masks, strict=True)
             }
         except Exception as exc:
             logger.debug(
@@ -2064,6 +2119,42 @@ class HeuristicReportBuilder:
                 "falling back to Python matching: %s",
                 exc,
             )
+
+    @staticmethod
+    def _needs_native_category_features(record: ObservationRecord) -> bool:
+        tags = record.tags or ()
+        if (
+            "daily_noise" in tags
+            or "anticheat_vulcan" in tags
+            or "chat_flood" in tags
+            or "chat_abuse" in tags
+        ):
+            return False
+        ctx = record.context or {}
+        if str(ctx.get("logLineKind") or "") in {
+            "stacktrace_frame",
+            "diagnostic_detail",
+        }:
+            return False
+        hint_code = str(ctx.get("opsHintCode") or "")
+        if hint_code and hint_code in OPS_HINT_CLASSIFICATIONS:
+            return False
+        ops = ctx.get("opsClassification")
+        if not isinstance(ops, dict):
+            return True
+        severity = str(ops.get("severity") or "info").lower()
+        report_categories = tuple(ops.get("report_categories") or ())
+        if not report_categories:
+            report_categories = OPS_CATEGORY_REPORT_MAP.get(
+                str(ops.get("category") or ""),
+                (),
+            )
+        return not (
+            report_categories
+            or bool(ops.get("needs_admin"))
+            or bool(ops.get("opsObservation"))
+            or OPS_SEVERITY_RANK.get(severity, 0) >= OPS_SEVERITY_RANK["medium"]
+        )
 
     def _classify_for_gate(self, record: ObservationRecord) -> str:
         """Classify with the full priority list before category filtering."""
@@ -2196,8 +2287,24 @@ class HeuristicReportBuilder:
 
         issue_buckets: list[tuple[tuple[str, str], list[ObservationRecord]]] = []
         for key, group in buckets.items():
-            for segment in self._split_issue_group(group, window_minutes):
-                issue_buckets.append((key, segment))
+            category, _ = key
+            issue_evidence = [
+                record
+                for record in group
+                if self._is_issue_evidence_candidate(record, category)
+            ]
+            for partition in self._partition_issue_evidence(issue_evidence, category):
+                for segment in self._split_issue_group(
+                    partition,
+                    window_minutes,
+                    force_split=category == "player_feedback",
+                    cluster_gap_ms=(
+                        PLAYER_FEEDBACK_CLUSTER_GAP_MS
+                        if category == "player_feedback"
+                        else ISSUE_CLUSTER_GAP_MS
+                    ),
+                ):
+                    issue_buckets.append((key, segment))
 
         chat_topics = self._build_chat_topics(log_records, flood_events, abuse_events)
         vulcan_alerts = self._build_vulcan_alerts(log_records)
@@ -2223,6 +2330,7 @@ class HeuristicReportBuilder:
             chat_severity = ""
             ops_categories: list[str] = []
             ops_subtypes: list[str] = []
+            ops_subtype_counts: Counter[str] = Counter()
             ops_impacts: list[str] = []
             ops_severity = ""
             for info in chat_infos:
@@ -2252,10 +2360,14 @@ class HeuristicReportBuilder:
                 ):
                     continue
                 self._append_unique(ops_categories, str(info.get("category") or ""))
-                self._append_unique(ops_subtypes, str(info.get("subtype") or ""))
+                subtype = str(info.get("subtype") or "")
+                self._append_unique(ops_subtypes, subtype)
+                if subtype:
+                    ops_subtype_counts[subtype] += 1
                 self._append_unique(ops_impacts, str(info.get("impact") or ""))
                 if OPS_SEVERITY_RANK.get(info_severity, 0) > OPS_SEVERITY_RANK.get(ops_severity, 0):
                     ops_severity = info_severity
+            ops_subtypes.sort(key=lambda subtype: -ops_subtype_counts[subtype])
             if SEVERITY_RANK.get(chat_severity, 0) > SEVERITY_RANK.get(severity, 0):
                 severity = chat_severity
             if SEVERITY_RANK.get(ops_severity, 0) > SEVERITY_RANK.get(severity, 0):
@@ -2265,14 +2377,13 @@ class HeuristicReportBuilder:
                 "community",
                 "community_ops",
                 "moderation",
-                "player_feedback",
             }:
                 severity = "medium"
+            if category == "daily" or severity == "low":
+                continue
             severity_rank = SEVERITY_RANK.get(severity, 0)
             if severity_rank > max_severity_rank:
                 max_severity_rank = severity_rank
-            if category == "daily" or severity == "low":
-                continue
             affected = sorted({record.server_id for record in group if record.server_id})
             backends = sorted(
                 {record.backend_server for record in group if record.backend_server}
@@ -2727,6 +2838,19 @@ class HeuristicReportBuilder:
             ops_info = (record.context or {}).get("opsClassification")
             if isinstance(ops_info, dict) and bool(ops_info.get("opsObservation")):
                 return f"{tag_map[category]}_observation"
+            if category in {"community_ops", "player_feedback"} and level in {
+                "",
+                "info",
+            }:
+                chat_info = (record.context or {}).get("chatClassification")
+                chat_needs_admin = isinstance(chat_info, dict) and bool(
+                    chat_info.get("needs_admin")
+                )
+                ops_needs_admin = isinstance(ops_info, dict) and bool(
+                    ops_info.get("needs_admin")
+                )
+                if not chat_needs_admin and not ops_needs_admin:
+                    return f"{tag_map[category]}_observation"
             return tag_map[category]
         return f"server_log_{level or 'info'}"
 
@@ -2744,16 +2868,52 @@ class HeuristicReportBuilder:
         )
 
     @staticmethod
+    def _partition_issue_evidence(
+        group: list[ObservationRecord],
+        category: str,
+    ) -> list[list[ObservationRecord]]:
+        if not group:
+            return []
+        has_chat = any("chat_message" in (record.tags or ()) for record in group)
+        has_server_log = any("chat_message" not in (record.tags or ()) for record in group)
+        if category != "player_feedback" and not (has_chat and has_server_log):
+            return [group] if group else []
+        partitions: dict[str, list[ObservationRecord]] = {}
+        for record in group:
+            is_chat = "chat_message" in (record.tags or ())
+            chat = (record.context or {}).get("chatClassification")
+            primary = (
+                str(chat.get("primary_category") or "").strip()
+                if isinstance(chat, dict)
+                else ""
+            )
+            key = (
+                f"chat:{primary or '未结构化反馈'}"
+                if is_chat
+                else "server"
+            )
+            partitions.setdefault(key, []).append(record)
+        return list(partitions.values())
+
+    @staticmethod
     def _split_issue_group(
         group: list[ObservationRecord],
         window_minutes: int,
+        *,
+        force_split: bool = False,
+        cluster_gap_ms: int = ISSUE_CLUSTER_GAP_MS,
     ) -> list[list[ObservationRecord]]:
         """Split short-window tag buckets when evidence goes quiet for five minutes."""
+        if not group:
+            return []
         timestamps = sorted(record.timestamp for record in group if record.timestamp)
         if len(timestamps) < 2:
             return [group]
         max_segmentable_span_ms = max(120, max(1, int(window_minutes)) * 2) * 60 * 1000
-        if timestamps[-1] - timestamps[0] > max_segmentable_span_ms:
+        if (
+            not force_split
+            and timestamps[-1] - timestamps[0] > max_segmentable_span_ms
+        ):
             return [group]
 
         ordered = sorted(
@@ -2769,7 +2929,7 @@ class HeuristicReportBuilder:
                 current
                 and timestamp
                 and last_timestamp
-                and timestamp - last_timestamp > ISSUE_CLUSTER_GAP_MS
+                and timestamp - last_timestamp > cluster_gap_ms
             ):
                 segments.append(current)
                 current = []
@@ -2779,6 +2939,66 @@ class HeuristicReportBuilder:
         if current:
             segments.append(current)
         return segments or [group]
+
+    def _is_issue_evidence_candidate(
+        self,
+        record: ObservationRecord,
+        category: str,
+    ) -> bool:
+        """Keep actionable evidence while leaving healthy INFO as report context."""
+        if category == "daily":
+            return False
+
+        tags = record.tags or ()
+        if (
+            "chat_flood" in tags
+            or "chat_abuse" in tags
+            or "anticheat_vulcan" in tags
+            or "loop_suppressed" in tags
+        ):
+            return True
+
+        ctx = record.context or {}
+        if "chat_message" in tags:
+            chat = ctx.get("chatClassification")
+            if isinstance(chat, dict):
+                chat_severity = str(chat.get("severity") or "").lower()
+                if bool(chat.get("needs_admin")) or SEVERITY_RANK.get(
+                    chat_severity,
+                    0,
+                ) >= SEVERITY_RANK["medium"]:
+                    return True
+            if category in {
+                "community",
+                "chat_review",
+                "player_feedback",
+                "community_ops",
+            }:
+                return True
+
+        ops = ctx.get("opsClassification")
+        if isinstance(ops, dict):
+            if bool(ops.get("opsObservation")) and not bool(ops.get("needs_admin")):
+                return False
+            ops_severity = str(ops.get("severity") or "info").lower()
+            if bool(ops.get("needs_admin")) or OPS_SEVERITY_RANK.get(
+                ops_severity,
+                0,
+            ) >= OPS_SEVERITY_RANK["medium"]:
+                return True
+
+        level = self._normalized_level(str(ctx.get("level") or ""))
+        if level in {"warn", "warning", "error", "severe", "fatal"}:
+            return True
+        if not level and (
+            "warn" in tags or "warning" in tags or "error" in tags
+        ):
+            return True
+        if level not in {"", "info"}:
+            return False
+
+        text = self._record_text(record)
+        return any(marker in text for marker in ISSUE_ACTIONABLE_INFO_MARKERS)
 
     # --- 严重级别 ---------------------------------------------------------
     def _severity(self, group: list[ObservationRecord]) -> str:
@@ -2799,7 +3019,7 @@ class HeuristicReportBuilder:
                 if SEVERITY_RANK.get(base_severity, 0) > SEVERITY_RANK["medium"]
                 else base_severity
             )
-        # 异常分数提级：模板计数突增（EWMA + 分位数）达到高分直接提级
+        # 异常分数提级：模板计数突增（EWMA + 分位数）只能作为 high 旁证。
         max_anomaly = 0.0
         for record in group:
             ctx = record.context or {}
@@ -2809,11 +3029,14 @@ class HeuristicReportBuilder:
                 score = 0.0
             if score > max_anomaly:
                 max_anomaly = score
-        if max_anomaly >= 0.8:
-            return "critical"
         if max_anomaly >= 0.6:
-            # 异常突增至少 high（除非其他规则已判 critical）
-            return "critical" if base_severity == "critical" else "high"
+            # 统计突增只证明频率偏离基线，不能单独证明崩溃或数据事故。
+            # critical 必须来自上方的确定性语义规则或结构化运维分类。
+            return (
+                base_severity
+                if SEVERITY_RANK.get(base_severity, 0) >= SEVERITY_RANK["high"]
+                else "high"
+            )
         return base_severity
 
     @staticmethod
@@ -4328,7 +4551,7 @@ class HeuristicReportBuilder:
         hint_code = str(ctx.get("opsHintCode") or "").strip()
         if not value and not hint_code:
             line_kind = str(ctx.get("logLineKind") or "").strip()
-            if line_kind == "stacktrace_frame":
+            if line_kind in {"stacktrace_frame", "diagnostic_detail"}:
                 value = True
             elif level in {"warn", "warning"}:
                 quality_flags = {

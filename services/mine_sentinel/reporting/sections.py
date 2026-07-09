@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .incidents import is_passive_issue
 from .labels import DEFAULT_LABELS
 
 
@@ -95,12 +96,15 @@ def _fallback_bullets(section_id: str, report: dict[str, Any]) -> list[str]:
 def _overall_bullets(report: dict[str, Any]) -> list[str]:
     bullets = _clean_bullets([report.get("summary")])
     servers = ", ".join(str(server) for server in (report.get("servers") or []) if server)
-    issue_count = sum(1 for issue in (report.get("issues") or []) if isinstance(issue, dict))
+    issue_count = len(_visible_issues(report))
     max_severity = str(report.get("max_severity") or "low").lower()
     status_parts = []
     if servers:
         status_parts.append(f"监控范围：{servers}")
     status_parts.append(f"需关注事件：{issue_count} 组")
+    vulcan_total = _positive_int((report.get("vulcan_alerts") or {}).get("total"), 0)
+    if vulcan_total:
+        status_parts.append(f"反作弊告警：{vulcan_total} 条")
     status_parts.append(f"最高风险：{SEVERITY_TITLES.get(max_severity, '观察')}")
     bullets.append(_truncate("；".join(status_parts) + "。"))
     return bullets or ["本窗口暂无可汇总的服务器运行日志。"]
@@ -112,9 +116,7 @@ def _incident_bullets(report: dict[str, Any]) -> list[str]:
     if bullets:
         return bullets
     aggregates: dict[str, dict[str, Any]] = {}
-    for order, issue in enumerate(report.get("issues") or []):
-        if not isinstance(issue, dict):
-            continue
+    for order, issue in enumerate(_visible_issues(report)):
         title = _issue_title(issue)
         action = str(issue.get("suggested_action") or "").strip()
         if not title:
@@ -161,13 +163,36 @@ def _incident_bullets(report: dict[str, Any]) -> list[str]:
 
 def _community_bullets(report: dict[str, Any]) -> list[str]:
     bullets = _clean_bullets([report.get("chat_summary")])
+    vulcan_alerts = report.get("vulcan_alerts") or {}
+    vulcan_total = _positive_int(vulcan_alerts.get("total"), 0)
+    if vulcan_total:
+        player_count = _positive_int(vulcan_alerts.get("unique_players"), 0)
+        check_count = _positive_int(vulcan_alerts.get("unique_checks"), 0)
+        top_players = []
+        for item in (vulcan_alerts.get("by_player") or [])[:3]:
+            if not isinstance(item, dict):
+                continue
+            player = str(item.get("player") or "").strip()
+            count = _positive_int(item.get("count"), 0)
+            if player and count:
+                top_players.append(f"{player} {count} 条")
+        line = (
+            f"Vulcan 反作弊：{vulcan_total} 条告警，涉及 {player_count} 名玩家、"
+            f"{check_count} 类检查"
+        )
+        if top_players:
+            line += f"；重点玩家：{'、'.join(top_players)}"
+        bullets.append(_truncate(line + "。"))
     categories = report.get("categories") or {}
     for key in ("community", "chat_review", "community_ops"):
-        bullets.extend(
-            _clean_bullets(
-                [_category_line(value, key) for value in (categories.get(key) or [])[:3]]
-            )
-        )
+        values = []
+        for value in categories.get(key) or []:
+            if vulcan_total and str(value).startswith("server_log_anticheat_vulcan:"):
+                continue
+            values.append(value)
+            if len(values) >= 3:
+                break
+        bullets.extend(_clean_bullets([_category_line(value, key) for value in values]))
     return bullets[:MAX_SECTION_BULLETS] or ["本窗口未发现明显聊天或社区运营异常。"]
 
 
@@ -187,10 +212,17 @@ def _risk_action_bullets(report: dict[str, Any]) -> list[str]:
     bullets = _clean_bullets(
         [_humanize_ops_note(note) for note in (report.get("ops_notes") or [])]
     )
-    for issue in report.get("issues") or []:
-        if isinstance(issue, dict):
-            bullets.extend(_clean_bullets([issue.get("suggested_action")]))
+    for issue in _visible_issues(report):
+        bullets.extend(_clean_bullets([issue.get("suggested_action")]))
     return _dedupe(bullets)[:MAX_SECTION_BULLETS] or ["保持观察，无需立即执行管理动作。"]
+
+
+def _visible_issues(report: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        issue
+        for issue in (report.get("issues") or [])
+        if isinstance(issue, dict) and not is_passive_issue(issue)
+    ]
 
 
 def _clean_bullets(values: Any) -> list[str]:

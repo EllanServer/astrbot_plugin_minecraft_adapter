@@ -128,7 +128,7 @@ def format_report(report: dict, total_count: int, dedupe_count: int, unique_play
     lines.extend(
         [
             "",
-            f"本报告基于完整{duration}运行日志、玩家事件和结构化分类生成。",
+            f"本报告基于{_duration_with_prefix('完整', duration)}运行日志、玩家事件和结构化分类生成。",
         ]
     )
     return "\n".join(lines)
@@ -156,7 +156,7 @@ def _overall_lines(
         status = "发现需要处理的运行风险"
     active_players = _active_players(report)
     lines = [
-        f"过去{duration}内，服务器整体情况为：{status}。",
+        f"{_duration_with_prefix('过去', duration)}内，服务器整体情况为：{status}。",
         f"本窗口记录到 {player_count} 名活跃玩家，主要包括：{active_players}。",
         (
             f"本次巡检识别到 {incident_count} 个重点事件，高风险事件 {high_risk_count} 个，"
@@ -232,6 +232,12 @@ def _is_suppressed_group(group: IncidentGroup) -> bool:
 
 
 def _is_observation_group(group: IncidentGroup) -> bool:
+    if group.family == "community":
+        labels = set(_unique_issue_values(list(group.issues), "chat_labels"))
+        return (
+            not labels
+            and str(group.max_severity or "").lower() in {"low", "medium"}
+        )
     if group.family == "community_ops":
         return not _community_ops_has_accident_signal(group)
     if group.family == "chat_review":
@@ -253,16 +259,16 @@ def _community_ops_has_accident_signal(group: IncidentGroup) -> bool:
 
 
 def _high_risk_count(groups: list[IncidentGroup]) -> int:
-    total = 0
-    for group in groups:
-        severity = str(group.max_severity or "").lower()
-        if severity not in {"high", "critical"}:
-            continue
-        if group.family in {"community", "chat_review", "moderation"}:
-            total += 1
-        elif severity == "critical":
-            total += 1
-    return total
+    return sum(
+        1
+        for group in groups
+        if str(group.max_severity or "").lower() in {"high", "critical"}
+    )
+
+
+def _duration_with_prefix(prefix: str, duration: str) -> str:
+    separator = "" if duration.startswith(("约 ", "本窗口")) else " "
+    return f"{prefix}{separator}{duration}"
 
 
 def _ops_incident_count(groups: list[IncidentGroup]) -> int:
@@ -391,7 +397,7 @@ def _player_issue_type(group: IncidentGroup) -> str:
     if group.family == "chat_review" and ("刷屏" in labels or "重复" in _group_text(group)):
         return "出现短时间重复或无意义聊天"
     if "权限异常" in labels:
-        return "出现找管理员/投诉或权限相关反馈"
+        return "出现命令或功能权限异常反馈"
     if "管理员求助" in labels or "证据提交" in labels:
         return "出现找管理员/投诉相关反馈"
     return f"反馈 {'、'.join(_incident_labels(list(group.issues))[:4]) or '玩家问题'}"
@@ -470,6 +476,16 @@ def _category_observation_lines(report: dict) -> list[str]:
     if performance_count:
         lines.append(
             f"性能旁证 {performance_count} 条：当前未形成持续卡顿或网络事故，仅保留用于时间线对照。"
+        )
+    community_ops_count = counts.pop("server_log_community_ops_observation", 0)
+    if community_ops_count:
+        lines.append(
+            f"社区活动与普通问答 {community_ops_count} 条：当前未发现活动事故、奖励异常或需要立即处理的社区冲突。"
+        )
+    player_feedback_count = counts.pop("server_log_player_feedback_observation", 0)
+    if player_feedback_count:
+        lines.append(
+            f"普通建议与反馈 {player_feedback_count} 条：已保留为运营观察，未发现需要立即处理的玩家故障。"
         )
     for tag, count in sorted(counts.items()):
         label = tag.removeprefix("server_log_").removesuffix("_observation")
@@ -588,6 +604,16 @@ def _incident_summary_sentence(group: IncidentGroup, labels: list[str]) -> str:
         "经济/商店异常",
         "网络连接异常",
     }
+    if "传送/位置异常" in ops_subtypes and chat_labels & {
+        "传送异常",
+        "虚空/卡位置",
+        "跨服异常",
+        "世界切换异常",
+    }:
+        return (
+            f"{time_part} 内同时出现服务端传送/位置 WARN 与玩家侧传送、卡位置反馈。"
+            "两类证据指向同一链路，应按时间点核对传送插件、世界加载和玩家位置保存。"
+        )
     if ops_subtypes & plugin_configuration and ops_subtypes & external_dependencies:
         return (
             f"{time_part} 内同时出现插件配置/内容定义、外部 API 或依赖问题，以及数据库、经济或网络连接线索。"
@@ -603,8 +629,13 @@ def _incident_summary_sentence(group: IncidentGroup, labels: list[str]) -> str:
             f"{time_part} 左右，服务器日志出现数据库连接超时线索，可能影响商店、经济、权限或玩家数据同步；"
             "需要结合数据库可用性、连接池和同时间玩家反馈确认影响范围。"
         )
+    if group.family in {"player_feedback", "moderation"} and "权限异常" in chat_labels:
+        return (
+            "玩家明确反馈命令或功能无权限，但当前仅有聊天证据，尚未看到权限插件侧的拒绝日志或配置核验结果。"
+            "应先确认目标命令、权限节点、玩家权限组和复现结果。"
+        )
     if group.family in {"player_feedback", "moderation"} and (
-        "管理员求助" in chat_labels or "权限异常" in chat_labels or "证据提交" in chat_labels
+        "管理员求助" in chat_labels or "证据提交" in chat_labels
     ):
         return (
             "玩家在聊天中出现找管理员、投诉或反馈问题的内容，但当前记录中未看到明确处理结果。"
@@ -1268,6 +1299,13 @@ def _incident_display_title(
         "经济/商店异常",
         "网络连接异常",
     }
+    if "传送/位置异常" in ops_subtypes and chat_labels & {
+        "传送异常",
+        "虚空/卡位置",
+        "跨服异常",
+        "世界切换异常",
+    }:
+        return "传送/位置异常与玩家反馈"
     if ops_subtypes & plugin_configuration and ops_subtypes & external_dependencies:
         return "启动阶段插件配置、外部依赖与连接异常"
     if {"插件加载/启用失败", "数据库超时"} <= ops_subtypes:
@@ -1281,8 +1319,12 @@ def _incident_display_title(
     if group.family in {"player_feedback", "moderation"} and (
         "管理员求助" in chat_labels or "权限异常" in chat_labels or "证据提交" in chat_labels
     ):
-        if "权限异常" in chat_labels and _has_strong_permission_evidence(group):
-            return "玩家管理求助与权限相关反馈"
+        if "权限异常" in chat_labels:
+            return (
+                "玩家权限异常与权限日志关联"
+                if _has_strong_permission_evidence(group)
+                else "玩家权限异常反馈（待核实）"
+            )
         return "玩家管理求助与投诉未闭环"
     if group.family == "community" and chat_labels & {"外挂举报", "飞行举报", "透视/Xray", "自动挖矿"}:
         return "疑似外挂/飞行相关举报"

@@ -116,6 +116,7 @@ _STACKTRACE_FRAME_RE = re.compile(
     r"(?:at\s+\S+\([^\r\n]*\)(?:\s+~\[[^\]]*\])?|\.\.\.\s+\d+\s+more)",
     re.IGNORECASE,
 )
+_DIAGNOSTIC_DETAIL_RE = re.compile(r"^[»›▶→]\s*\S")
 _ERROR_WORDS = (
     "error",
     "exception",
@@ -1991,6 +1992,8 @@ def _detect_log_line_kind(content: str) -> str:
     body = _PREFIX_RE.sub("", str(content or "")).lstrip(" :\t")
     if _STACKTRACE_FRAME_RE.fullmatch(body):
         return "stacktrace_frame"
+    if _DIAGNOSTIC_DETAIL_RE.match(body):
+        return "diagnostic_detail"
     return "message"
 
 
@@ -2005,8 +2008,8 @@ def _python_runtime_log_hints(line: str, max_line_length: int) -> dict[str, Any]
     if len(str(line or "")) > max_line_length:
         quality_flags.append("truncated")
     line_kind = _detect_log_line_kind(content)
-    if line_kind == "stacktrace_frame":
-        quality_flags.append("stacktrace_frame")
+    if line_kind != "message":
+        quality_flags.append(line_kind)
     hints: dict[str, Any] = {
         "content": content,
         "level": _detect_level(content),
@@ -2065,6 +2068,7 @@ def _runtime_log_hints_batch(lines: list[str], max_line_length: int) -> list[dic
 
 def _python_log_time_parts(line: str) -> tuple[str | None, str | None, str | None]:
     text = _ANSI_RE.sub("", line).strip()
+    text = text.lstrip("".join(_TRANSPORT_FORMAT_CHARS)).lstrip()
     match = _FULL_TS_RE.match(text)
     if match:
         return match.group("date"), match.group("time"), match.group("ms")
@@ -2625,6 +2629,8 @@ def _llm_quality_score(redaction_count: int, flags: list[str]) -> int:
             score -= 35
         elif flag == "stacktrace_frame":
             score -= 18
+        elif flag == "diagnostic_detail":
+            score -= 10
         elif flag in {"control_stripped", "truncated"}:
             score -= 8
         elif flag == "whitespace_collapsed":
