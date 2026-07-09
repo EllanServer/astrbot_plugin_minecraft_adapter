@@ -99,8 +99,17 @@ jobs:
           from services.mine_sentinel.storage.codec import ObservationRecordCodec
           cfg = MineSentinelConfig.from_dict({})
           codec = ObservationRecordCodec(cfg)
-          assert codec.uses_native is True, '装了 Rust wheel 后 uses_native 应为 True'
-          print('Rust core loaded, uses_native=True')
+          required = (
+              'runtime_log_hints_batch',
+              'runtime_log_time_parts_batch',
+              'ai_sampling_features_batch',
+              'report_category_features_batch',
+              'observation_priority_score',
+          )
+          missing = [name for name in required if not hasattr(mine_sentinel_rs, name)]
+          assert not missing, f'Rust wheel 缺少批量热路径: {missing}'
+          assert codec.uses_native is False, '逐条 codec 应保持更快的 Python C 热路径'
+          print('Rust batch core loaded; per-record codec intentionally uses Python')
           "
 
       - name: Run tests (Rust path)
