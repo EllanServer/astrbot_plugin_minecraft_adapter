@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -76,6 +77,15 @@ def _report(first_seen: int, last_seen: int, include_issue: bool = True) -> dict
         "window_end_ts": last_seen + 60_000,
         "_export_file_name": "evidence.jsonl.gz",
     }
+
+
+def _local_time_range(first_seen: int, last_seen: int) -> str:
+    first = time.localtime(first_seen / 1000)
+    last = time.localtime(last_seen / 1000)
+    first_text = time.strftime("%Y-%m-%d %H:%M:%S", first)
+    if first.tm_year == last.tm_year and first.tm_yday == last.tm_yday:
+        return f"{first_text} - {time.strftime('%H:%M:%S', last)}"
+    return f"{first_text} - {time.strftime('%Y-%m-%d %H:%M:%S', last)}"
 
 
 class IncidentManagementTests(unittest.TestCase):
@@ -231,7 +241,7 @@ class IncidentManagementTests(unittest.TestCase):
         plan = build_check_plan([issue], facts, "operations")
         plan_text = "\n".join(str(step) for step in plan)
 
-        self.assertEqual(facts["time"], "1970-01-01 08:16:40 - 08:17:40")
+        self.assertEqual(facts["time"], _local_time_range(1_000_000, 1_060_000))
         self.assertEqual(facts["where"], "survival/latest.log / world (120, 64, -32)")
         self.assertEqual(facts["people_text"], "PlayerA")
         self.assertEqual(facts["components"], "QuickShop")
@@ -440,7 +450,10 @@ class IncidentManagementTests(unittest.TestCase):
             "survival", {"issues": [issue]}
         )[0]
 
-        self.assertIn("时间：1970-01-01 08:16:40 - 08:17:40", message)
+        self.assertIn(
+            f"时间：{_local_time_range(1_000_000, 1_060_000)}",
+            message,
+        )
         self.assertIn("人物：PlayerA", message)
         self.assertIn("插件/组件：QuickShop", message)
         self.assertIn("日志文件：latest.log", message)

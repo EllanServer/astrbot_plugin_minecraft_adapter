@@ -9027,7 +9027,13 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
         facts = carbon["facts"]
         plan_text = json.dumps(carbon["check_plan"], ensure_ascii=False)
 
-        self.assertEqual(facts["time"], "2026-07-08 21:14:04 - 21:15:52")
+        # The fixture name has no date, so its inferred day follows checkout
+        # mtime. Git does not preserve mtime across runners; the log clock is
+        # the stable fact this integration test needs to assert.
+        self.assertRegex(
+            facts["time"],
+            r"^\d{4}-\d{2}-\d{2} 21:14:04 - 21:15:52$",
+        )
         self.assertEqual(facts["where"], "pbfhcai")
         self.assertEqual(
             facts["people_text"],
