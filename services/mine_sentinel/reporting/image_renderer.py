@@ -291,11 +291,7 @@ class MineSentinelReportImageRenderer:
                 f"怎样算处理完成：{incident.get('verification') or '受影响功能恢复，并且问题没有再次出现。'}"
             )
             detail.summary_panel(action_lines, accent)
-            detail.section_title(
-                "AI 给出的详细步骤"
-                if incident.get("ai_plan_used")
-                else "给维护人员的详细步骤"
-            )
+            detail.section_title("接下来怎么做")
             check_plan = list(incident.get("check_plan") or [])
             if check_plan:
                 detail.numbered_list([format_check_step(step) for step in check_plan])

@@ -1,7 +1,7 @@
 name: astrbot_plugin_minecraft_adapter
 display_name: MineSentinel 监控管理报告 AI
 desc: 只读读取 Minecraft latest.log、历史 .log 和 .log.gz，使用规则、异常检测、事件级上下文诊断和 AstrBot AI 生成行动优先的事件管理报告
-version: 3.0.0
+version: 3.0.1
 author: Railgun19457 / EllanServer
 repo: https://github.com/EllanServer/astrbot_plugin_minesentinel
 astrbot_version: ">=4.10.4"
