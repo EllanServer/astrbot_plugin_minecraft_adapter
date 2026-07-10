@@ -141,6 +141,8 @@ class IncidentGrouper:
     def can_merge(self, group: IncidentGroup, issue: dict[str, Any]) -> bool:
         if group.family != issue_family(issue):
             return False
+        if group.family == "operations" and issue_domain(group.issues[0]) != issue_domain(issue):
+            return False
         issue_scope_values = set(issue_scopes(issue))
         if group.scopes and issue_scope_values and group.scopes.isdisjoint(issue_scope_values):
             return False
@@ -210,6 +212,38 @@ def issue_family(issue: dict[str, Any]) -> str:
     if category == "suggestion" or tag in SUGGESTION_TAGS:
         return "suggestion"
     return "operations"
+
+
+def issue_domain(issue: dict[str, Any]) -> str:
+    """Return the technical failure domain used to prevent kitchen-sink incidents."""
+
+    category = str(issue.get("category") or "").lower()
+    if category in {"network", "cross_server"}:
+        return "network"
+    if category == "economy":
+        return "economy"
+    if category == "complaint":
+        return "performance"
+    if category == "plugin":
+        return "plugin"
+    ops_categories = {str(value) for value in issue.get("ops_categories") or []}
+    if "数据库与存储" in ops_categories:
+        return "database"
+    if "经济与资产" in ops_categories:
+        return "economy"
+    if "网络与代理" in ops_categories:
+        return "network"
+    if "性能与资源" in ops_categories:
+        return "performance"
+    if "传送与位置" in ops_categories:
+        return "position"
+    if "世界与区块" in ops_categories:
+        return "world"
+    if "权限与命令" in ops_categories:
+        return "permission"
+    if "插件与模组" in ops_categories:
+        return "plugin"
+    return category or str(issue.get("tag") or "operations").lower()
 
 
 def looks_like_abuse(issue: dict[str, Any]) -> bool:

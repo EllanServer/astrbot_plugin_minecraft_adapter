@@ -180,7 +180,34 @@ jobs:
           test -s SHA256SUMS.txt
           sha256sum --check SHA256SUMS.txt
 
-      - name: Create GitHub release
+      - name: Resolve curated release notes
+        id: release-notes
+        shell: bash
+        run: |
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if [[ -f "$notes" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "path=$notes" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub release with curated notes
+        if: steps.release-notes.outputs.available == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/release/astrbot_plugin_minecraft_adapter.zip
+            dist/release/*.whl
+            dist/release/*.tar.gz
+            dist/release/SHA256SUMS.txt
+          body_path: ${{ steps.release-notes.outputs.path }}
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          overwrite_files: true
+
+      - name: Create GitHub release with generated notes
+        if: steps.release-notes.outputs.available != 'true'
         uses: softprops/action-gh-release@v3
         with:
           files: |

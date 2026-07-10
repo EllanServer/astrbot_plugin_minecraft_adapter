@@ -27,19 +27,30 @@ class MineSentinelCommandHandler:
 
     async def handle_report(self, event: "AstrMessageEvent", args: str = ""):
         tokens = str(args or "").strip().split()
-        if not tokens or tokens[0].lower() != "now":
-            yield event.plain_result("用法: /ms report now [服务器ID] [8h]")
+        mode = tokens[0].lower() if tokens else ""
+        if mode not in {"now", "postmortem"}:
+            yield event.plain_result(
+                "用法: /ms report now [服务器ID] [8h] | "
+                "/ms report postmortem [服务器ID] [24h]"
+            )
             return
         if not self.service:
             yield event.plain_result("MineSentinel 未初始化")
             return
 
         target = parse_report_args(tokens[1:])
-        result = await self.service.report_now_result(
-            current_session=event.unified_msg_origin,
-            server_id=target.server_id,
-            window_minutes=target.window_minutes,
-        )
+        if mode == "postmortem":
+            result = await self.service.postmortem_result(
+                current_session=event.unified_msg_origin,
+                server_id=target.server_id,
+                window_minutes=target.window_minutes,
+            )
+        else:
+            result = await self.service.report_now_result(
+                current_session=event.unified_msg_origin,
+                server_id=target.server_id,
+                window_minutes=target.window_minutes,
+            )
         yield _event_report_result(event, result)
 
 
@@ -76,14 +87,20 @@ def parse_window_minutes(value: str) -> int | None:
 
 
 def _event_report_result(event: "AstrMessageEvent", result):
-    image = getattr(result, "image", None)
-    if image is not None:
+    images = list(getattr(result, "images", None) or [])
+    if not images:
+        image = getattr(result, "image", None)
+        if image is not None:
+            images = [image]
+    if images:
         try:
             from astrbot.api.message_components import Image
 
             chain_result = getattr(event, "chain_result", None)
             if callable(chain_result):
-                return chain_result([Image.fromBytes(image.getvalue())])
+                return chain_result(
+                    [Image.fromBytes(image.getvalue()) for image in images]
+                )
         except Exception:
             pass
     return event.plain_result(str(result))

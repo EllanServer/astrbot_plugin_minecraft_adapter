@@ -41,13 +41,23 @@ class MineSentinelDelivery:
         text: str,
         image: BytesIO | None = None,
         file_path: Path | None = None,
+        images: list[BytesIO] | None = None,
     ) -> bool:
-        if image is not None:
-            if await self.send_image(umo, image):
+        pages = list(images or ([] if image is None else [image]))
+        if pages:
+            sent_pages = 0
+            for page in pages:
+                if not await self.send_image(umo, page):
+                    break
+                sent_pages += 1
+            if sent_pages == len(pages):
                 if file_path:
                     await self.send_file(umo, file_path)
                 return True
-            logger.warning(f"[MineSentinel] 图片报告发送失败，回退文本: {umo}")
+            logger.warning(
+                f"[MineSentinel] 图片报告发送失败（已发送 {sent_pages}/{len(pages)} 页），"
+                f"回退文本: {umo}"
+            )
         return await self.send_message(umo, text, file_path)
 
     async def send_image(self, umo: str, image: BytesIO) -> bool:

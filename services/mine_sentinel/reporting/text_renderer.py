@@ -53,6 +53,11 @@ _OBSERVATION_TAG_RE = re.compile(
 
 
 def format_report(report: dict, total_count: int, dedupe_count: int, unique_players: int) -> str:
+    if report.get("incident_management"):
+        from .incident_management import format_incident_management_text
+
+        return format_incident_management_text(report)
+
     presentation = _PRESENTATION_BUILDER.build(
         report,
         total_count,

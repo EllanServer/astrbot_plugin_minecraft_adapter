@@ -1,6 +1,7 @@
 __pycache__/
 dev/
 .vscode/
+.preview-cache/
 
 # Local AstrBot runtime/config data, not plugin source
 data/cmd_config.json

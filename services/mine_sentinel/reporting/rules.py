@@ -28,7 +28,16 @@ from functools import lru_cache
 from typing import Any
 
 from ..models import MineSentinelConfig, ObservationRecord
-from .common import SEVERITY_RANK, format_locations, location_list
+from .common import (
+    SEVERITY_RANK,
+    format_locations,
+    location_list,
+    log_file_list,
+    person_name_list,
+    plugin_name_list,
+    position_list,
+    world_name_list,
+)
 from .sections import build_report_sections
 
 try:
@@ -816,6 +825,29 @@ FLIGHT_REPORT_INTENT_MARKERS = (
     "cheat",
     "hack",
     "ban",
+)
+TELEPORT_PROBLEM_MARKERS = (
+    "失败",
+    "不能",
+    "无法",
+    "不了",
+    "没反应",
+    "用不了",
+    "卡住",
+    "卡位置",
+    "卡在原地",
+    "虚空",
+    "位置错误",
+    "位置不对",
+    "坐标错误",
+    "坐标不对",
+    "传错",
+    "回不去",
+    "没过去",
+    "不同步",
+    "丢失",
+    "报错",
+    "异常",
 )
 CHAT_MEDIUM_CATEGORIES = {"管理请求", "性能与连接异常", "数据与插件异常", "经济与物品", "违规与安全风险"}
 CHAT_CHAT_REVIEW_LABELS = {"辱骂", "人身攻击", "引战", "刷屏", "广告", "诈骗", "恶意拉人"}
@@ -1645,6 +1677,10 @@ class HeuristicReportBuilder:
                     marker in text for marker in FLIGHT_REPORT_INTENT_MARKERS
                 ):
                     continue
+                if label == "传送异常" and not any(
+                    marker in text for marker in TELEPORT_PROBLEM_MARKERS
+                ):
+                    continue
                 self._append_unique(labels, label)
                 self._append_unique(categories, category)
 
@@ -2412,6 +2448,10 @@ class HeuristicReportBuilder:
                 {record.backend_server for record in group if record.backend_server}
             )
             locations = location_list(group)
+            plugins = plugin_name_list(group)
+            log_files = log_file_list(group)
+            worlds = world_name_list(group)
+            positions = position_list(group)
             samples = self._issue_evidence_samples(
                 group,
                 category,
@@ -2434,13 +2474,7 @@ class HeuristicReportBuilder:
                             if str(label) in CHAT_CHAT_REVIEW_LABELS:
                                 self._append_unique(chat_labels, str(label))
             else:
-                players = sorted(
-                    {
-                        str((record.context or {}).get("chatPlayer") or "").strip()
-                        for record in group
-                        if (record.context or {}).get("chatPlayer")
-                    }
-                )
+                players = person_name_list(group)
             timestamps = [record.timestamp for record in group if record.timestamp]
             should_alert = self._should_alert(
                 severity, len(group), affected, backends, category, group
@@ -2466,6 +2500,10 @@ class HeuristicReportBuilder:
                     "affected_backends": backends,
                     "affected_locations": locations,
                     "affected_locations_text": format_locations(locations),
+                    "affected_plugins": plugins,
+                    "affected_log_files": log_files,
+                    "affected_worlds": worlds,
+                    "affected_positions": positions,
                     "evidence_count": len(group),
                     "unique_players": len(players),
                     "players": players,

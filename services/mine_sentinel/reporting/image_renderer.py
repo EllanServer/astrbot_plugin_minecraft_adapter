@@ -22,6 +22,7 @@ from .incident_format import (
     quiet_window_text as _quiet_window_text,
 )
 from .incidents import IncidentGroup, IncidentGrouper, IssuePolicy, issue_sort_key
+from .incident_response import format_check_step
 from .labels import DEFAULT_LABELS
 from .presentation import ReportPresentationBuilder
 
@@ -46,8 +47,15 @@ class MineSentinelReportImageRenderer:
     HEADER = "#18243a"
     HEADER_MUTED = "#b8c4d6"
 
-    def __init__(self, cache_dir: Path):
+    def __init__(
+        self,
+        cache_dir: Path,
+        max_summary_incidents: int = 6,
+        max_detail_pages: int = 6,
+    ):
         self.cache_dir = cache_dir
+        self.max_summary_incidents = max(1, max_summary_incidents)
+        self.max_detail_pages = max(1, max_detail_pages)
         self.font_provider = FontProvider(cache_dir / "fonts")
         self._font_cache: dict[tuple[int, str], object] = {}
         self._assets_ready = False
@@ -64,17 +72,270 @@ class MineSentinelReportImageRenderer:
         dedupe_count: int,
         unique_players: int,
     ) -> BytesIO:
-        await self._ensure_assets()
-        # The actual drawing is pure CPU-bound PIL work on a large canvas;
-        # run it off the event loop so heartbeats/message dispatch are not
-        # blocked while a report image (often 20000+px tall) is rendered.
-        return await asyncio.to_thread(
-            self._draw_report,
+        pages = await self.render_pages(
             report,
             total_count,
             dedupe_count,
             unique_players,
         )
+        return pages[0]
+
+    async def render_pages(
+        self,
+        report: dict,
+        total_count: int,
+        dedupe_count: int,
+        unique_players: int,
+    ) -> list[BytesIO]:
+        await self._ensure_assets()
+        draw = (
+            self._draw_management_pages
+            if report.get("incident_management")
+            else self._draw_legacy_pages
+        )
+        return await asyncio.to_thread(
+            draw,
+            report,
+            total_count,
+            dedupe_count,
+            unique_players,
+        )
+
+    def _draw_legacy_pages(
+        self,
+        report: dict,
+        total_count: int,
+        dedupe_count: int,
+        unique_players: int,
+    ) -> list[BytesIO]:
+        return [
+            self._draw_report(report, total_count, dedupe_count, unique_players)
+        ]
+
+    def _draw_management_pages(
+        self,
+        report: dict,
+        total_count: int,
+        dedupe_count: int,
+        unique_players: int,
+    ) -> list[BytesIO]:
+        management = report.get("incident_management") or {}
+        counts = management.get("counts") or {}
+        coverage = management.get("coverage") or {}
+        incidents = list(management.get("incidents") or [])
+        actions = list(management.get("action_queue") or [])
+        status_color = _management_status_color(management.get("status_level"))
+        pages: list[BytesIO] = []
+
+        canvas = _ReportCanvas(self)
+        canvas.header(
+            f"MineSentinel {management.get('report_type_label') or '事件管理报告'}",
+            f"{management.get('servers') or _format_servers(report)} · "
+            f"{management.get('time_window') or _format_time_window(report)}",
+            str(management.get("status") or "待确认"),
+            status_color,
+        )
+        canvas.stats(
+            [
+                ("新发", str(counts.get("new", 0)), "#fef2f2", self.RED),
+                ("持续", str(counts.get("ongoing", 0)), "#fff7ed", self.AMBER),
+                ("已恢复", str(counts.get("recovered", 0)), "#ecfdf5", self.GREEN),
+                ("待复核", str(counts.get("needs_review", 0)), "#eff6ff", self.BLUE),
+            ]
+        )
+        canvas.section_title("管理结论")
+        canvas.summary_panel(
+            [
+                str(management.get("summary") or "当前没有可汇总的管理结论。"),
+                f"下一次更新：{management.get('next_update') or '按既定巡检周期'}。",
+            ],
+            status_color,
+        )
+
+        canvas.section_title(
+            "复盘后要做什么"
+            if management.get("report_type") == "postmortem"
+            else "接下来要做什么"
+        )
+        if actions:
+            canvas.numbered_list(
+                [
+                    f"[{item.get('action_label', '留意观察')} · {item.get('timing', '下次巡检时')}] "
+                    f"{item.get('incident_id', 'INC')} · {item.get('time') or '时间未记录'}\n"
+                    f"地点：{item.get('where') or '未记录'}；人物：{item.get('people') or '未关联具体玩家'}；"
+                    f"插件/组件：{item.get('components') or '未识别'}\n"
+                    f"操作：{item.get('action') or '复核事件'}\n"
+                    f"负责人：{item.get('owner_role') or '值班管理员'}；"
+                    f"完成标准：{item.get('verification') or '确认风险不再持续'}"
+                    for item in actions
+                ]
+            )
+        else:
+            canvas.info_note("无需立即处置，按既定周期继续观察。")
+
+        canvas.section_title("处理进度")
+        try:
+            contract_limit = max(
+                1,
+                int(management.get("summary_incident_limit") or self.max_summary_incidents),
+            )
+        except (TypeError, ValueError):
+            contract_limit = self.max_summary_incidents
+        visible_incidents = incidents[: min(self.max_summary_incidents, contract_limit)]
+        if visible_incidents:
+            canvas.bullet_list(
+                [
+                    f"[{item.get('action_label', '留意观察')}][{item.get('lifecycle_label', '待确认')}] "
+                    f"{item.get('incident_id', 'INC')} · {item.get('title', '运行事件')}\n"
+                    f"时间：{(item.get('facts') or {}).get('time') or item.get('time_range') or '未记录'}；"
+                    f"地点：{(item.get('facts') or {}).get('where') or '未记录'}\n"
+                    f"人物：{(item.get('facts') or {}).get('people_text') or '未关联具体玩家'}；"
+                    f"插件/组件：{(item.get('facts') or {}).get('components') or '未识别'}"
+                    for item in visible_incidents
+                ]
+            )
+            if len(incidents) > len(visible_incidents):
+                canvas.info_note(
+                    f"另有 {len(incidents) - len(visible_incidents)} 个事件未在摘要页展开；"
+                    "完整内容保留在文本报告和证据附件中。"
+                )
+        else:
+            canvas.info_note("本窗口没有需要升级为事件的异常。")
+
+        canvas.section_title("报告依据")
+        coverage_lines = [
+            f"检查了 {coverage.get('records', total_count)} 条日志记录，"
+            f"涉及玩家 {coverage.get('players', unique_players)} 人。",
+            "判断依据：自动分析结果和相关时间前后的原始日志。",
+            f"完整日志附件：{coverage.get('attachment') or '未生成'}。",
+        ]
+        if coverage.get("analysis_truncated"):
+            coverage_lines.append("本次正文使用有界样本；完整窗口仍保留在证据附件中。")
+        observations = management.get("observations") or {}
+        if observations.get("count"):
+            coverage_lines.append(str(observations.get("summary") or ""))
+        canvas.bullet_list([line for line in coverage_lines if line])
+        canvas.report_footer(
+            [
+                "第 1 页 · 管理摘要",
+                "每个还没处理完的事件都会在后续页面给出具体办法。",
+            ]
+        )
+        pages.append(canvas.output())
+
+        current_incidents = [
+            incident
+            for incident in incidents
+            if incident.get("lifecycle") != "recovered"
+        ]
+        for page_index, incident in enumerate(
+            current_incidents[: self.max_detail_pages],
+            1,
+        ):
+            detail = _ReportCanvas(self)
+            is_postmortem = management.get("report_type") == "postmortem"
+            facts = incident.get("facts") or {}
+            severity = str(incident.get("severity") or "low")
+            _, accent = _severity_colors(severity)
+            detail.header(
+                f"{'事件复盘单' if is_postmortem else '事件处置单'} · "
+                f"{incident.get('incident_id', 'INC')}",
+                f"{facts.get('where') or management.get('servers') or _format_servers(report)} · "
+                f"{facts.get('time') or incident.get('time_range') or '未知窗口'}",
+                f"{incident.get('action_label', '留意观察')} · {incident.get('lifecycle_label', '待确认')}",
+                accent,
+            )
+            detail.stats(
+                [
+                    ("处理要求", str(incident.get("action_label") or "留意观察"), "#fef2f2", accent),
+                    ("当前状态", str(incident.get("lifecycle_label") or "待确认"), "#fff7ed", self.AMBER),
+                    ("相关日志", str(incident.get("evidence_count", 0)), "#eff6ff", self.BLUE),
+                    ("需要确认", "是" if incident.get("needs_review") else "按情况", "#ecfdf5", self.GREEN),
+                ]
+            )
+            detail.section_title("发生了什么")
+            detail.summary_panel(
+                [
+                    f"时间：{facts.get('time') or incident.get('time_range') or '未记录'}；持续：{facts.get('duration') or '未知'}。",
+                    f"地点：{facts.get('where') or '未记录具体服务器/世界位置'}。",
+                    f"人物：{facts.get('people_text') or '未关联到具体玩家（服务端/插件级事件）'}。",
+                    f"插件/组件：{facts.get('components') or '未从当前证据识别'}。",
+                    f"日志文件：{'、'.join(facts.get('log_files') or []) or '未记录文件名'}。",
+                ],
+                accent,
+            )
+            detail.section_title("可能造成什么影响")
+            analysis_label = (
+                "AI 证据复核"
+                if incident.get("ai_reviewed")
+                else "系统分析（供维护人员参考）"
+            )
+            detail.summary_panel(
+                [
+                    f"影响判断：{incident.get('impact_label') or '影响尚不明确'}。",
+                    f"影响范围：{incident.get('impact') or '待确认'}。",
+                    str(incident.get("summary") or "暂无事件摘要。"),
+                    f"{analysis_label}：{incident.get('assessment') or '等待人工确认'}",
+                ],
+                self.BLUE,
+            )
+            detail.section_title("怎么处理")
+            action_lines = [
+                f"现在要做：{incident.get('action_now') or '请负责人确认问题是否仍在发生。'}",
+            ]
+            if incident.get("ai_reviewed") and incident.get("recommended_action"):
+                action_lines.append(
+                    f"AI 复核建议：{incident.get('recommended_action')}"
+                )
+            action_lines.append(
+                f"怎样算处理完成：{incident.get('verification') or '受影响功能恢复，并且问题没有再次出现。'}"
+            )
+            detail.summary_panel(action_lines, accent)
+            detail.section_title(
+                "AI 给出的详细步骤"
+                if incident.get("ai_plan_used")
+                else "给维护人员的详细步骤"
+            )
+            check_plan = list(incident.get("check_plan") or [])
+            if check_plan:
+                detail.numbered_list([format_check_step(step) for step in check_plan])
+            else:
+                detail.numbered_list(
+                    [
+                        str(incident.get("action_now") or "复核事件并确认影响。"),
+                        f"完成标准：{incident.get('verification') or '确认风险不再持续'}。",
+                    ]
+                )
+            if incident.get("ai_plan_used"):
+                detail.info_note(
+                    "AI 方案已通过格式、安全与证据范围校验；事实字段和事件等级仍由规则层锁定。"
+                )
+            detail.info_note(
+                f"负责人：{incident.get('owner_role') or '值班管理员'}；"
+                "完成后记录处置人、变更内容、验证时间和关闭依据。"
+            )
+            detail.section_title("相关日志时间")
+            detail.info_note(
+                f"证据时间：{facts.get('time') or incident.get('time_range') or '待确认'}；"
+                f"聚合证据 {incident.get('evidence_count', 0)} 条。"
+            )
+            evidence = list(incident.get("evidence") or [])
+            if evidence:
+                detail.bullet_list(evidence[:4])
+            else:
+                detail.info_note("关键原文请查看随报告发送的完整证据附件。")
+            research_sources = str(incident.get("research_sources") or "").strip()
+            if research_sources:
+                detail.subsection_title("辅助参考")
+                detail.paragraph(research_sources, size=21, color=self.MUTED)
+            detail.report_footer(
+                [
+                    f"第 {page_index + 1} 页 · 事件处置单",
+                    f"证据附件：{coverage.get('attachment') or '未生成'}",
+                ]
+            )
+            pages.append(detail.output())
+        return pages
 
     def _draw_report(
         self,
@@ -888,6 +1149,17 @@ def _report_status(incident_count: int, high_risk_count: int) -> tuple[str, str]
     if incident_count:
         return "需要关注", "#b45309"
     return "运行稳定", "#15803d"
+
+
+def _management_status_color(value: Any) -> str:
+    level = str(value or "stable").lower()
+    if level == "critical":
+        return "#b42318"
+    if level == "attention":
+        return "#b45309"
+    if level == "recovered":
+        return "#0e7490"
+    return "#15803d"
 
 
 def _severity_colors(severity: str) -> tuple[str, str]:

@@ -25,6 +25,10 @@ from .models import MineSentinelConfig, ObservationRecord
 from .report_artifacts import MineSentinelReportArtifacts
 from .reporting import MineSentinelReporter
 from .reporting.image_renderer import MineSentinelReportImageRenderer
+from .reporting.incident_management import (
+    IncidentLifecycleStore,
+    IncidentManagementBuilder,
+)
 from .reporting.report_result import MineSentinelRenderedReport
 from .routing import MineSentinelTargetRouter
 from .runtime_log import MineSentinelRuntimeLogTailer, build_hour_observations
@@ -75,8 +79,19 @@ class MineSentinelService:
             self.disk_store,
             thread_runner=report_thread_runner or self.io_runner,
         )
+        lifecycle_store = (
+            IncidentLifecycleStore(storage_path / "incident_lifecycle.json")
+            if self.config.report.lifecycle_enabled
+            else None
+        )
+        self.incident_management = IncidentManagementBuilder(
+            lifecycle_store,
+            max_summary_incidents=self.config.report.max_summary_incidents,
+        )
         self.report_image_renderer = MineSentinelReportImageRenderer(
-            storage_path / "render_cache"
+            storage_path / "render_cache",
+            max_summary_incidents=self.config.report.max_summary_incidents,
+            max_detail_pages=self.config.report.max_detail_pages,
         )
         self.delivery = MineSentinelDelivery(context)
         self.target_router = MineSentinelTargetRouter(
@@ -283,6 +298,7 @@ class MineSentinelService:
         server_id: str | None = None,
         window_minutes: int | None = None,
         render_image: bool | None = None,
+        report_type: str = "inspection",
     ) -> MineSentinelRenderedReport:
         if not self.config.enabled:
             return MineSentinelRenderedReport("MineSentinel 未启用")
@@ -305,9 +321,18 @@ class MineSentinelService:
         report_unique_players = len(
             {record.identity for record in report_records if record.identity}
         )
+        self._attach_incident_management(
+            report,
+            report_total_count,
+            0,
+            report_unique_players,
+            report_type=report_type,
+            state_scope=current_session or server_id or "manual",
+            persist_state=False,
+        )
         text = format_report(report, report_total_count, 0, report_unique_players)
         report_file = self._report_file_path(report)
-        image = await self._render_report_image(
+        images = await self._render_report_images(
             report,
             report_total_count,
             0,
@@ -323,9 +348,32 @@ class MineSentinelService:
                 report_records,
                 current_session,
                 include_server_targets=self.config.report.send_to_target_sessions,
-                image=image,
+                image=images[0] if images else None,
+                images=images or None,
+                file_path=report_file,
             )
-        return MineSentinelRenderedReport(text, image=image, report_file=report_file)
+        return MineSentinelRenderedReport(
+            text,
+            image=images[0] if images else None,
+            report_file=report_file,
+            images=images,
+        )
+
+    async def postmortem_result(
+        self,
+        current_session: str,
+        server_id: str | None = None,
+        window_minutes: int | None = None,
+        render_image: bool | None = None,
+    ) -> MineSentinelRenderedReport:
+        window = window_minutes or max(1440, self.config.report.default_window_minutes)
+        return await self.report_now_result(
+            current_session=current_session,
+            server_id=server_id,
+            window_minutes=window,
+            render_image=render_image,
+            report_type="postmortem",
+        )
 
     async def _run_periodic_report_once(self) -> bool:
         window = self._report_window_minutes()
@@ -354,13 +402,22 @@ class MineSentinelService:
             unique_players = len(
                 {record.identity for record in report_records if record.identity}
             )
+            self._attach_incident_management(
+                report,
+                len(report_records),
+                0,
+                unique_players,
+                report_type="periodic",
+                state_scope=umo,
+                persist_state=self.config.report.lifecycle_enabled,
+            )
             text = format_report(
                 report,
                 len(report_records),
                 0,
                 unique_players,
             )
-            image = await self._render_report_image(
+            images = await self._render_report_images(
                 report,
                 len(report_records),
                 0,
@@ -370,8 +427,9 @@ class MineSentinelService:
             sent_any = await self.dispatcher.send_report(
                 umo,
                 text,
-                image=image,
+                image=images[0] if images else None,
                 file_path=self._report_file_path(report),
+                images=images or None,
             ) or sent_any
         if sent_any:
             self.last_report_time = time.time()
@@ -578,11 +636,28 @@ class MineSentinelService:
         unique_players: int,
         render_image: bool | None,
     ):
+        images = await self._render_report_images(
+            report,
+            total_count,
+            dedupe_count,
+            unique_players,
+            render_image,
+        )
+        return images[0] if images else None
+
+    async def _render_report_images(
+        self,
+        report: dict,
+        total_count: int,
+        dedupe_count: int,
+        unique_players: int,
+        render_image: bool | None,
+    ) -> list:
         should_render = self.config.report.send_as_image if render_image is None else render_image
         if not should_render:
-            return None
+            return []
         try:
-            return await self.report_image_renderer.render(
+            return await self.report_image_renderer.render_pages(
                 report,
                 total_count,
                 dedupe_count,
@@ -590,7 +665,30 @@ class MineSentinelService:
             )
         except Exception as exc:
             logger.warning(f"[MineSentinel] 渲染图片报告失败，回退文本: {exc}")
-            return None
+            return []
+
+    def _attach_incident_management(
+        self,
+        report: dict,
+        total_count: int,
+        dedupe_count: int,
+        unique_players: int,
+        *,
+        report_type: str,
+        state_scope: str,
+        persist_state: bool,
+    ) -> None:
+        if self.config.report.layout != "incident_management":
+            return
+        self.incident_management.attach(
+            report,
+            total_count,
+            dedupe_count,
+            unique_players,
+            report_type=report_type,
+            state_scope=state_scope,
+            persist_state=persist_state,
+        )
 
     def _has_report_delivery_targets(self) -> bool:
         return bool(

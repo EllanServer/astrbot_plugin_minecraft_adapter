@@ -269,7 +269,28 @@
           },
           "send_as_image": {
             "type": "bool",
-            "description": "报告正文优先渲染为图片发送",
+            "description": "报告正文优先渲染为多页图片发送",
+            "default": true
+          },
+          "layout": {
+            "type": "string",
+            "description": "报告版式：incident_management 为行动优先的 1 页摘要 + N 页事件处置单；legacy 为旧五段式长报告",
+            "options": ["incident_management", "legacy"],
+            "default": "incident_management"
+          },
+          "max_summary_incidents": {
+            "type": "int",
+            "description": "管理摘要最多列出的事件数，范围 1-12",
+            "default": 6
+          },
+          "max_detail_pages": {
+            "type": "int",
+            "description": "单份报告最多渲染的事件处置单页数，范围 1-12；其余事件仍保留在文本和证据附件中",
+            "default": 6
+          },
+          "lifecycle_enabled": {
+            "type": "bool",
+            "description": "周期巡检是否持久化活动事件状态，用于区分新发、持续和已恢复",
             "default": true
           },
           "send_full_log_file": {

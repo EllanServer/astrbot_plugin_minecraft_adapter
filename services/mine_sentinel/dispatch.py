@@ -46,6 +46,7 @@ class MineSentinelReportDispatcher:
         include_report_targets: bool = True,
         image: BytesIO | None = None,
         file_path: Path | None = None,
+        images: list[BytesIO] | None = None,
     ) -> bool:
         current_resolved = self._resolve_session(current_session)
         seen: set[str] = set()
@@ -73,7 +74,11 @@ class MineSentinelReportDispatcher:
             async with semaphore:
                 try:
                     return await self.send_report(
-                        target_umo, text, image=image, file_path=file_path
+                        target_umo,
+                        text,
+                        image=image,
+                        file_path=file_path,
+                        images=images,
                     )
                 except Exception as exc:
                     if self.error_sink:
@@ -89,10 +94,14 @@ class MineSentinelReportDispatcher:
         text: str,
         image: BytesIO | None = None,
         file_path: Path | None = None,
+        images: list[BytesIO] | None = None,
     ) -> bool:
         send_report = getattr(self.delivery, "send_report", None)
         if callable(send_report):
-            sent = await send_report(umo, text, image, file_path)
+            if images is None:
+                sent = await send_report(umo, text, image, file_path)
+            else:
+                sent = await send_report(umo, text, image, file_path, images)
         else:
             sent = await self.delivery.send_message(umo, text, file_path)
         if not sent:

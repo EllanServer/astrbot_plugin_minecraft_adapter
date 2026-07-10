@@ -47,6 +47,48 @@ GENERIC_TAG_TITLES = {
     "server_switch": "跨服切换",
 }
 
+ACTION_LABELS = {
+    "critical": "马上处理",
+    "high": "马上处理",
+    "medium": "今天处理",
+    "low": "留意观察",
+    "info": "仅作记录",
+}
+
+ACTION_TIMINGS = {
+    "critical": "现在开始",
+    "high": "现在开始",
+    "medium": "今天内",
+    "low": "下次巡检时",
+    "info": "无需处理",
+}
+
+IMPACT_LABELS = {
+    "critical": "已经严重影响运行",
+    "high": "很可能影响正常使用",
+    "medium": "可能影响部分功能",
+    "low": "暂未发现明显影响",
+    "info": "仅作记录，暂未发现影响",
+}
+
+
+def action_label(value: Any) -> str:
+    """Return a reader-facing action label instead of an ops priority code."""
+
+    return ACTION_LABELS.get(str(value or "low").lower(), "留意观察")
+
+
+def action_timing(value: Any) -> str:
+    """Describe when a non-technical reader should start handling an event."""
+
+    return ACTION_TIMINGS.get(str(value or "low").lower(), "下次巡检时")
+
+
+def impact_label(value: Any) -> str:
+    """Explain severity as likely human impact rather than a technical level."""
+
+    return IMPACT_LABELS.get(str(value or "low").lower(), "影响尚不明确")
+
 
 class LabelCatalog:
     """Translate deterministic report categories and tags into reader-facing text."""

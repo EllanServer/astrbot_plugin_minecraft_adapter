@@ -27,6 +27,7 @@ from astrbot.api import logger
 
 from .models import MineSentinelConfig, ObservationRecord
 from .reporting.ai_normalizer import parse_json_object, repair_json_object_text
+from .reporting.labels import action_label, impact_label
 from .reporting.rules import HeuristicReportBuilder
 
 
@@ -511,36 +512,45 @@ def format_cycle_report(
 ) -> str:
     """Render a cycle report dict into a human-readable text message."""
     lines = [
-        f"📊 MineSentinel 周期报告 - {server_name}",
+        f"MineSentinel 周期报告 · 事件巡检 - {server_name}",
         f"周期：{len(hourly_summaries)} 小时",
         f"日志总数：{report.get('total_records', 0)}",
         f"错误：{report.get('total_errors', 0)}  警告：{report.get('total_warnings', 0)}",
         "",
-        "总结：",
+        "管理结论：",
         str(report.get("summary") or ""),
         "",
     ]
+    recs = report.get("recommendations") or []
+    lines.append("立即处理：")
+    if recs:
+        for index, rec in enumerate(recs[:6], 1):
+            lines.append(f"  {index}. {rec}")
+    else:
+        lines.append("  1. 无需立即处置，按下一周期继续观察。")
+    lines.extend(["", "事件态势："])
+    issues = report.get("key_issues") or []
+    if issues:
+        for issue in issues[:8]:
+            title = issue.get("title") or issue.get("category") or "未知"
+            severity = str(issue.get("severity") or "medium").lower()
+            handling = action_label(severity)
+            occ = issue.get("occurrences") or 1
+            hour = issue.get("hour") or ""
+            lines.append(
+                f"  - [{handling}] {title}（{occ} 次）{hour}；"
+                f"{impact_label(severity)}"
+            )
+    else:
+        lines.append("  - 本周期没有需要升级处置的事件。")
+    lines.append("")
     timeline = report.get("timeline") or []
     if timeline:
-        lines.append("时间线：")
+        lines.append("证据时间线：")
         for entry in timeline[:12]:
             hour = entry.get("hour") or ""
             summary = str(entry.get("summary") or "")[:120]
-            lines.append(f"  • {hour}: {summary}")
+            lines.append(f"  - {hour}: {summary}")
         lines.append("")
-    issues = report.get("key_issues") or []
-    if issues:
-        lines.append(f"关键问题（{len(issues)}）：")
-        for issue in issues[:8]:
-            title = issue.get("title") or issue.get("category") or "未知"
-            severity = issue.get("severity") or "medium"
-            occ = issue.get("occurrences") or 1
-            hour = issue.get("hour") or ""
-            lines.append(f"  • [{severity}] {title} (x{occ}) {hour}")
-        lines.append("")
-    recs = report.get("recommendations") or []
-    if recs:
-        lines.append("建议：")
-        for rec in recs[:6]:
-            lines.append(f"  • {rec}")
+    lines.append("下一次更新：下一周期或状态变化时。")
     return "\n".join(lines)

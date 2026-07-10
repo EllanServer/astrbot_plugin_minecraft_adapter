@@ -34,6 +34,8 @@ MAX_RESEARCH_URL_CHARS = 500
 MAX_TOOL_QUERY_CHARS = 240
 MAX_DIAGNOSIS_TEXT_CHARS = 500
 MAX_CONTEXT_METADATA_ITEMS = 8
+MAX_AI_CHECK_PLAN_STEPS = 6
+MAX_AI_CHECK_STEP_CHARS = 360
 
 _WEB_TOOL_NAMES = (
     "web_search_tavily",
@@ -55,6 +57,8 @@ _DIAGNOSIS_SCHEMA_TEXT = (
     '{"issues":[{"index":0,"category":"","tag":"","incident_index":0,'
     '"initial_assessment":"","suggested_action":"","confidence":0.0,'
     '"evidence_sufficient":true,"evidence_record_indexes":[0],'
+    '"check_plan":[{"phase":"","check":"","expected":"",'
+    '"on_failure":""}],'
     '"tool_requests":[{"tool":"expand_context","center_record_index":0,'
     '"before":40,"after":40,"reason":""},{"tool":"web_search",'
     '"query":""}]}]}'
@@ -158,12 +162,18 @@ class AIIssueDiagnoser:
                 diagnosis.get("suggested_action"),
                 issue,
             )
-            if not assessment and not action:
+            check_plan = _validated_ai_check_plan(
+                diagnosis.get("check_plan"),
+                issue,
+            )
+            if not assessment and not action and not check_plan:
                 continue
             if assessment:
                 issue["ai_assessment"] = assessment
             if action:
                 issue["suggested_action"] = action
+            if check_plan:
+                issue["ai_check_plan"] = check_plan
             metadata = {
                 "confidence": diagnosis.get("confidence", 0.0),
                 "context_radius": report_config.ai_context_radius,
@@ -174,6 +184,7 @@ class AIIssueDiagnoser:
                     "evidence_record_indexes", []
                 )[:12],
                 "research_sources": diagnosis.get("research_sources", [])[:5],
+                "check_plan_steps": len(check_plan),
             }
             issue["ai_diagnosis"] = metadata
             diagnosed += 1
@@ -322,6 +333,7 @@ class AIIssueDiagnoser:
             "expanded": expanded,
             "web_researched": web_researched,
             "research_sources": research_sources,
+            "check_plan": last_decision.get("check_plan"),
         }
 
     async def _ask(self, provider: Any, prompt: str) -> dict[str, Any] | None:
@@ -386,7 +398,13 @@ class AIContextLocator:
             "tag": issue.get("tag"),
             "incident_index": issue.get("incident_index"),
             "severity": issue.get("severity"),
+            "affected_servers": (issue.get("affected_servers") or [])[:6],
+            "affected_backends": (issue.get("affected_backends") or [])[:6],
             "affected_locations": (issue.get("affected_locations") or [])[:6],
+            "affected_worlds": (issue.get("affected_worlds") or [])[:6],
+            "affected_positions": (issue.get("affected_positions") or [])[:6],
+            "affected_plugins": (issue.get("affected_plugins") or [])[:12],
+            "affected_log_files": (issue.get("affected_log_files") or [])[:8],
             "ops_categories": (issue.get("ops_categories") or [])[:8],
             "ops_subtypes": (issue.get("ops_subtypes") or [])[:10],
             "issue_terms": (issue.get("issue_terms") or [])[:10],
@@ -712,6 +730,8 @@ def _initial_diagnosis_prompt(payload: dict[str, Any], config: MineSentinelConfi
         "请诊断一个已由确定性规则识别的 Minecraft 服务器事件。你已获得命中原文及其"
         f"前后各 {radius} 条原始日志（隐私字段已脱敏）。先基于这些连续原文给出初步判断和"
         "可操作、只读优先的建议。证据不足时，由你选择是否请求工具。只输出以下 JSON："
+        "check_plan 必须包含 2 至 6 个有顺序的步骤；每步都要写清做什么、通过标准和"
+        "未通过时怎么办，最后一步必须是恢复验证或完成确认。"
         f"{_DIAGNOSIS_SCHEMA_TEXT}。"
         "index/category/tag/incident_index 必须逐字复制。evidence_record_indexes 只能引用证据包中"
         "存在的 record_index，至少一个。expand_context 的中心只能选择当前已提供的记录索引；"
@@ -794,6 +814,43 @@ def _validated_evidence_indexes(
             continue
         result.append(index)
     return result[:12]
+
+
+def _validated_ai_check_plan(
+    value: Any,
+    issue: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Accept only complete, grounded and safely bounded AI action plans."""
+
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, str]] = []
+    for raw in value[:MAX_AI_CHECK_PLAN_STEPS]:
+        if not isinstance(raw, dict):
+            return []
+        phase = sanitize_free_text(raw.get("phase"), 80)
+        check = validate_suggested_action(raw.get("check"), issue)
+        expected = sanitize_free_text(
+            raw.get("expected"),
+            MAX_AI_CHECK_STEP_CHARS,
+        )
+        on_failure = validate_suggested_action(raw.get("on_failure"), issue)
+        if not all((phase, check, expected, on_failure)):
+            return []
+        result.append(
+            {
+                "phase": phase,
+                "check": check[:MAX_AI_CHECK_STEP_CHARS],
+                "expected": expected,
+                "on_failure": on_failure[:MAX_AI_CHECK_STEP_CHARS],
+            }
+        )
+    if len(result) < 2:
+        return []
+    final_phase = result[-1]["phase"]
+    if not any(marker in final_phase for marker in ("恢复", "验证", "完成", "关闭")):
+        return []
+    return result
 
 
 def _safe_search_query(value: Any) -> str:

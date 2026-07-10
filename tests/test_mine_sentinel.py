@@ -4134,7 +4134,7 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertIn("Spammer", text)
         self.assertIn("spam-link", text)
 
-    def test_text_report_separates_incidents_from_observations(self):
+    def test_text_report_separates_failure_domains_and_observations(self):
         from services.mine_sentinel.reporting.text_renderer import format_report
 
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
@@ -4171,7 +4171,8 @@ class MineSentinelRulesTests(unittest.TestCase):
 
         self.assertIn("重点事件", text)
         self.assertIn("一般观察", text)
-        self.assertIn("插件加载失败与数据库连接超时", text)
+        self.assertIn("插件加载失败", text)
+        self.assertIn("数据库连接超时", text)
         self.assertIn("短时间重复/无意义聊天内容", text)
         self.assertIn("等级：低", text)
         self.assertIn("社区活动与普通问答", text)
@@ -4709,11 +4710,36 @@ class MineSentinelRulesTests(unittest.TestCase):
 
         self.assertEqual(len(complaint_issues), 2)
         self.assertEqual(
-            sorted(bool(issue["players"]) for issue in complaint_issues),
-            [False, True],
+            {tuple(issue["players"]) for issue in complaint_issues},
+            {("Alex",), ("Steve",)},
         )
         self.assertEqual({issue_family(issue) for issue in complaint_issues}, {"operations"})
         self.assertEqual(len(IncidentGrouper().group(complaint_issues)), 1)
+
+    def test_ordinary_teleport_conversation_is_not_a_problem_report(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        messages = [
+            ("LilyFairy_uwu", "你去tp _Czser"),
+            ("Hugin0209", "我想传送"),
+            ("_Czser", "太远了 传送就好"),
+        ]
+        records = [
+            self._make_record(
+                f"[Async Chat Thread/INFO]: <{player}> {message}",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": player, "chatMessage": message},
+                timestamp=1_700_000_000_000 + index * 30_000,
+            )
+            for index, (player, message) in enumerate(messages)
+        ]
+
+        report = builder.build(records, 60, "survival")
+
+        self.assertEqual(report["issues"], [])
+        for record in records:
+            classification = record.context["chatClassification"]
+            self.assertNotIn("传送异常", classification["labels"])
+            self.assertFalse(classification["needs_admin"])
 
     def test_chat_three_layer_does_not_treat_turn_off_as_disconnect(self):
         config = MineSentinelConfig.from_dict({})
@@ -4731,7 +4757,7 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertFalse(classification["needs_admin"])
         self.assertEqual(report["issues"], [])
 
-    def test_chat_problem_labels_merge_into_one_incident(self):
+    def test_chat_problem_labels_split_by_failure_domain(self):
         from services.mine_sentinel.reporting.incidents import IncidentGrouper, IssuePolicy
         from services.mine_sentinel.reporting.text_renderer import format_report
 
@@ -4769,7 +4795,7 @@ class MineSentinelRulesTests(unittest.TestCase):
         groups = IncidentGrouper().group(IssuePolicy().actionable_issues(report["issues"]))
         text = format_report(report, len(records), 0, 3)
 
-        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups), 3)
         self.assertIn("传送异常", text)
         self.assertIn("虚空/卡位置", text)
         self.assertIn("掉线", text)
@@ -8962,6 +8988,65 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
         ):
             self.assertNotIn(marker, issue_text)
 
+    def test_real_issues_expose_plugins_and_log_files_for_operator_reports(self):
+        plugins = {
+            plugin
+            for issue in self.report["issues"]
+            for plugin in (issue.get("affected_plugins") or [])
+        }
+        log_files = {
+            log_file
+            for issue in self.report["issues"]
+            for log_file in (issue.get("affected_log_files") or [])
+        }
+
+        self.assertIn("QuickShop", plugins)
+        self.assertIn("CarbonChat", plugins)
+        self.assertIn("luckperms", plugins)
+        self.assertEqual(log_files, {"mclogs_pbfhCaI.log"})
+
+    def test_real_management_report_has_actionable_five_fact_contract(self):
+        from services.mine_sentinel.reporting.incident_management import (
+            IncidentManagementBuilder,
+        )
+
+        report = copy.deepcopy(self.report)
+        IncidentManagementBuilder(max_summary_incidents=6).attach(
+            report,
+            len(self.records),
+            0,
+            5,
+        )
+        management = report["incident_management"]
+        carbon = next(
+            incident
+            for incident in management["incidents"]
+            if {"CarbonChat", "luckperms"}
+            <= set((incident.get("facts") or {}).get("plugins") or [])
+        )
+        facts = carbon["facts"]
+        plan_text = json.dumps(carbon["check_plan"], ensure_ascii=False)
+
+        self.assertEqual(facts["time"], "2026-07-08 21:14:04 - 21:15:52")
+        self.assertEqual(facts["where"], "pbfhcai")
+        self.assertEqual(
+            facts["people_text"],
+            "未关联到具体玩家（服务端/插件级事件）",
+        )
+        self.assertEqual(facts["components"], "CarbonChat、luckperms")
+        self.assertEqual(facts["log_files"], ["mclogs_pbfhCaI.log"])
+        self.assertIn("SELECT 1", plan_text)
+        self.assertIn("maxLifetime", plan_text)
+        self.assertTrue(
+            all(step.get("expected") and step.get("on_failure") for step in carbon["check_plan"])
+        )
+        self.assertEqual(carbon["check_plan"][-1]["phase"], "恢复验证")
+        self.assertEqual(len(management["action_queue"]), 3)
+        self.assertEqual(
+            management["action_queue"][0]["incident_id"],
+            management["incidents"][0]["incident_id"],
+        )
+
     def test_real_offline_mode_warning_is_auth_risk_not_generic_bug(self):
         security_records = [
             record
@@ -9210,7 +9295,7 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
         text = format_report(self.report, len(self.records), 0, 5)
 
         self.assertIn("过去 49 分钟内", text)
-        self.assertIn("高风险事件 5 个", text)
+        self.assertIn("高风险事件 9 个", text)
         self.assertIn("基于完整 49 分钟运行日志", text)
         self.assertNotIn("过去49 分钟", text)
         self.assertIn("服务器离线模式与身份认证风险", text)
@@ -10167,6 +10252,26 @@ class MineSentinelAIOutputRegressionTests(unittest.TestCase):
                                         "核对 ExamplePlugin 的 config.yml 语法、插件版本与当前服务端兼容性，"
                                         "再检查后续是否出现成功启用日志。"
                                     ),
+                                    "check_plan": [
+                                        {
+                                            "phase": "证据确认",
+                                            "check": "备份并定位 ExamplePlugin 的 config.yml 报错行。",
+                                            "expected": "报错行、插件版本和配置文件能够一一对应。",
+                                            "on_failure": "扩大日志上下文并把最小配置片段交给插件负责人。",
+                                        },
+                                        {
+                                            "phase": "配置修复",
+                                            "check": "对照当前插件版本修正 config.yml，并只修改报错字段。",
+                                            "expected": "配置可以解析，变更内容只包含预期字段。",
+                                            "on_failure": "恢复配置备份并保持插件停用，等待插件负责人确认字段。",
+                                        },
+                                        {
+                                            "phase": "恢复验证",
+                                            "check": "在维护窗口加载 ExamplePlugin 并测试受影响功能。",
+                                            "expected": "插件成功启用，受影响功能正常且日志不再出现同类错误。",
+                                            "on_failure": "保持事件为处理中，并提交版本、配置和完整报错记录。",
+                                        },
+                                    ],
                                     "confidence": 0.91,
                                     "evidence_sufficient": True,
                                     "evidence_record_indexes": [50],
@@ -10190,9 +10295,15 @@ class MineSentinelAIOutputRegressionTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertIn("前后各 40 条", provider.prompt)
+        self.assertIn("check_plan", provider.prompt)
         diagnosed_issue = diagnosed["issues"][0]
         self.assertIn("配置文件解析", diagnosed_issue["ai_assessment"])
         self.assertTrue(diagnosed_issue["ai_diagnosis"])
+        self.assertEqual(len(diagnosed_issue["ai_check_plan"]), 3)
+        self.assertEqual(
+            diagnosed_issue["ai_check_plan"][-1]["phase"],
+            "恢复验证",
+        )
         group = IncidentGrouper().group(diagnosed["issues"])[0]
         self.assertIn("配置文件解析", _incident_judgement_line(group))
         self.assertIn("config.yml", _incident_recommended_action(group))

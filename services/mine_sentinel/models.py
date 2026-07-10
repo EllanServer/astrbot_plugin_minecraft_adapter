@@ -16,6 +16,7 @@ _logger = logging.getLogger(__name__)
 
 _VALID_TEMPLATE_PARSE_MODES = ("all", "warn_error", "interesting")
 _VALID_EXPORT_FORMATS = ("jsonl", "jsonl.gz")
+_VALID_REPORT_LAYOUTS = ("incident_management", "legacy")
 
 
 def _enum_choice(value: Any, valid: tuple[str, ...], default: str, field_name: str) -> str:
@@ -116,6 +117,10 @@ class MineSentinelReportConfig:
     ai_tool_timeout_seconds: int = 45
     send_full_log_file: bool = True
     send_as_image: bool = True
+    layout: str = "incident_management"
+    max_summary_incidents: int = 6
+    max_detail_pages: int = 6
+    lifecycle_enabled: bool = True
     # PR9: 导出附件优化——压缩格式 + 同窗口复用
     export_format: str = "jsonl"  # "jsonl" | "jsonl.gz"
     export_reuse_existing: bool = True
@@ -492,6 +497,23 @@ class MineSentinelConfig:
                 ),
                 send_full_log_file=_as_bool(report_data.get("send_full_log_file"), True),
                 send_as_image=_as_bool(report_data.get("send_as_image"), True),
+                layout=_enum_choice(
+                    report_data.get("layout"),
+                    _VALID_REPORT_LAYOUTS,
+                    "incident_management",
+                    "report.layout",
+                ),
+                max_summary_incidents=min(
+                    12,
+                    _positive_int(report_data.get("max_summary_incidents"), 6),
+                ),
+                max_detail_pages=min(
+                    12,
+                    _positive_int(report_data.get("max_detail_pages"), 6),
+                ),
+                lifecycle_enabled=_as_bool(
+                    report_data.get("lifecycle_enabled"), True
+                ),
                 export_format=_enum_choice(
                     report_data.get("export_format"),
                     _VALID_EXPORT_FORMATS,
