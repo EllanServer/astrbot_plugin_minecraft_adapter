@@ -11,6 +11,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     from tests.astrbot_stubs import ensure_test_import_paths, install_astrbot_stubs
@@ -6706,7 +6707,8 @@ class MineSentinelHourlySummaryTests(unittest.IsolatedAsyncioTestCase):
             service._hourly_job.run_hour = _spy_run_hour
 
             # Manually invoke the partial-hour handler as if the job just started.
-            await service._hourly_job._process_current_partial_hour()
+            with patch("services.mine_sentinel.jobs.time.time", return_value=3_720.0):
+                await service._hourly_job._process_current_partial_hour()
 
             self.assertEqual(len(called), 1)
             self.assertEqual(called[0][2], "srv")
