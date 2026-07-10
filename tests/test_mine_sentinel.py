@@ -24,6 +24,7 @@ ensure_test_import_paths()
 install_astrbot_stubs()
 install_mine_sentinel_rs_stub_if_missing()
 _install_astrbot_stubs = install_astrbot_stubs
+_PLUGIN_PACKAGE = Path(__file__).resolve().parents[1].name
 
 from services.mine_sentinel.models import MineSentinelConfig, ObservationRecord
 from services.mine_sentinel.reporting.rules import HeuristicReportBuilder
@@ -68,8 +69,8 @@ def _platform_inst(platform_id: str, name: str, running: bool):
 class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
     def test_plugin_exports_only_mine_sentinel_class(self):
         ensure_test_import_paths()
-        module = importlib.import_module("astrbot_plugin_minecraft_adapter.main")
-        package = importlib.import_module("astrbot_plugin_minecraft_adapter")
+        module = importlib.import_module(f"{_PLUGIN_PACKAGE}.main")
+        package = importlib.import_module(_PLUGIN_PACKAGE)
 
         self.assertTrue(hasattr(module, "MineSentinelPlugin"))
         self.assertFalse(hasattr(module, "MinecraftAdapterPlugin"))
@@ -82,9 +83,9 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
 
     def test_handlers_export_only_mine_sentinel_command_handler(self):
         ensure_test_import_paths()
-        handlers = importlib.import_module("astrbot_plugin_minecraft_adapter.handlers")
+        handlers = importlib.import_module(f"{_PLUGIN_PACKAGE}.handlers")
         commands = importlib.import_module(
-            "astrbot_plugin_minecraft_adapter.handlers.mine_sentinel_commands"
+            f"{_PLUGIN_PACKAGE}.handlers.mine_sentinel_commands"
         )
 
         self.assertEqual(handlers.__all__, ["MineSentinelCommandHandler"])
@@ -97,7 +98,7 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
 
     def test_plugin_data_path_migrates_legacy_storage(self):
         ensure_test_import_paths()
-        module = importlib.import_module("astrbot_plugin_minecraft_adapter.main")
+        module = importlib.import_module(f"{_PLUGIN_PACKAGE}.main")
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             legacy_storage = (
@@ -117,7 +118,7 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
             self.assertFalse(legacy_storage.exists())
 
     def test_plugin_enable_switches_are_combined(self):
-        module = importlib.import_module("astrbot_plugin_minecraft_adapter.main")
+        module = importlib.import_module(f"{_PLUGIN_PACKAGE}.main")
 
         self.assertFalse(
             module._effective_mine_sentinel_config(
